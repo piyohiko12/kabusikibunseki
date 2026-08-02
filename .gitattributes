@@ -1,0 +1,10 @@
+# 改行コードの自動変換(Mac/Windows混在対策)
+* text=auto eol=lf
+
+# Windowsのバッチファイルは必ずCRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Macのシェルスクリプトは必ずLF(CRLFだと起動できないため)
+*.sh text eol=lf
+*.command text eol=lf

@@ -1,0 +1,18 @@
+# Python仮想環境(OSごとに作り直すため共有しない)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# 個人データ(保有銘柄・ウォッチリスト・設定)は共有しない
+# ※このリポジトリは公開設定のため、資産情報が漏れないよう必ず除外する
+data/
+reports/
+
+# Streamlitのローカル秘密情報
+.streamlit/secrets.toml
+
+# OS生成ファイル
+.DS_Store
+Thumbs.db
+desktop.ini
