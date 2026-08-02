@@ -105,7 +105,21 @@ Streamlit製の米国株分析ダッシュボードです。株価・財務デ�
 - Windows / macOS / Linux
 - Python 3.10 以上
 
-Pythonが未インストールの場合:
+現在のバージョンの確認:
+
+```powershell
+py -3 --version
+```
+
+```bash
+python3 --version
+```
+
+> ⚠️ **macOSに最初から入っている `python3` は 3.9系**のことがあり、これでは動きません。
+> `3.9.x` と表示された場合は下のコマンドで新しいPythonを入れてください
+> (ランチャーはバージョンを確認し、3.10未満しか無ければその旨を表示して止まります)。
+
+Pythonが未インストール、またはバージョンが古い場合:
 
 ```powershell
 winget install -e --id Python.Python.3.12
@@ -124,6 +138,13 @@ brew install python@3.12
 - Windows: `start-app.cmd` をダブルクリック
 - macOS: `start-app.command` をダブルクリック
   (初回のみ「開発元を確認できません」と出たら、右クリック →「開く」)
+
+ランチャーは起動のたびに次を自動で行います。
+
+1. Python 3.10以上を探す(見つからなければ導入方法を表示して停止)
+2. `.venv` が無ければ作成し、依存パッケージをインストール
+3. `requirements.txt` が前回インストール時から変わっていれば自動で入れ直す
+   (`git pull` でパッケージが増えたときに手動作業が要らない)
 
 手動でセットアップする場合:
 
@@ -176,6 +197,22 @@ cd kabusikibunseki
 
 あとはランチャー(`start-app.command` / `start-app.cmd`)をダブルクリックすれば、
 仮想環境の作成から起動まで自動で行われます。
+
+macOSでの具体的な手順:
+
+```bash
+python3 --version                 # 3.10以上か確認(3.9系なら brew install python@3.12)
+cd ~/Documents                    # 好きな置き場所へ
+git clone https://github.com/piyohiko12/kabusikibunseki.git
+open kabusikibunseki              # Finderが開くので start-app.command をダブルクリック
+```
+
+- `git` が未導入だと初回に「コマンドラインデベロッパツール」の導入を促されます。
+  そのままインストールしてから `git clone` をやり直してください。
+- ダブルクリック時に「開発元を確認できません」と出たら、右クリック →「開く」。
+- 初回は依存パッケージのダウンロードで数分かかります。完了すると
+  ブラウザで http://localhost:8501 が自動で開きます。
+- 保有銘柄・ウォッチリストは同期対象外(下記)なので、新しいPCでは空から始まります。
 
 **日々の使い方(両方のPCで編集する場合):**
 

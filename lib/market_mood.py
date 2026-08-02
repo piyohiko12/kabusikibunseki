@@ -45,6 +45,18 @@ def _naive(c: pd.Series) -> pd.Series:
     return c
 
 
+def _close(ticker: str, period: str) -> pd.Series:
+    """終値をタイムゾーンなしのindexで返す。
+
+    fetch_history は取得失敗やレート制限のとき例外ではなく空のDataFrameを返すため、
+    ここでFetchErrorに変換し、呼び出し側の except でまとめて扱えるようにする。
+    """
+    df = data_fetcher.fetch_history(ticker, period)
+    if df.empty or "Close" not in df.columns:
+        raise data_fetcher.FetchError(f"{ticker}: 株価データを取得できませんでした")
+    return _naive(df["Close"])
+
+
 def _clip(v: float) -> float:
     return max(0.0, min(100.0, v))
 
@@ -98,12 +110,12 @@ def sector_reliability() -> dict:
     """
     out = {}
     try:
-        spx = _naive(data_fetcher.fetch_history("^GSPC", "10y")["Close"])
+        spx = _close("^GSPC", "10y")
     except data_fetcher.FetchError:
         return out
     for sym in SECTOR_SYMS:
         try:
-            c = _naive(data_fetcher.fetch_history(sym, "10y")["Close"]).dropna()
+            c = _close(sym, "10y").dropna()
         except data_fetcher.FetchError:
             continue
         if len(c) < 500:
@@ -122,14 +134,14 @@ def sector_reliability() -> dict:
 def sector_moods() -> list[dict]:
     """各セクターETFの現在の買い場スコア・判定を返す(スコア昇順=売られた順)。"""
     try:
-        spx = _naive(data_fetcher.fetch_history("^GSPC", "2y")["Close"])
+        spx = _close("^GSPC", "2y")
     except data_fetcher.FetchError:
         return []
     premium = sector_reliability()
     rows = []
     for sym in SECTOR_SYMS:
         try:
-            c = _naive(data_fetcher.fetch_history(sym, "2y")["Close"]).dropna()
+            c = _close(sym, "2y").dropna()
         except data_fetcher.FetchError:
             continue
         if len(c) < 260:
@@ -171,9 +183,9 @@ def zone_stats() -> dict | None:
     恐怖側ほど高く単調に並ぶ(等ウェイト構成が前後半分割でも頑健)。
     """
     try:
-        spx = _naive(data_fetcher.fetch_history("^GSPC", "10y")["Close"])
-        vix = _naive(data_fetcher.fetch_history("^VIX", "10y")["Close"])
-        tlt = _naive(data_fetcher.fetch_history("TLT", "10y")["Close"])
+        spx = _close("^GSPC", "10y")
+        vix = _close("^VIX", "10y")
+        tlt = _close("TLT", "10y")
     except data_fetcher.FetchError:
         return None
     if len(spx) < 500:
@@ -187,7 +199,7 @@ def zone_stats() -> dict | None:
     sec = {}
     for sym in SECTOR_SYMS:
         try:
-            sec[sym] = _naive(data_fetcher.fetch_history(sym, "10y")["Close"]).reindex(spx.index)
+            sec[sym] = _close(sym, "10y").reindex(spx.index)
         except data_fetcher.FetchError:
             continue
     if sec:

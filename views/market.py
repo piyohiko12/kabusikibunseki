@@ -54,10 +54,12 @@ else:
     with col_gauge:
         st.plotly_chart(charts.mood_gauge(mood["score"]),
                         config={"displayModeBar": False, "staticPlot": True})
+        zone_color = ("red" if mood["score"] < 45
+                      else "green" if mood["score"] > 55 else "gray")
+        zone_chip = ui.chip(f"現在: {mood['zone_label']}", zone_color)
         st.markdown(
-            f'<div style="text-align:center;margin-top:-14px;">'
-            f'{ui.chip(f"現在: {mood["zone_label"]}", "red" if mood["score"] < 45 else ("green" if mood["score"] > 55 else "gray"))}'
-            f'</div>', unsafe_allow_html=True)
+            f'<div style="text-align:center;margin-top:-14px;">{zone_chip}</div>',
+            unsafe_allow_html=True)
         st.caption("0=極度の恐怖 ←→ 100=極度の強欲(Fear & Greed方式の自作指数)")
     with col_verdict:
         with st.container(border=True):
