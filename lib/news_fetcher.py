@@ -7,6 +7,7 @@
 
 import html
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -21,8 +22,25 @@ import yfinance as yf
 from lib.data_fetcher import FetchError
 
 _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) stock-analyzer/1.0"}
-# SECはUser-Agentに連絡先の明記を要求している(公正アクセスポリシー)
-_SEC_UA = {"User-Agent": "stock-analyzer/1.0 (personal use; contact: u12s20@gmail.com)"}
+
+
+def _sec_user_agent() -> dict:
+    """SEC EDGAR用のUser-Agent。
+
+    SECは公正アクセスポリシーでUser-Agentへの連絡先明記を求めている。
+    メールアドレスは公開リポジトリに含めないため、環境変数
+    SEC_CONTACT か data/settings.json の "sec_contact" から読み込む
+    (未設定ならプロジェクトURLを連絡先として送る)。
+    """
+    contact = os.environ.get("SEC_CONTACT")
+    if not contact:
+        try:
+            from lib import settings_store
+            contact = settings_store.load().get("sec_contact")
+        except Exception:
+            contact = None
+    contact = contact or "https://github.com/piyohiko12/kabusikibunseki"
+    return {"User-Agent": f"stock-analyzer/1.0 (personal use; contact: {contact})"}
 
 SOCIAL_SOURCES = ["Stocktwits", "Hacker News", "Mastodon"]
 
@@ -118,7 +136,7 @@ def fetch_google_news(ticker: str, lang: str = "en") -> list[dict]:
 def _sec_cik_map() -> dict:
     """ティッカー → CIK(SEC企業番号)の対応表。週1回更新で十分。"""
     req = urllib.request.Request("https://www.sec.gov/files/company_tickers.json",
-                                 headers=_SEC_UA)
+                                 headers=_sec_user_agent())
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read().decode("utf-8"))
     return {v["ticker"]: v["cik_str"] for v in data.values()}
@@ -135,7 +153,7 @@ def fetch_sec_filings(ticker: str) -> list[dict]:
         return []
     try:
         url = f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json"
-        req = urllib.request.Request(url, headers=_SEC_UA)
+        req = urllib.request.Request(url, headers=_sec_user_agent())
         with urllib.request.urlopen(req, timeout=30) as r:
             recent = json.loads(r.read().decode("utf-8"))["filings"]["recent"]
     except Exception as e:
