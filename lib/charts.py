@@ -254,17 +254,24 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
         for lv in (o.get("levels") or []):
             is_res = lv["type"] == "抵抗線"
             color = DOWN if is_res else UP
+            strength = int(lv.get("strength") or 0)
+            # 強いレベルほど濃く・太く描き、一目で優先順位が分かるようにする
+            alpha = 0.06 + 0.035 * strength
+            width = 1 + (1 if strength >= 4 else 0)
             if lv.get("zone_high", 0) > lv.get("zone_low", 0):
+                rgb = "208,59,59" if is_res else "12,163,12"
                 fig.add_hrect(
                     y0=lv["zone_low"], y1=lv["zone_high"],
-                    fillcolor=("rgba(208,59,59,0.08)" if is_res
-                               else "rgba(12,163,12,0.08)"),
+                    fillcolor=f"rgba({rgb},{alpha:.3f})",
                     line_width=0, row=1, col=1,
                 )
+            label = f"${lv['price']:,.2f}"
+            if strength:
+                label += " " + "★" * strength
             fig.add_hline(
-                y=lv["price"], line=dict(color=color, width=1, dash="dash"),
-                opacity=0.65, row=1, col=1,
-                annotation_text=f"${lv['price']:,.2f}",
+                y=lv["price"], line=dict(color=color, width=width, dash="dash"),
+                opacity=0.7, row=1, col=1,
+                annotation_text=label,
                 annotation_position="left",
                 annotation_font=dict(color=color, size=10),
             )
@@ -289,10 +296,20 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
     if o["log_scale"]:
         fig.update_yaxes(type="log", row=1, col=1)
 
+    # 十字カーソル。価格を目で追いやすくする(サブチャートとx軸は共有)
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikecolor=MUTED, spikethickness=1, spikedash="dot")
+    fig.update_yaxes(showspikes=True, spikemode="toaxis", spikesnap="cursor",
+                     spikecolor=MUTED, spikethickness=1, spikedash="dot",
+                     row=1, col=1)
+
+    base_h = int(o.get("height") or 430)
     fig.update_layout(
-        height=430 + 140 * len(oscillators),
+        height=base_h + 140 * len(oscillators),
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
+        spikedistance=-1,
+        dragmode=o.get("dragmode") or "zoom",
         legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
         margin=dict(t=30, b=20),
     )

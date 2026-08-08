@@ -29,6 +29,28 @@ OVERLAY_OPTIONS = ["SMA20", "SMA50", "SMA200", "EMA20", "EMA50", "VWAP(日中)",
 HTF_MAP = {"1m": "日足", "5m": "日足", "15m": "日足", "1h": "日足",
            "1d": "週足", "1wk": "月足"}
 OSC_OPTIONS = ["出来高", "RSI", "MACD", "ストキャスティクス"]
+
+# ワンクリックで用途別の表示に切り替えるプリセット
+PRESETS = {
+    "🧭 シンプル": {
+        "overlays": ["SMA50", "SMA200"],
+        "oscillators": ["出来高"],
+    },
+    "📐 テクニカル": {
+        "overlays": ["SMA20", "SMA50", "SMA200", "サポレジライン"],
+        "oscillators": ["出来高", "RSI", "MACD"],
+    },
+    "🎯 スイング": {
+        "overlays": ["SMA50", "SMA200", "サポレジライン", "フィボナッチ",
+                     "出来高プロファイル"],
+        "oscillators": ["出来高", "RSI"],
+    },
+    "⚡ デイトレ": {
+        "overlays": ["VWAP(日中)", "SMA20", "ボリンジャーバンド", "サポレジライン"],
+        "oscillators": ["出来高", "ストキャスティクス"],
+    },
+}
+CUSTOM = "⚙️ カスタム"
 BENCHMARKS = {"S&P500": "^GSPC", "NASDAQ総合": "^IXIC", "ダウ平均": "^DJI"}
 NEWS_SOURCES = ["Yahoo Finance", "Google News", "🇯🇵 日本語", "SEC開示"]
 PLOT_CONFIG = {
@@ -174,24 +196,79 @@ tab_chart, tab_news, tab_tape, tab_flow = st.tabs(
 
 # ---------------------------------------------------------------- タブ1
 with tab_chart:
-    c_type, c_interval, c_cfg = st.columns([2.4, 2, 1.2])
+    # 前回の表示設定を復元する(data/settings.json に保存)
+    _saved_chart = _settings.get("chart") or {}
+    _preset_names = list(PRESETS) + [CUSTOM]
+    _saved_preset = _saved_chart.get("preset")
+    if _saved_preset not in _preset_names:
+        _saved_preset = "📐 テクニカル"
+
+    # 保存値が壊れていても既定値で開けるようにする
+    _def_type = _saved_chart.get("chart_type")
+    _def_type = _def_type if _def_type in CHART_TYPES else "ローソク足"
+    _def_bar = _saved_chart.get("bar_label")
+    _def_bar = _def_bar if _def_bar in INTERVALS else "日足"
+
+    c_type, c_interval = st.columns([2.2, 3])
     with c_type:
         chart_type = st.pills("チャート種別", CHART_TYPES,
-                              default="ローソク足") or "ローソク足"
+                              default=_def_type) or _def_type
     with c_interval:
-        bar_label = st.pills("足の間隔", list(INTERVALS), default="日足") or "日足"
+        bar_label = st.pills("足の間隔", list(INTERVALS),
+                             default=_def_bar) or _def_bar
+
+    c_preset, c_cfg = st.columns([3.4, 1.2])
+    with c_preset:
+        preset = st.pills("表示プリセット", _preset_names,
+                          default=_saved_preset) or _saved_preset
     with c_cfg:
-        with st.popover("⚙️ 表示設定"):
-            overlays = st.multiselect("オーバーレイ(価格に重ねる指標)",
-                                      OVERLAY_OPTIONS,
-                                      default=["SMA20", "SMA50", "SMA200",
-                                               "サポレジライン"])
-            oscillators = st.multiselect("サブチャート", OSC_OPTIONS,
-                                         default=["出来高", "RSI", "MACD"])
-            show_events = st.toggle("配当・分割マーカー", value=True)
-            log_scale = st.toggle("対数スケール(価格軸)", value=False)
-            benches = st.multiselect("パフォーマンス比較", list(BENCHMARKS),
-                                     default=[])
+        st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+        cfg_pop = st.popover("⚙️ 詳細設定", use_container_width=True)
+
+    # プリセットを選んだらその内容、カスタムなら前回の選択を初期値にする
+    if preset in PRESETS:
+        base_overlays = PRESETS[preset]["overlays"]
+        base_oscs = PRESETS[preset]["oscillators"]
+    else:
+        base_overlays = _saved_chart.get("overlays") or ["SMA50", "サポレジライン"]
+        base_oscs = _saved_chart.get("oscillators") or ["出来高", "RSI"]
+
+    with cfg_pop:
+        st.caption("プリセットを上書きすると「カスタム」として保存されます。")
+        overlays = st.multiselect("オーバーレイ(価格に重ねる指標)",
+                                  OVERLAY_OPTIONS,
+                                  default=[o for o in base_overlays
+                                           if o in OVERLAY_OPTIONS])
+        oscillators = st.multiselect("サブチャート", OSC_OPTIONS,
+                                     default=[o for o in base_oscs
+                                              if o in OSC_OPTIONS])
+        col_a, col_b = st.columns(2)
+        show_events = col_a.toggle("配当・分割マーカー",
+                                   value=_saved_chart.get("events", True))
+        log_scale = col_b.toggle("対数スケール",
+                                 value=_saved_chart.get("log_scale", False))
+        _heights = {360: "低い", 430: "標準", 520: "やや高い",
+                    640: "高い", 780: "最大"}
+        _def_h = _saved_chart.get("height")
+        _def_h = _def_h if _def_h in _heights else 430
+        chart_height = st.select_slider(
+            "チャートの高さ", options=list(_heights),
+            value=_def_h, format_func=lambda v: _heights[v])
+        benches = st.multiselect("パフォーマンス比較", list(BENCHMARKS), default=[])
+
+    # 設定が変わったら保存(次回起動時も同じ見た目で開ける)
+    _now_chart = {
+        "preset": preset if (preset in PRESETS
+                             and sorted(overlays) == sorted(PRESETS[preset]["overlays"])
+                             and sorted(oscillators) == sorted(PRESETS[preset]["oscillators"]))
+        else CUSTOM,
+        "chart_type": chart_type, "bar_label": bar_label,
+        "overlays": overlays, "oscillators": oscillators,
+        "events": show_events, "log_scale": log_scale, "height": chart_height,
+    }
+    if _now_chart != _saved_chart:
+        settings_store.save(chart=_now_chart)
+
     interval = INTERVALS[bar_label]
 
     chart_view = view
@@ -252,11 +329,14 @@ with tab_chart:
         "events": show_events,
         "log_scale": log_scale,
         "levels": lv_chart,
+        "height": chart_height,
     }
     st.plotly_chart(charts.price_chart(chart_view, ticker, opts),
                     config=PLOT_CONFIG)
-    st.caption("💡 チャート右上のツールバーからトレンドライン・矩形の描画や消去ができます。"
-               "◆=配当、★=株式分割。赤破線=抵抗線、緑破線=サポート。"
+    st.caption("💡 十字カーソルで価格と日付を読めます。ドラッグで拡大、ダブルクリックで戻る。"
+               "右上のツールバーからトレンドライン・矩形の描画も可能です。"
+               "◆=配当、★=株式分割。赤帯=抵抗ゾーン、緑帯=サポートゾーン"
+               "(濃く太いほど強いレベル)。"
                + (f" {limit_note}" if limit_note else ""))
 
     if benches:
@@ -301,6 +381,7 @@ with tab_chart:
             "価格": lv["price"],
             "現在比": lv["distance_pct"],
             "反発実績": _rate_str(lv),
+            "ヒゲ拒絶": lv.get("rejects", 0),
             "強さ": "★" * lv["strength"],
             "根拠": lv["basis"] + (" / " + "・".join(lv["confluence"])
                                    if lv["confluence"] else ""),
@@ -310,9 +391,27 @@ with tab_chart:
         ).map(lambda v: "color: #d03b3b" if v == "抵抗線" else "color: #006300",
               subset=["種別"])
         st.dataframe(styled_lv, hide_index=True)
-        st.caption("反発実績=接近時に反転した回数/接近回数。「日足合流」等は上位足でも"
-                   "同じレベルが確認できたもの。価格帯(ゾーン)はチャート上の帯で表示。"
-                   "期間を切り替えると再計算されます。参考情報です。")
+        st.caption("反発実績=接近時に反転した回数/接近回数。ヒゲ拒絶=実体では入らず"
+                   "ヒゲだけが刺さって押し戻された回数(反発の強い証拠)。"
+                   "「日足合流」等は上位足でも同じレベルが確認できたもの。"
+                   "期間を切り替えると再計算されます。")
+
+        with st.expander("ℹ️ 「強さ★」の意味と、検証でわかった限界"):
+            st.markdown(
+                "★は **レベル同士の優劣を並べるための相対評価** です。"
+                "S&P500構成銘柄の2013〜2018年の日次データで、6ヶ月分から算出した"
+                "レベルが40本先までにどうなったかを実測して較正しました。\n\n"
+                "較正に使っていない80銘柄での結果:\n\n"
+                "| 強さ | 接近後に反発した割合 |\n|---|---|\n"
+                "| ★5 | 65.0% |\n| ★4 | 58.0% |\n| ★3 | 60.2% |\n"
+                "| ★2 | 57.6% |\n| ★1 | 58.9% |\n\n"
+                "**★5は★1より約6pt反発しやすい**、という程度の差です。"
+                "★4以下の差はほとんどありません。\n\n"
+                "⚠️ さらに重要な限界として、**同じ距離にランダムに引いた線と比べた"
+                "反発率の差はほぼゼロ**でした。つまりレベルに触れたあと反発するか"
+                "抜けるかは、この手法では予測できていません。"
+                "★が高いレベルを「相対的に注目度が高い価格帯」として見る使い方に"
+                "留め、売買判断の根拠にはしないでください。")
 
         with st.expander("📋 詳細データ(ゾーン範囲・テスト履歴)"):
             st.dataframe(pd.DataFrame([{
