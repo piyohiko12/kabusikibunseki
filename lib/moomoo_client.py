@@ -359,6 +359,192 @@ def capital_distribution(ticker: str) -> dict | None:
             "update_time": row.get("update_time")}
 
 
+SESSION_RANKS = {
+    "pre": ("get_us_pre_market_rank", "pre_market"),
+    "after": ("get_us_after_hours_rank", "after_hours"),
+    "overnight": ("get_us_overnight_rank", "overnight"),
+}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def session_rank(session: str, count: int = 10, losers: bool = False) -> pd.DataFrame:
+    """米国株のプレ/アフター/夜間セッションのランキング。
+
+    session: "pre" | "after" | "overnight"、losers=Trueで値下がり順。
+    Yahoo Financeでは取得できない時間外の値動きを一覧できる。
+    """
+    ctx = _ctx()
+    spec = SESSION_RANKS.get(session)
+    if ctx is None or not spec:
+        return pd.DataFrame()
+    method, prefix = spec
+    try:
+        from moomoo import RankSortDir
+        sort_dir = RankSortDir.ASCENDING if losers else RankSortDir.DESCENDING
+        ret, data = getattr(ctx, method)(sort_dir=sort_dir, count=count)
+    except Exception:
+        return pd.DataFrame()
+    if not _ok(ret):
+        return pd.DataFrame()
+    # このAPI群は (件数, DataFrame) のタプルを返す
+    if isinstance(data, tuple):
+        data = data[1] if len(data) > 1 else None
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame({
+        "ティッカー": data.get("security", pd.Series(dtype=str)).map(_strip_market),
+        "銘柄名": data.get("name"),
+        "時間外価格": data.get(f"{prefix}_price"),
+        "時間外変化率": data.get(f"{prefix}_change_ratio"),
+        "出来高": data.get(f"{prefix}_volume"),
+        "終値": data.get("close_price"),
+    })
+    return out.dropna(subset=["ティッカー"]).reset_index(drop=True)
+
+
+def _strip_market(code) -> str | None:
+    """"US.AAPL" や {"code": "US.AAPL"} から "AAPL" を取り出す。"""
+    if isinstance(code, dict):
+        code = code.get("code") or code.get("security")
+    if not isinstance(code, str) or not code:
+        return None
+    return code.split(".", 1)[1] if "." in code else code
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fed_watch() -> pd.DataFrame:
+    """FedWatchの政策金利織り込み確率(会合日 × 金利レンジ × 確率)。"""
+    ctx = _ctx()
+    if ctx is None:
+        return pd.DataFrame()
+    try:
+        ret, data = ctx.get_fed_watch_target_rate()
+    except Exception:
+        return pd.DataFrame()
+    if not _ok(ret) or not isinstance(data, pd.DataFrame) or data.empty:
+        return pd.DataFrame()
+    cols = [c for c in ["meeting_date", "target_range", "probability"] if c in data.columns]
+    if len(cols) < 3:
+        return pd.DataFrame()
+    out = data[cols].copy()
+    out["probability"] = pd.to_numeric(out["probability"], errors="coerce")
+    return out.dropna(subset=["probability"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def short_interest(ticker: str, num: int = 24) -> pd.DataFrame:
+    """空売り残高の推移(米国株)。列: 日付・空売り株数・浮動株比率・日数(days to cover)。"""
+    ctx = _ctx()
+    code = to_code(ticker)
+    if ctx is None or not code:
+        return pd.DataFrame()
+    try:
+        res = ctx.get_short_interest(code, num=num)
+    except Exception:
+        return pd.DataFrame()
+    # このAPIは (ret, 米国用DataFrame, 香港用DataFrame) を返す
+    if not isinstance(res, tuple) or len(res) < 2 or not _ok(res[0]):
+        return pd.DataFrame()
+    us = res[1]
+    if not isinstance(us, pd.DataFrame) or us.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "日付": us.get("timestamp_str"),
+        "空売り株数": pd.to_numeric(us.get("shares_short"), errors="coerce"),
+        "浮動株比率": pd.to_numeric(us.get("short_percent"), errors="coerce"),
+        "買い戻し日数": pd.to_numeric(us.get("days_to_cover"), errors="coerce"),
+        "終値": pd.to_numeric(us.get("close_price"), errors="coerce"),
+    })
+    return out.dropna(subset=["空売り株数"]).reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def institutional_holding(ticker: str, num: int = 12) -> pd.DataFrame:
+    """機関投資家の保有推移。列: 報告期・機関数・保有株数・保有比率と各変化。"""
+    ctx = _ctx()
+    code = to_code(ticker)
+    if ctx is None or not code:
+        return pd.DataFrame()
+    try:
+        ret, data = ctx.get_shareholders_institutional(code, num=num)
+    except Exception:
+        return pd.DataFrame()
+    if not _ok(ret) or not isinstance(data, pd.DataFrame) or data.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "報告期": data.get("period_text"),
+        "機関数": pd.to_numeric(data.get("institution_quantity"), errors="coerce"),
+        "機関数の増減": pd.to_numeric(data.get("institution_quantity_change"), errors="coerce"),
+        "保有株数": pd.to_numeric(data.get("holder_quantity"), errors="coerce"),
+        "保有株数の増減": pd.to_numeric(data.get("holder_quantity_change"), errors="coerce"),
+        "保有比率": pd.to_numeric(data.get("holder_pct"), errors="coerce"),
+        "保有比率の増減": pd.to_numeric(data.get("holder_pct_change"), errors="coerce"),
+    })
+    out = out.dropna(subset=["報告期"])
+    return out.reset_index(drop=True)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def option_volatility(ticker: str) -> dict | None:
+    """オプションのIV(予想変動率)とHV(実績変動率)の推移および現在の評価。"""
+    ctx = _ctx()
+    code = to_code(ticker)
+    if ctx is None or not code:
+        return None
+    try:
+        ret, data = ctx.get_option_volatility(code)
+    except Exception:
+        return None
+    if not _ok(ret) or not isinstance(data, pd.DataFrame) or data.empty:
+        return None
+    series = pd.DataFrame({
+        "日付": data.get("timestamp_str"),
+        "IV": pd.to_numeric(data.get("implied_volatility"), errors="coerce"),
+        "HV": pd.to_numeric(data.get("history_volatility"), errors="coerce"),
+        "IVプレミアム": pd.to_numeric(data.get("volatility_premium"), errors="coerce"),
+    }).dropna(subset=["IV"], how="all")
+    if series.empty:
+        return None
+    head = data.iloc[0]
+    return {
+        "series": series.reset_index(drop=True),
+        "average_iv": pd.to_numeric(pd.Series([head.get("average_impvol")]),
+                                    errors="coerce").iloc[0],
+        "status": head.get("impvol_status"),
+        "analysis": head.get("analysis") or "",
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def put_call_ratio(days: int = 180) -> pd.DataFrame:
+    """米国株オプション市場全体のPut/Callレシオ(出来高ベース)の推移。"""
+    ctx = _ctx()
+    if ctx is None:
+        return pd.DataFrame()
+    try:
+        from moomoo import OptionMarket, OptionStatisticDataType
+        end = pd.Timestamp.today().normalize()
+        begin = end - pd.Timedelta(days=days)
+        res = ctx.get_option_market_statistic(
+            OptionMarket.US_SECURITY, OptionStatisticDataType.VOLUME,
+            begin_time=begin.strftime("%Y-%m-%d"), end_time=end.strftime("%Y-%m-%d"))
+    except Exception:
+        return pd.DataFrame()
+    if not isinstance(res, tuple) or not _ok(res[0]):
+        return pd.DataFrame()
+    data = res[1]
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "日付": data.get("time"),
+        "Put/Call": pd.to_numeric(data.get("ratio"), errors="coerce"),
+        "Call": pd.to_numeric(data.get("call_value"), errors="coerce"),
+        "Put": pd.to_numeric(data.get("put_value"), errors="coerce"),
+    }).dropna(subset=["Put/Call"])
+    return out.reset_index(drop=True)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def history_quota() -> dict | None:
     """履歴K線の残りクォータ。無料枠の消費状況を画面で確認できるようにする。"""

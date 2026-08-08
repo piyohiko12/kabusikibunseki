@@ -169,8 +169,8 @@ else:
     st.caption("株価はYahoo Financeの値で、15〜20分遅れています。"
                "サイドバーの「moomooリアルタイム連携」を有効にすると即時値になります。")
 
-tab_chart, tab_news, tab_tape = st.tabs(
-    ["📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値"])
+tab_chart, tab_news, tab_tape, tab_flow = st.tabs(
+    ["📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値", "🏦 需給・IV"])
 
 # ---------------------------------------------------------------- タブ1
 with tab_chart:
@@ -613,3 +613,84 @@ with tab_tape:
                           border=True)
                 st.caption("大口ほど機関投資家の動きを反映しやすい参考情報です。"
                            "売買代金の内訳であり、将来の値動きを示すものではありません。")
+
+
+# ---------------------------------------------------------------- タブ4
+with tab_flow:
+    if moomoo_client.status()["state"] != "ok":
+        st.info("このタブはmoomoo OpenAPI(無料)に接続すると使えます。"
+                "サイドバーの「moomooリアルタイム連携」から設定してください。")
+    else:
+        st.caption(f"{ticker} の需給(空売り・機関投資家)とオプションの変動率。"
+                   "いずれもmoomooから取得した参考情報です。")
+
+        # --- 空売り残高 ---
+        st.markdown("#### 🐻 空売り残高")
+        shorts = moomoo_client.short_interest(ticker)
+        if shorts.empty:
+            st.caption("空売り残高を取得できませんでした(対象外の銘柄か、権限がありません)。")
+        else:
+            latest_s = shorts.iloc[-1]
+            prev_s = shorts.iloc[-2] if len(shorts) > 1 else latest_s
+            s1, s2, s3 = st.columns(3)
+            delta_shares = latest_s["空売り株数"] - prev_s["空売り株数"]
+            s1.metric("空売り株数", f"{latest_s['空売り株数']:,.0f}株",
+                      f"{delta_shares:+,.0f}", delta_color="inverse", border=True)
+            if pd.notna(latest_s["浮動株比率"]):
+                s2.metric("浮動株に対する比率", f"{latest_s['浮動株比率']:.2f}%",
+                          f"{latest_s['浮動株比率'] - prev_s['浮動株比率']:+.2f}pt"
+                          if pd.notna(prev_s["浮動株比率"]) else None,
+                          delta_color="inverse", border=True)
+            if pd.notna(latest_s["買い戻し日数"]):
+                s3.metric("買い戻しにかかる日数", f"{latest_s['買い戻し日数']:.1f}日",
+                          "高いほど踏み上げが起きやすい", delta_color="off", border=True)
+            st.plotly_chart(charts.short_interest_chart(shorts),
+                            config={"displayModeBar": False})
+
+        # --- 機関投資家の保有推移 ---
+        st.divider()
+        st.markdown("#### 🏦 機関投資家の保有推移")
+        inst = moomoo_client.institutional_holding(ticker)
+        if inst.empty:
+            st.caption("機関投資家の保有データを取得できませんでした。")
+        else:
+            latest_i = inst.iloc[-1]
+            i1, i2, i3 = st.columns(3)
+            i1.metric("保有機関数", f"{latest_i['機関数']:,.0f}",
+                      f"{latest_i['機関数の増減']:+,.0f}"
+                      if pd.notna(latest_i["機関数の増減"]) else None, border=True)
+            if pd.notna(latest_i["保有比率"]):
+                i2.metric("機関の保有比率", f"{latest_i['保有比率']:.2f}%",
+                          f"{latest_i['保有比率の増減']:+.2f}pt"
+                          if pd.notna(latest_i["保有比率の増減"]) else None, border=True)
+            i3.metric("最新の報告期", str(latest_i["報告期"]), border=True)
+            st.plotly_chart(charts.institution_chart(inst),
+                            config={"displayModeBar": False})
+            st.caption("四半期ごとの報告(13F等)に基づくため、実際の売買からは遅れます。")
+
+        # --- オプションのIV ---
+        st.divider()
+        st.markdown("#### 🌪️ オプションの変動率(IV / HV)")
+        vol = moomoo_client.option_volatility(ticker)
+        if not vol:
+            st.caption("オプションの変動率を取得できませんでした"
+                       "(オプションが上場していない銘柄の可能性があります)。")
+        else:
+            v_chart, v_note = st.columns([1.6, 1])
+            with v_chart:
+                st.plotly_chart(charts.iv_hv_chart(vol["series"]),
+                                config={"displayModeBar": False})
+            with v_note:
+                last_v = vol["series"].iloc[-1]
+                if pd.notna(last_v.get("IV")):
+                    st.metric("現在のIV", f"{last_v['IV']:.1f}%",
+                              f"HVとの差 {last_v['IVプレミアム']:+.1f}pt"
+                              if pd.notna(last_v.get("IVプレミアム")) else None,
+                              delta_color="off", border=True)
+                if vol.get("average_iv") is not None and pd.notna(vol["average_iv"]):
+                    st.metric("平均IV", f"{vol['average_iv']:.1f}%", border=True)
+                if vol.get("analysis"):
+                    st.info(vol["analysis"])
+                st.caption("IVが高いほどオプション市場が今後の大きな値動きを"
+                           "見込んでいることを示します。HVを大きく上回るときは"
+                           "決算などのイベントが控えている場合があります。")
