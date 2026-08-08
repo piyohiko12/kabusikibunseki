@@ -5,8 +5,8 @@ import html
 import pandas as pd
 import streamlit as st
 
-from lib import (charts, data_fetcher, indicators, levels, news_fetcher,
-                 sensitivity, settings_store, ui)
+from lib import (charts, data_fetcher, indicators, levels, moomoo_client,
+                 news_fetcher, sensitivity, settings_store, ui)
 
 # 表示ラベル → (取得期間, 表示日数)。SMA200を期間の先頭から描くため長めに取得する。
 PERIODS = {
@@ -132,8 +132,20 @@ if badges:
     st.markdown(" ".join(badges), unsafe_allow_html=True)
     st.markdown("")
 
+# moomooが使えるときは遅延のない現在値に差し替える(使えなければYahooの終値のまま)
+realtime = moomoo_client.snapshot((ticker,)).get(ticker)
+if realtime and realtime.get("price"):
+    price_now = float(realtime["price"])
+    base = realtime.get("previous_close") or prev
+    change = price_now - float(base)
+    change_pct = (price_now / float(base) - 1) * 100 if base else 0.0
+    price_label = "株価(リアルタイム)"
+else:
+    price_now = latest
+    price_label = "株価(直近終値)"
+
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("株価(直近終値)", f"${latest:,.2f}",
+m1.metric(price_label, f"${price_now:,.2f}",
           f"{change:+,.2f}({change_pct:+.2f}%)", border=True)
 m2.metric("52週高値", f"${year['High'].max():,.2f}", border=True)
 m3.metric("52週安値", f"${year['Low'].min():,.2f}", border=True)
@@ -149,7 +161,16 @@ if rsi_now is not None and pd.notna(rsi_now):
 else:
     m4.metric("RSI(14)", "—", border=True)
 
-tab_chart, tab_news = st.tabs(["📊 チャート・指標", "📰 ニュース・ネットの反応"])
+if realtime:
+    st.caption(f"🟢 株価はmoomooのリアルタイム値です(更新: "
+               f"{realtime.get('update_time') or '—'})。"
+               "チャート・指標はYahoo Financeの日足を使用しています。")
+else:
+    st.caption("株価はYahoo Financeの値で、15〜20分遅れています。"
+               "サイドバーの「moomooリアルタイム連携」を有効にすると即時値になります。")
+
+tab_chart, tab_news, tab_tape = st.tabs(
+    ["📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値"])
 
 # ---------------------------------------------------------------- タブ1
 with tab_chart:
@@ -514,3 +535,81 @@ with tab_news:
                     body = p["body"]
                     st.write(md_escape(body[:300] + ("…" if len(body) > 300 else "")))
 
+
+
+# ---------------------------------------------------------------- タブ3
+with tab_tape:
+    state = moomoo_client.status()
+    if state["state"] != "ok":
+        st.info(
+            "このタブはmoomoo OpenAPI(無料)に接続すると使えます。\n\n"
+            f"現在の状態: **{state['message']}**\n\n"
+            "1. moomoo証券の口座でログインできる **moomoo OpenD** をPCで起動する\n"
+            "2. サイドバーの「moomooリアルタイム連携」を有効にする\n\n"
+            "接続しても取得できるのは相場データだけで、このツールは発注を一切行いません。"
+        )
+    else:
+        st.caption(f"{ticker} の板・歩み値(moomoo・自動更新はしません。"
+                   "最新にするにはページを再読み込みしてください)")
+        col_book, col_tick = st.columns([1, 1])
+
+        with col_book:
+            book = moomoo_client.order_book(ticker)
+            if not book:
+                st.warning("板情報を取得できませんでした。"
+                           "米国株の板情報には対応する相場権限が必要です。")
+            else:
+                st.plotly_chart(charts.depth_chart(book["bids"], book["asks"]),
+                                config={"displayModeBar": False})
+                if book["bids"] and book["asks"]:
+                    spread = book["asks"][0][0] - book["bids"][0][0]
+                    mid = (book["asks"][0][0] + book["bids"][0][0]) / 2
+                    bid_vol = sum(v for _p, v, _n in book["bids"])
+                    ask_vol = sum(v for _p, v, _n in book["asks"])
+                    b1, b2 = st.columns(2)
+                    b1.metric("スプレッド", f"${spread:,.3f}",
+                              f"{spread / mid * 100:.3f}%" if mid else None,
+                              delta_color="off", border=True)
+                    total = bid_vol + ask_vol
+                    b2.metric("買い板の厚み", f"{bid_vol / total * 100:.0f}%" if total else "—",
+                              f"買{bid_vol:,} / 売{ask_vol:,}",
+                              delta_color="off", border=True)
+
+        with col_tick:
+            ticks = moomoo_client.recent_ticks(ticker, num=60)
+            if ticks.empty:
+                st.warning("歩み値を取得できませんでした。")
+            else:
+                buy = int((ticks.get("ticker_direction") == "BUY").sum())
+                sell = int((ticks.get("ticker_direction") == "SELL").sum())
+                if buy or sell:
+                    st.plotly_chart(ui.stacked_bar([
+                        ("買い約定", buy, "#0ca30c", "#ffffff"),
+                        ("売り約定", sell, "#d03b3b", "#ffffff"),
+                    ]), config={"displayModeBar": False})
+                st.dataframe(
+                    ticks.rename(columns={
+                        "time": "時刻", "price": "価格", "volume": "数量",
+                        "turnover": "代金", "ticker_direction": "方向", "type": "種別"}),
+                    hide_index=True, height=420,
+                    column_config={
+                        "価格": st.column_config.NumberColumn(format="$%.2f"),
+                        "数量": st.column_config.NumberColumn(format="%,d"),
+                        "代金": st.column_config.NumberColumn(format="$%,.0f"),
+                    })
+
+        cap = moomoo_client.capital_distribution(ticker)
+        if cap:
+            st.divider()
+            c_chart, c_note = st.columns([1.4, 1])
+            with c_chart:
+                st.plotly_chart(charts.capital_bar(cap["tiers"]),
+                                config={"displayModeBar": False})
+            with c_note:
+                st.markdown("#### 資金の出入り")
+                st.metric("本日の純流入", f"${cap['net']:+,.0f}",
+                          "買い越し" if cap["net"] >= 0 else "売り越し",
+                          delta_color="normal" if cap["net"] >= 0 else "inverse",
+                          border=True)
+                st.caption("大口ほど機関投資家の動きを反映しやすい参考情報です。"
+                           "売買代金の内訳であり、将来の値動きを示すものではありません。")

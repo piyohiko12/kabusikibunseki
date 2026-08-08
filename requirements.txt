@@ -3,3 +3,5 @@ yfinance>=0.2.50
 pandas>=2.0
 plotly>=5.24
 lxml>=5.0
+# moomoo OpenAPI(任意)。未接続でもアプリは従来どおり動く
+moomoo-api>=10.4

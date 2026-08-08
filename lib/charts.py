@@ -425,6 +425,53 @@ def perf_bar(changes: pd.Series, title: str) -> go.Figure:
     return fig
 
 
+def depth_chart(bids: list[tuple], asks: list[tuple]) -> go.Figure:
+    """板情報の横棒グラフ(上=売り気配 赤、下=買い気配 緑)。
+
+    bids / asks は (価格, 数量, 注文数) のリスト(価格の良い順)。
+    """
+    rows = [(p, v, "売り") for p, v, _n in reversed(asks)] + \
+           [(p, v, "買い") for p, v, _n in bids]
+    if not rows:
+        return go.Figure()
+    labels = [f"{p:,.2f}" for p, _v, _s in rows]
+    fig = go.Figure(go.Bar(
+        x=[v for _p, v, _s in rows], y=labels, orientation="h",
+        marker_color=[DOWN if s == "売り" else UP for _p, _v, s in rows],
+        marker_line_width=0,
+        text=[f"{v:,}" for _p, v, _s in rows], textposition="outside",
+        hovertemplate="%{y}: %{x:,}株<extra></extra>",
+    ))
+    # 売りと買いの境目(スプレッド)に線を引く
+    if asks and bids:
+        fig.add_hline(y=len(asks) - 0.5, line=dict(color=MUTED, width=1, dash="dot"))
+    fig.update_layout(
+        title="板情報(気配)", height=max(260, 26 * len(rows) + 90),
+        margin=dict(t=50, b=20), showlegend=False,
+        xaxis_title="数量(株)", yaxis_title="価格($)",
+        yaxis=dict(autorange="reversed", type="category"),
+    )
+    return fig
+
+
+def capital_bar(tiers: list[tuple]) -> go.Figure:
+    """資金流入の横棒グラフ。tiers は (区分, 純額, 流入, 流出) のリスト。"""
+    labels = [t[0] for t in tiers]
+    values = [t[1] for t in tiers]
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation="h",
+        marker_color=[UP if v >= 0 else DOWN for v in values], marker_line_width=0,
+        text=[f"{v/1e6:+,.1f}M" for v in values], textposition="outside",
+        hovertemplate="%{y}: $%{x:+,.0f}<extra></extra>",
+    ))
+    fig.add_vline(x=0, line=dict(color=MUTED, width=1))
+    fig.update_layout(title="資金流入(本日・純額)", height=260,
+                      margin=dict(t=50, b=20), showlegend=False,
+                      xaxis_title="純流入額(ドル)",
+                      yaxis=dict(autorange="reversed"))
+    return fig
+
+
 def value_chart(total: pd.Series, cost: float) -> go.Figure:
     """ポートフォリオ評価額の推移(取得額の水平線付き)。"""
     fig = go.Figure(go.Scatter(
