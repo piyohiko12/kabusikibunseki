@@ -12,6 +12,7 @@ pages = [
     st.Page("views/stock_analysis.py", title="銘柄分析", icon="📈", default=True),
     st.Page("views/compare.py", title="銘柄比較", icon="⚖️"),
     st.Page("views/market.py", title="市場概況", icon="🌐"),
+    st.Page("views/v6_signal.py", title="V6判定", icon="🤖"),
     st.Page("views/portfolio.py", title="ポートフォリオ管理", icon="💼"),
 ]
 nav = st.navigation(pages)

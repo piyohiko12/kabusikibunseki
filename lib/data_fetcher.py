@@ -25,6 +25,42 @@ def fetch_history(ticker: str, period: str, interval: str = "1d") -> pd.DataFram
     return df
 
 
+@st.cache_data(ttl=300, show_spinner="67銘柄の5分足を取得中...")
+def fetch_intraday_batch(tickers: tuple[str, ...], period: str = "1d",
+                         interval: str = "5m") -> dict[str, pd.DataFrame]:
+    """複数銘柄の分足をまとめて取得する(1銘柄ずつだとレート制限に当たるため)。
+
+    取得できなかった銘柄はキーごと含めない。呼び出し側で欠損を検査する。
+    """
+    if not tickers:
+        return {}
+    try:
+        raw = yf.download(list(tickers), period=period, interval=interval,
+                          group_by="ticker", auto_adjust=False, progress=False,
+                          threads=True)
+    except Exception as e:
+        raise FetchError(str(e)) from e
+    if raw is None or raw.empty:
+        return {}
+
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    out: dict[str, pd.DataFrame] = {}
+    for t in tickers:
+        try:
+            sub = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+        except KeyError:
+            continue
+        if not isinstance(sub, pd.DataFrame) or sub.empty:
+            continue
+        if not all(c in sub.columns for c in cols):
+            continue
+        df = sub[cols].dropna(subset=["Close"])
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        if not df.empty:
+            out[t] = df
+    return out
+
+
 @st.cache_data(ttl=900, show_spinner="銘柄情報を取得中...")
 def fetch_info(ticker: str) -> dict:
     """企業情報・ファンダメンタル指標を取得する。
