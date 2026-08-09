@@ -112,10 +112,11 @@ def _events(df: pd.DataFrame, zlo: float, zhi: float, atr: float,
     lo_ = df["Low"].to_numpy(float)
     c = df["Close"].to_numpy(float)
     n = len(df)
-    if "VOL_MA20" in df.columns and "Volume" in df.columns:
+    vol_ma_col = next((c for c in ("VOL_MA20", "VOL_MA") if c in df.columns), None)
+    if vol_ma_col is not None and "Volume" in df.columns:
         with np.errstate(divide="ignore", invalid="ignore"):
             vr = np.nan_to_num(df["Volume"].to_numpy(float)
-                               / df["VOL_MA20"].to_numpy(float), nan=1.0, posinf=1.0)
+                               / df[vol_ma_col].to_numpy(float), nan=1.0, posinf=1.0)
     else:
         vr = np.ones(n)
 

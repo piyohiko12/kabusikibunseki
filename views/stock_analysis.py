@@ -31,26 +31,6 @@ HTF_MAP = {"1m": "日足", "5m": "日足", "15m": "日足", "1h": "日足",
 OSC_OPTIONS = ["出来高", "RSI", "MACD", "ストキャスティクス"]
 
 # ワンクリックで用途別の表示に切り替えるプリセット
-PRESETS = {
-    "🧭 シンプル": {
-        "overlays": ["SMA50", "SMA200"],
-        "oscillators": ["出来高"],
-    },
-    "📐 テクニカル": {
-        "overlays": ["SMA20", "SMA50", "SMA200", "サポレジライン"],
-        "oscillators": ["出来高", "RSI", "MACD"],
-    },
-    "🎯 スイング": {
-        "overlays": ["SMA50", "SMA200", "サポレジライン", "フィボナッチ",
-                     "出来高プロファイル"],
-        "oscillators": ["出来高", "RSI"],
-    },
-    "⚡ デイトレ": {
-        "overlays": ["VWAP(日中)", "SMA20", "ボリンジャーバンド", "サポレジライン"],
-        "oscillators": ["出来高", "ストキャスティクス"],
-    },
-}
-CUSTOM = "⚙️ カスタム"
 BENCHMARKS = {"S&P500": "^GSPC", "NASDAQ総合": "^IXIC", "ダウ平均": "^DJI"}
 NEWS_SOURCES = ["Yahoo Finance", "Google News", "🇯🇵 日本語", "SEC開示"]
 PLOT_CONFIG = {
@@ -191,10 +171,10 @@ if badges:
     st.markdown("")
 
 # moomooが使えるときは遅延のない現在値に差し替える(使えなければYahooの終値のまま)
-realtime = moomoo_client.snapshot((ticker,)).get(ticker)
-if realtime and realtime.get("price"):
-    price_now = float(realtime["price"])
-    base = realtime.get("previous_close") or prev
+# snapshotはdata_fetcher.fetch_realtime_snapshot経由で1回だけ取得済み。
+if snapshot.get("price"):
+    price_now = float(snapshot["price"])
+    base = snapshot.get("previous_close") or prev
     change = price_now - float(base)
     change_pct = (price_now / float(base) - 1) * 100 if base else 0.0
     price_label = "株価(リアルタイム)"
@@ -389,8 +369,8 @@ with tab_chart:
         st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
         if st.button("↻", help="最新データを再取得", key="refresh_chart"):
             data_fetcher.fetch_chart_history.clear()
-            data_fetcher.fetch_realtime_snapshot.clear()
             data_fetcher.fetch_order_book.clear()
+            moomoo_client.snapshot.clear()
             st.rerun()
 
     macd_slow = max(int(macd_fast) + 1, int(macd_slow_input))

@@ -116,9 +116,11 @@ def _drawdown_52w(df: pd.DataFrame) -> float | None:
 
 
 def _volume_ratio(df: pd.DataFrame) -> float | None:
-    if "VOL_MA20" not in df.columns or "Volume" not in df.columns:
+    column = next((name for name in ("VOL_MA20", "VOL_MA")
+                   if name in df.columns), None)
+    if column is None or "Volume" not in df.columns:
         return None
-    average, volume = _last(df["VOL_MA20"]), _last(df["Volume"])
+    average, volume = _last(df[column]), _last(df["Volume"])
     if average in (None, 0) or volume is None:
         return None
     return volume / average

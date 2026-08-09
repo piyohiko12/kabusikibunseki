@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-from lib import moomoo_fetcher
+from lib import moomoo_client, moomoo_fetcher
 
 
 class FetchError(Exception):
@@ -109,17 +109,20 @@ def moomoo_status() -> dict:
     return moomoo_fetcher.connection_status()
 
 
-@st.cache_data(ttl=30, show_spinner=False)
 def fetch_realtime_snapshot(ticker: str) -> dict:
-    """moomooの最新価格。利用できなければフォールバック理由のみ返す。"""
-    try:
-        snapshot = moomoo_fetcher.fetch_snapshot(ticker)
-    except moomoo_fetcher.MoomooError as exc:
-        return {"source": "Yahoo Finance", "fallback_reason": str(exc)}
-    if not snapshot or not snapshot.get("price"):
+    """moomooの最新価格。利用できなければフォールバック理由のみ返す。
+
+    取得はmoomoo_client.snapshotに一本化している(そちらが5秒キャッシュを持つ)。
+    """
+    state = moomoo_client.status()
+    if state["state"] != moomoo_client._State.OK:
+        return {"source": "Yahoo Finance", "fallback_reason": state["message"]}
+    snap = moomoo_client.snapshot((ticker,)).get(ticker)
+    if not snap or not snap.get("price"):
         return {"source": "Yahoo Finance",
                 "fallback_reason": "moomooから最新価格を取得できませんでした"}
-    return snapshot
+    return {**snap, "code": moomoo_client.to_code(ticker) or ticker,
+            "source": "moomoo OpenAPI"}
 
 
 @st.cache_data(ttl=30, show_spinner="チャートデータを取得中...")
@@ -134,6 +137,17 @@ def _fetch_chart_history_cached(ticker: str, period: str, interval: str,
     del settings_token  # Streamlitのキャッシュキーに設定値を含めるための引数。
     fallback_reason = None
     moomoo_meta = {}
+    if not moomoo_fetcher.history_enabled():
+        # クォータを消費しないよう、moomooには問い合わせない。
+        return fetch_history(ticker, period, interval), {
+            "source": "Yahoo Finance",
+            "code": ticker,
+            "fetched_at": None,
+            "cache_status": "fallback",
+            "quota": None,
+            "remain": None,
+            "fallback_reason": None,
+        }
     try:
         moomoo = moomoo_fetcher.fetch_history(
             ticker, period, interval, allow_new_quota=allow_new_quota)
@@ -194,7 +208,8 @@ def fetch_chart_history(ticker: str, period: str, interval: str = "1d",
     """設定変更を即時反映しつつ、同じ設定内では30秒キャッシュする。"""
     settings = moomoo_fetcher._integration_settings()
     token = (
-        bool(settings.get("enabled")), str(settings.get("host")),
+        bool(settings.get("enabled")), bool(moomoo_fetcher.history_enabled()),
+        str(settings.get("host")),
         int(settings.get("port", 11111)), settings.get("history_reserve"),
     )
     return _fetch_chart_history_cached(
@@ -254,7 +269,6 @@ def fetch_capital_distribution(ticker: str) -> dict | None:
         return moomoo_fetcher.fetch_capital_distribution(ticker)
     except moomoo_fetcher.MoomooError as exc:
         raise FetchError(str(exc)) from exc
-
 
 @st.cache_data(ttl=900, show_spinner="銘柄情報を取得中...")
 def fetch_info(ticker: str) -> dict:

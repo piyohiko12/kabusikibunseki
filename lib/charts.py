@@ -391,17 +391,20 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
         prof = levels_mod.volume_profile(df)
         if not prof.empty and prof.max() > 0:
             share = prof / prof.sum() * 100
+            # サブプロットはxaxis1..xaxis{rows}を使うので、重ね描き用の軸は
+            # その次の番号を使う。x2を使うと出来高パネルの軸を壊してしまう。
+            axis_id = rows + 1
             fig.add_trace(go.Bar(
                 x=(prof / prof.max()).values, y=prof.index, orientation="h",
                 marker_color="rgba(42,120,214,0.22)", marker_line_width=0,
-                name="出来高プロファイル", xaxis="x2", yaxis="y",
+                name="出来高プロファイル", xaxis=f"x{axis_id}", yaxis="y",
                 customdata=share.values,
                 hovertemplate="$%{y:,.2f}帯: 出来高シェア %{customdata:.1f}%<extra></extra>",
             ))
-            fig.update_layout(xaxis2=dict(
-                overlaying="x", side="top", range=[0, 6],
+            fig.update_layout(**{f"xaxis{axis_id}": dict(
+                overlaying="x", anchor="y", side="top", range=[0, 6],
                 visible=False, fixedrange=True,
-            ))
+            )})
 
     if "サポレジライン" in set(o["overlays"]):
         for lv in (o.get("levels") or []):
@@ -473,6 +476,10 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
                 font=dict(color=theme["text"], size=10), x=0, y=1.04,
             ), row=1, col=1,
         )
+    # ローソク足はrangesliderの既定がTrueなので、まず全行で明示的に消す。
+    # 消さないと1行目のスライダーがサブチャート領域に価格チャートの縮小版を
+    # 重ね描きしてしまう。表示するのは最下段だけ。
+    fig.update_xaxes(rangeslider_visible=False)
     fig.update_xaxes(rangeslider_visible=o["range_slider"], row=rows, col=1)
 
     last_row = df.iloc[-1] if not df.empty else None
@@ -495,6 +502,9 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
         margin=dict(t=74, b=28, l=24, r=68),
         hoverlabel=dict(bgcolor=theme["panel"], font_color=theme["text"]),
         hoverdistance=80, spikedistance=-1,
+        # uirevisionが同じ間、Plotlyは前回のズーム位置などUI状態を引き継ぐ。
+        # インジケーターやテーマを切り替えてもズームが外れないようにしたいので、
+        # 銘柄・足種・チャート種別だけをキーにする。
         uirevision=f"{ticker}-{o['interval']}-{o['chart_type']}",
         newshape=dict(line=dict(color="#f5b642", width=2), opacity=0.9),
         modebar=dict(bgcolor="rgba(0,0,0,0)", color=theme["muted"],

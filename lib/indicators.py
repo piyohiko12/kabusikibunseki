@@ -89,9 +89,11 @@ def add_indicators(df: pd.DataFrame, params: dict | None = None) -> pd.DataFrame
 
     if "Volume" in out.columns:
         out["VOL_MA"] = out["Volume"].rolling(cfg["volume_ma"]).mean()
-        # 既存ページとの後方互換性
-        if cfg["volume_ma"] == 20:
-            out["VOL_MA20"] = out["VOL_MA"]
+        # VOL_MA20はチャート設定とは独立した固定の20日平均。
+        # ルール「出来高(20日平均比)」やサポレジの出来高評価が、
+        # チャートの期間設定で意味を変えてしまわないようにする。
+        out["VOL_MA20"] = (out["VOL_MA"] if cfg["volume_ma"] == 20
+                           else out["Volume"].rolling(20).mean())
         # VWAP(日ごとにリセット)。分足・時間足での利用を想定
         tp = (out["High"] + out["Low"] + out["Close"]) / 3
         day = out.index.date

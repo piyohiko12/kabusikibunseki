@@ -2,6 +2,11 @@
 
 OpenDまたはSDKが利用できない場合は例外を返し、呼び出し側がyfinanceへ
 フォールバックできるようにする。取引コンテキストや注文APIは扱わない。
+
+接続そのものは lib.moomoo_client に一本化している。OpenQuoteContext は
+OpenDが起動していないと例外を返さず無限に再接続を試みるため、
+moomoo_client 側のTCP事前確認+デーモンスレッド+タイムアウト+失敗キャッシュを
+必ず経由する。このモジュールでcontextを直接生成してはいけない。
 """
 
 from __future__ import annotations
@@ -9,18 +14,17 @@ from __future__ import annotations
 import json
 import os
 import re
-import socket
-from contextlib import closing
 from pathlib import Path
 
 import pandas as pd
 
+from lib import moomoo_client
+
 _SDK_IMPORT_ERROR = None
 try:
-    from moomoo import (AuType, KLType, OpenQuoteContext, RET_OK, Session,
-                        SubType)
+    from moomoo import AuType, KLType, RET_OK, Session, SubType
 except Exception as exc:  # SDKやログ初期化の失敗でもyfinanceで動かす
-    AuType = KLType = OpenQuoteContext = Session = SubType = None
+    AuType = KLType = Session = SubType = None
     RET_OK = 0
     _SDK_IMPORT_ERROR = str(exc)
 
@@ -57,30 +61,42 @@ DEFAULT_QUOTA_RESERVE = 10
 
 
 def _integration_settings() -> dict:
-    """サイドバーと同じ保存設定を返す。環境変数は未設定項目の補助に使う。"""
+    """共有クライアントと同じ接続設定に、履歴予約枠を加えて返す。"""
+    cfg = moomoo_client._settings()
     try:
         from lib import settings_store
         saved = settings_store.load()
     except Exception:
         saved = {}
-    host = saved.get("moomoo_host") or os.environ.get(
-        "FUTU_OPEND_HOST", "127.0.0.1")
-    raw_port = saved.get("moomoo_port") or os.environ.get("FUTU_OPEND_PORT", "11111")
-    try:
-        port = int(raw_port)
-    except (TypeError, ValueError):
-        port = 11111
     return {
-        "enabled": bool(saved.get("moomoo_enabled", False)),
-        "host": host,
-        "port": port,
+        "enabled": bool(cfg["enabled"]),
+        "host": cfg["host"],
+        "port": cfg["port"],
         "history_reserve": saved.get("moomoo_history_reserve"),
     }
 
 
+HISTORY_DISABLED_MESSAGE = (
+    "moomooの履歴K線取得はオフです(歴史的K線クォータを消費するため既定でオフ)"
+)
+
+
 def _connection() -> tuple[str, int]:
-    settings = _integration_settings()
-    return settings["host"], settings["port"]
+    cfg = moomoo_client._settings()
+    return cfg["host"], cfg["port"]
+
+
+def history_enabled() -> bool:
+    """チャート履歴をmoomooから取るかどうか。
+
+    request_history_kline は口座資産に応じた「歴史的K線クォータ」を消費し、
+    一度使うと30日間戻らない。既定はオフにして、チャートはYahoo Financeから
+    取得する。設定画面で明示的にオンにしたときだけmoomooを使う。
+    """
+    from lib import settings_store
+    s = settings_store.load()
+    return bool(s.get("moomoo_enabled", False)) and bool(
+        s.get("moomoo_chart_history", False))
 
 
 def normalize_code(ticker: str) -> str:
@@ -106,52 +122,36 @@ def normalize_code(ticker: str) -> str:
 
 
 def connection_status(timeout: float = 0.4) -> dict:
-    """SDKとOpenDの利用可否をpickle可能なdictで返す。"""
-    settings = _integration_settings()
-    sdk_installed = OpenQuoteContext is not None
-    host, port = settings["host"], settings["port"]
-    reachable = False
-    if settings["enabled"] and sdk_installed:
-        try:
-            with closing(socket.create_connection((host, port), timeout=timeout)):
-                reachable = True
-        except OSError:
-            pass
+    """SDKとOpenDの利用可否をpickle可能なdictで返す。
 
-    if not settings["enabled"]:
-        message = "moomoo連携はオフ"
-    elif not sdk_installed:
-        message = ("moomoo-api SDKが未導入です" if not _SDK_IMPORT_ERROR else
-                   f"moomoo-api SDKを読み込めません: {_SDK_IMPORT_ERROR}")
-    elif not reachable:
-        message = f"OpenDに接続できません({host}:{port})"
-    else:
-        message = f"OpenD接続中({host}:{port})"
+    判定は moomoo_client.status() に委譲する(TCP確認・接続タイムアウト・
+    失敗キャッシュを含む)。
+    """
+    del timeout  # 既存呼び出しとの互換用。実際のtimeoutは共有クライアントが管理する。
+    state = moomoo_client.status()
+    settings = _integration_settings()
+    host, port = _connection()
     return {
-        "available": settings["enabled"] and sdk_installed and reachable,
+        "available": state["state"] == moomoo_client._State.OK,
         "enabled": settings["enabled"],
-        "sdk_installed": sdk_installed,
-        "opend_reachable": reachable,
+        "sdk_installed": state["state"] != moomoo_client._State.NOT_INSTALLED,
+        "opend_reachable": state["state"] in (moomoo_client._State.OK,
+                                              moomoo_client._State.TIMEOUT),
         "host": host,
         "port": port,
-        "message": message,
+        "message": state["message"],
     }
 
 
-def _ensure_available() -> None:
-    status = connection_status()
-    if not status["available"]:
-        raise MoomooError(status["message"])
-
-
 def _open_context():
-    _ensure_available()
-    host, port = _connection()
-    try:
-        return OpenQuoteContext(host=host, port=port, ai_type=1)
-    except TypeError:
-        # 古いSDKではai_typeが未実装。読み取り専用接続は従来引数で継続する。
-        return OpenQuoteContext(host=host, port=port)
+    """moomoo_clientが保持する共有contextを返す。
+
+    呼び出し側はこのcontextを close してはいけない(使い回すため)。
+    """
+    ctx = moomoo_client._ctx()
+    if ctx is None:
+        raise MoomooError(moomoo_client.status()["message"])
+    return ctx
 
 
 def _period_start(period: str, now: pd.Timestamp | None = None) -> str:
@@ -412,10 +412,11 @@ def fetch_history(ticker: str, period: str, interval: str = "1d",
     """
     if interval not in INTERVAL_MAP:
         raise MoomooError(f"未対応の足種です: {interval}")
+    if not history_enabled():
+        if not _integration_settings()["enabled"]:
+            raise MoomooError("moomoo連携はオフ")
+        raise MoomooError(HISTORY_DISABLED_MESSAGE)
     code = normalize_code(ticker)
-    if not _integration_settings()["enabled"]:
-        # 設定OFFは明示的な利用停止。OpenDだけでなくローカルキャッシュも使わない。
-        raise MoomooError("moomoo連携はオフ")
     cached = _read_history_cache(code, period, interval)
     if cached is not None and cached[1]["cache_status"] == "fresh":
         return cached[0]
@@ -526,11 +527,6 @@ def fetch_history(ticker: str, period: str, interval: str = "1d",
             stale.attrs["moomoo_meta"] = meta
             return stale
         raise MoomooError(str(exc)) from exc
-    finally:
-        if ctx is not None:
-            ctx.close()
-
-
 def _enum_text(value) -> str:
     name = getattr(value, "name", None)
     if name:
@@ -562,15 +558,11 @@ def fetch_market_state(ticker: str) -> dict:
         raise
     except Exception as exc:
         raise MoomooError(str(exc)) from exc
-    finally:
-        if ctx is not None:
-            ctx.close()
 
 
 def fetch_snapshot(ticker: str) -> dict:
     """最新価格・前日終値・最良気配などのスナップショットを取得する。"""
     code = normalize_code(ticker)
-    ctx = None
     try:
         ctx = _open_context()
         ret, data = ctx.get_market_snapshot([code])
@@ -594,9 +586,6 @@ def fetch_snapshot(ticker: str) -> dict:
         raise
     except Exception as exc:
         raise MoomooError(str(exc)) from exc
-    finally:
-        if ctx is not None:
-            ctx.close()
 
 
 def _book_value(item) -> tuple[float | None, float | None]:
@@ -612,12 +601,11 @@ def _book_value(item) -> tuple[float | None, float | None]:
 def fetch_order_book(ticker: str, num: int = 10) -> pd.DataFrame:
     """板情報を最良気配から最大num段取得する。取引は一切行わない。"""
     code = normalize_code(ticker)
-    ctx = None
     try:
         ctx = _open_context()
-        ret, message = ctx.subscribe([code], [SubType.ORDER_BOOK])
-        if ret != RET_OK:
-            raise MoomooError(str(message))
+        # 購読数には口座ごとの上限があるので、moomoo_client側の購読管理を通す。
+        if not moomoo_client._ensure_subscribed(ctx, code, [SubType.ORDER_BOOK]):
+            raise MoomooError(f"板情報の購読に失敗しました: {code}")
         ret, data = ctx.get_order_book(code, num=num)
         if ret != RET_OK:
             raise MoomooError(str(data))
@@ -639,20 +627,13 @@ def fetch_order_book(ticker: str, num: int = 10) -> pd.DataFrame:
         raise
     except Exception as exc:
         raise MoomooError(str(exc)) from exc
-    finally:
-        if ctx is not None:
-            ctx.close()
-
-
 def fetch_recent_ticks(ticker: str, num: int = 60) -> pd.DataFrame:
     """直近の歩み値を取得する。取引方向と出来高を再評価に利用する。"""
     code = normalize_code(ticker)
-    ctx = None
     try:
         ctx = _open_context()
-        ret, message = ctx.subscribe([code], [SubType.TICKER])
-        if ret != RET_OK:
-            raise MoomooError(str(message))
+        if not moomoo_client._ensure_subscribed(ctx, code, [SubType.TICKER]):
+            raise MoomooError(f"歩み値の購読に失敗しました: {code}")
         ret, data = ctx.get_rt_ticker(code, num=num)
         if ret != RET_OK:
             raise MoomooError(str(data))
@@ -666,15 +647,11 @@ def fetch_recent_ticks(ticker: str, num: int = 60) -> pd.DataFrame:
         raise
     except Exception as exc:
         raise MoomooError(str(exc)) from exc
-    finally:
-        if ctx is not None:
-            ctx.close()
 
 
 def fetch_capital_distribution(ticker: str) -> dict | None:
     """大口・中口・小口の当日純流入を取得する。"""
     code = normalize_code(ticker)
-    ctx = None
     try:
         ctx = _open_context()
         ret, data = ctx.get_capital_distribution(code)
@@ -707,6 +684,3 @@ def fetch_capital_distribution(ticker: str) -> dict | None:
         raise
     except Exception as exc:
         raise MoomooError(str(exc)) from exc
-    finally:
-        if ctx is not None:
-            ctx.close()

@@ -1,11 +1,14 @@
+import pathlib
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from lib import data_fetcher, moomoo_client, moomoo_fetcher
+from lib import data_fetcher, moomoo_client, moomoo_fetcher, settings_store
 
 
 class _KLType:
@@ -76,6 +79,14 @@ def _enabled_settings(reserve=10):
             "history_reserve": reserve}
 
 
+@contextmanager
+def _enabled_history_settings(reserve=10):
+    with patch.object(moomoo_fetcher, "_integration_settings",
+                      return_value=_enabled_settings(reserve)), \
+            patch.object(moomoo_fetcher, "history_enabled", return_value=True):
+        yield
+
+
 class MoomooFetcherTests(unittest.TestCase):
     def test_normalize_code(self):
         self.assertEqual(moomoo_fetcher.normalize_code("AAPL"), "US.AAPL")
@@ -108,8 +119,7 @@ class MoomooFetcherTests(unittest.TestCase):
         return (
             patch.object(moomoo_fetcher, "CACHE_DIR", Path(cache_dir)),
             patch.object(moomoo_fetcher, "_open_context", return_value=context),
-            patch.object(moomoo_fetcher, "_integration_settings",
-                         return_value=_enabled_settings(reserve)),
+            _enabled_history_settings(reserve),
             patch.object(moomoo_fetcher, "_now_utc",
                          return_value=pd.Timestamp(now)),
             patch.object(moomoo_fetcher, "KLType", _KLType),
@@ -257,6 +267,7 @@ class MoomooFetcherTests(unittest.TestCase):
                 patch.object(moomoo_fetcher, "_integration_settings",
                              return_value={"enabled": False, "host": "127.0.0.1",
                                            "port": 11111, "history_reserve": 10}), \
+                patch.object(moomoo_fetcher, "history_enabled", return_value=False), \
                 patch.object(moomoo_fetcher, "_open_context", context_open):
             moomoo_fetcher._write_history_cache(
                 _history_frame(), "US.AAPL", "1y", "1d",
@@ -273,7 +284,7 @@ class MoomooFetcherTests(unittest.TestCase):
         self.assertEqual(state["market_state"], "MORNING")
         self.assertEqual(state["source"], "moomoo OpenAPI")
         self.assertEqual(context.market_state_calls, 1)
-        self.assertTrue(context.closed)
+        self.assertFalse(context.closed)
 
 
 class HybridDataTests(unittest.TestCase):
@@ -301,7 +312,8 @@ class HybridDataTests(unittest.TestCase):
         }
         yahoo = pd.DataFrame()
         data_fetcher.fetch_chart_history.clear()
-        with patch.object(moomoo_fetcher, "fetch_history", return_value=moomoo) as fetcher, \
+        with patch.object(moomoo_fetcher, "history_enabled", return_value=True), \
+                patch.object(moomoo_fetcher, "fetch_history", return_value=moomoo) as fetcher, \
                 patch.object(data_fetcher, "fetch_history", return_value=yahoo):
             result, meta = data_fetcher.fetch_chart_history(
                 "AAPL", "1y", allow_new_quota=True)
@@ -330,7 +342,8 @@ class HybridDataTests(unittest.TestCase):
             index=pd.DatetimeIndex(["2026-08-08"], name="Date"),
         )
         data_fetcher.fetch_chart_history.clear()
-        with patch.object(moomoo_fetcher, "fetch_history", return_value=moomoo), \
+        with patch.object(moomoo_fetcher, "history_enabled", return_value=True), \
+                patch.object(moomoo_fetcher, "fetch_history", return_value=moomoo), \
                 patch.object(data_fetcher, "fetch_history", return_value=yahoo):
             result, meta = data_fetcher.fetch_chart_history("AAPL", "1y")
         self.assertEqual(float(result.iloc[-1]["Close"]), 110.0)
@@ -357,6 +370,74 @@ class HybridDataTests(unittest.TestCase):
         self.assertIsNone(state["market_state"])
         self.assertEqual(state["source"], "Unavailable")
         self.assertEqual(state["fallback_reason"], "offline")
+
+class ConnectionIsolationTests(unittest.TestCase):
+    """OpenDが応答しないときにUIを固まらせないための約束事。"""
+
+    def test_module_never_creates_its_own_quote_context(self):
+        # OpenQuoteContextはOpenD未起動だと例外を返さず無限に再接続する。
+        # 接続はmoomoo_client(TCP事前確認+タイムアウト)経由に限定する。
+        source = pathlib.Path(moomoo_fetcher.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("OpenQuoteContext(", source)
+
+    def test_open_context_delegates_to_moomoo_client(self):
+        with mock.patch.object(moomoo_client, "_ctx", return_value="CTX") as ctx:
+            self.assertEqual(moomoo_fetcher._open_context(), "CTX")
+        ctx.assert_called_once_with()
+
+    def test_open_context_raises_instead_of_blocking(self):
+        with mock.patch.object(moomoo_client, "_ctx", return_value=None), \
+                mock.patch.object(moomoo_client, "status",
+                                  return_value={"state": "no_opend",
+                                                "message": "OpenDに接続できません"}):
+            with self.assertRaises(moomoo_fetcher.MoomooError):
+                moomoo_fetcher._open_context()
+
+    def test_shared_context_is_not_closed(self):
+        source = pathlib.Path(moomoo_fetcher.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("ctx.close()", source)
+
+
+class HistoryQuotaOptInTests(unittest.TestCase):
+    """歴史的K線クォータは30日戻らないので、既定では消費しない。"""
+
+    def test_history_is_disabled_by_default(self):
+        for settings in ({}, {"moomoo_enabled": True},
+                         {"moomoo_chart_history": True}):
+            with self.subTest(settings=settings):
+                with mock.patch.object(settings_store, "load",
+                                       return_value=settings):
+                    self.assertFalse(moomoo_fetcher.history_enabled())
+
+    def test_history_needs_both_switches(self):
+        with mock.patch.object(settings_store, "load",
+                               return_value={"moomoo_enabled": True,
+                                             "moomoo_chart_history": True}):
+            self.assertTrue(moomoo_fetcher.history_enabled())
+
+    def test_fetch_history_refuses_before_touching_opend(self):
+        with mock.patch.object(moomoo_fetcher, "history_enabled",
+                               return_value=False), \
+                mock.patch.object(moomoo_fetcher, "_open_context") as ctx:
+            with self.assertRaises(moomoo_fetcher.MoomooError):
+                moomoo_fetcher.fetch_history("AAPL", "1y", "1d")
+        ctx.assert_not_called()
+
+    def test_chart_history_skips_moomoo_when_opted_out(self):
+        frame = pd.DataFrame({"Close": [1.0]},
+                             index=pd.DatetimeIndex(["2026-08-07"]))
+        data_fetcher.fetch_chart_history.clear()
+        with mock.patch.object(moomoo_fetcher, "history_enabled",
+                               return_value=False), \
+                mock.patch.object(moomoo_fetcher, "fetch_history") as moomoo, \
+                mock.patch.object(data_fetcher, "fetch_history",
+                                  return_value=frame):
+            result, meta = data_fetcher.fetch_chart_history("AAPL", "1y", "1d")
+        data_fetcher.fetch_chart_history.clear()
+        moomoo.assert_not_called()
+        self.assertEqual(meta["source"], "Yahoo Finance")
+        self.assertIsNone(meta["fallback_reason"])
+        self.assertFalse(result.empty)
 
 
 if __name__ == "__main__":

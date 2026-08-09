@@ -1,6 +1,6 @@
 import streamlit as st
 
-from lib import moomoo_client, settings_store
+from lib import data_fetcher, moomoo_client, settings_store
 
 st.set_page_config(
     page_title="米国株式分析ツール",
@@ -49,6 +49,18 @@ with st.sidebar:
                 moomoo_client.status.clear()
                 st.rerun()
 
+            chart_hist = st.toggle(
+                "過去K線もmoomooを使用（枠保護あり）",
+                value=bool(saved.get("moomoo_chart_history", False)),
+                help=("オフ（既定）では過去K線をYahoo Financeから取得します。オンでも、"
+                      "取得済み銘柄・ローカルキャッシュを優先し、新しい銘柄は予約枠を"
+                      "超える場合に限って明示的な単一銘柄表示から取得します。"),
+            )
+            if chart_hist != bool(saved.get("moomoo_chart_history", False)):
+                settings_store.save(moomoo_chart_history=chart_hist)
+                data_fetcher.fetch_chart_history.clear()
+                st.rerun()
+
             reserve = st.number_input(
                 "履歴K線の予約枠",
                 min_value=0,
@@ -62,6 +74,11 @@ with st.sidebar:
             if int(reserve) != int(saved.get("moomoo_history_reserve", 10)):
                 settings_store.save(moomoo_history_reserve=int(reserve))
                 st.rerun()
+            if chart_hist:
+                st.caption("取得済み銘柄とキャッシュは追加枠なしで再利用します。"
+                           "未取得銘柄は残り枠が予約枠を超える場合だけ取得します。")
+            else:
+                st.caption("過去K線はYahoo Financeを使い、moomooの履歴枠を消費しません。")
 
             if state["state"] == "ok":
                 st.success(state["message"], icon="🟢")

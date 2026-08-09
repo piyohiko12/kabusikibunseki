@@ -243,9 +243,12 @@ def snapshot(tickers: tuple[str, ...]) -> dict[str, dict]:
             except (TypeError, ZeroDivisionError):
                 change_pct = None
         out[t] = {
+            "name": row.get("name") or t,
             "price": last,
             "previous_close": prev,
             "change_percent": change_pct,
+            "bid": row.get("bid_price"),
+            "ask": row.get("ask_price"),
             "open": row.get("open_price"),
             "high": row.get("high_price"),
             "low": row.get("low_price"),
