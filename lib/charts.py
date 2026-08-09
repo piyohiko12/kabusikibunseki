@@ -254,19 +254,28 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
         for lv in (o.get("levels") or []):
             is_res = lv["type"] == "抵抗線"
             color = DOWN if is_res else UP
+            strength = int(lv.get("strength") or 0)
+            # 強いレベルほど濃く・太く描き、一目で優先順位が分かるようにする
+            alpha = 0.06 + 0.035 * strength
+            width = 1 + (1 if strength >= 4 else 0)
             if lv.get("zone_high", 0) > lv.get("zone_low", 0):
+                rgb = "208,59,59" if is_res else "12,163,12"
                 fig.add_hrect(
                     y0=lv["zone_low"], y1=lv["zone_high"],
-                    fillcolor=("rgba(208,59,59,0.08)" if is_res
-                               else "rgba(12,163,12,0.08)"),
+                    fillcolor=f"rgba({rgb},{alpha:.3f})",
                     line_width=0, row=1, col=1,
                 )
+            label = f"${lv['price']:,.2f}"
+            if strength:
+                label += " " + "★" * strength
+            # ラベルは枠の内側に置く。外側(left)だとY軸の目盛りと重なって読めない
             fig.add_hline(
-                y=lv["price"], line=dict(color=color, width=1, dash="dash"),
-                opacity=0.65, row=1, col=1,
-                annotation_text=f"${lv['price']:,.2f}",
-                annotation_position="left",
+                y=lv["price"], line=dict(color=color, width=width, dash="dash"),
+                opacity=0.7, row=1, col=1,
+                annotation_text=label,
+                annotation_position="top left",
                 annotation_font=dict(color=color, size=10),
+                annotation_bgcolor="rgba(252,252,251,0.72)",
             )
 
     if not df.empty:
@@ -289,10 +298,20 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
     if o["log_scale"]:
         fig.update_yaxes(type="log", row=1, col=1)
 
+    # 十字カーソル。価格を目で追いやすくする(サブチャートとx軸は共有)
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikecolor=MUTED, spikethickness=1, spikedash="dot")
+    fig.update_yaxes(showspikes=True, spikemode="toaxis", spikesnap="cursor",
+                     spikecolor=MUTED, spikethickness=1, spikedash="dot",
+                     row=1, col=1)
+
+    base_h = int(o.get("height") or 430)
     fig.update_layout(
-        height=430 + 140 * len(oscillators),
+        height=base_h + 140 * len(oscillators),
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
+        spikedistance=-1,
+        dragmode=o.get("dragmode") or "zoom",
         legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
         margin=dict(t=30, b=20),
     )
@@ -422,6 +441,145 @@ def perf_bar(changes: pd.Series, title: str) -> go.Figure:
     fig.add_vline(x=0, line=dict(color=MUTED, width=1))
     fig.update_layout(title=title, height=400, margin=dict(t=50, b=20),
                       showlegend=False, xaxis_title="前日比(%)")
+    return fig
+
+
+def depth_chart(bids: list[tuple], asks: list[tuple]) -> go.Figure:
+    """板情報の横棒グラフ(上=売り気配 赤、下=買い気配 緑)。
+
+    bids / asks は (価格, 数量, 注文数) のリスト(価格の良い順)。
+    """
+    rows = [(p, v, "売り") for p, v, _n in reversed(asks)] + \
+           [(p, v, "買い") for p, v, _n in bids]
+    if not rows:
+        return go.Figure()
+    labels = [f"{p:,.2f}" for p, _v, _s in rows]
+    fig = go.Figure(go.Bar(
+        x=[v for _p, v, _s in rows], y=labels, orientation="h",
+        marker_color=[DOWN if s == "売り" else UP for _p, _v, s in rows],
+        marker_line_width=0,
+        text=[f"{v:,}" for _p, v, _s in rows], textposition="outside",
+        hovertemplate="%{y}: %{x:,}株<extra></extra>",
+    ))
+    # 売りと買いの境目(スプレッド)に線を引く
+    if asks and bids:
+        fig.add_hline(y=len(asks) - 0.5, line=dict(color=MUTED, width=1, dash="dot"))
+    fig.update_layout(
+        title="板情報(気配)", height=max(260, 26 * len(rows) + 90),
+        margin=dict(t=50, b=20), showlegend=False,
+        xaxis_title="数量(株)", yaxis_title="価格($)",
+        yaxis=dict(autorange="reversed", type="category"),
+    )
+    return fig
+
+
+def capital_bar(tiers: list[tuple]) -> go.Figure:
+    """資金流入の横棒グラフ。tiers は (区分, 純額, 流入, 流出) のリスト。"""
+    labels = [t[0] for t in tiers]
+    values = [t[1] for t in tiers]
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation="h",
+        marker_color=[UP if v >= 0 else DOWN for v in values], marker_line_width=0,
+        text=[f"{v/1e6:+,.1f}M" for v in values], textposition="outside",
+        hovertemplate="%{y}: $%{x:+,.0f}<extra></extra>",
+    ))
+    fig.add_vline(x=0, line=dict(color=MUTED, width=1))
+    fig.update_layout(title="資金流入(本日・純額)", height=260,
+                      margin=dict(t=50, b=20), showlegend=False,
+                      xaxis_title="純流入額(ドル)",
+                      yaxis=dict(autorange="reversed"))
+    return fig
+
+
+def iv_hv_chart(series: pd.DataFrame) -> go.Figure:
+    """オプションのIV(予想変動率)とHV(実績変動率)の推移。"""
+    fig = go.Figure()
+    for col, color, name in (("IV", PRIMARY, "IV(予想変動率)"),
+                             ("HV", SECONDARY, "HV(実績変動率)")):
+        if col in series.columns and series[col].notna().any():
+            fig.add_trace(go.Scatter(
+                x=series["日付"], y=series[col], name=name,
+                line=dict(color=color, width=2),
+                hovertemplate=f"%{{x}}<br>{name}: %{{y:.1f}}%<extra></extra>"))
+    fig.update_layout(title="IVとHVの推移", height=320, margin=dict(t=50, b=20),
+                      yaxis_title="変動率(%)", hovermode="x unified",
+                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    return fig
+
+
+def short_interest_chart(df: pd.DataFrame) -> go.Figure:
+    """空売り残高(棒)と浮動株に対する比率(線)の推移。"""
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(
+        x=df["日付"], y=df["空売り株数"], name="空売り株数",
+        marker_color=MUTED, marker_line_width=0,
+        hovertemplate="%{x}<br>空売り: %{y:,.0f}株<extra></extra>"), secondary_y=False)
+    if df["浮動株比率"].notna().any():
+        fig.add_trace(go.Scatter(
+            x=df["日付"], y=df["浮動株比率"], name="浮動株比率",
+            line=dict(color=DOWN, width=2),
+            hovertemplate="%{x}<br>比率: %{y:.2f}%<extra></extra>"), secondary_y=True)
+    fig.update_yaxes(title_text="空売り株数", secondary_y=False)
+    fig.update_yaxes(title_text="浮動株比率(%)", secondary_y=True, showgrid=False)
+    fig.update_layout(title="空売り残高の推移", height=320, margin=dict(t=50, b=20),
+                      hovermode="x unified",
+                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    return fig
+
+
+def institution_chart(df: pd.DataFrame) -> go.Figure:
+    """機関投資家の保有比率(線)と機関数(棒)の推移。"""
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(
+        x=df["報告期"], y=df["機関数"], name="機関数",
+        marker_color="#c3c2b7", marker_line_width=0,
+        hovertemplate="%{x}<br>機関数: %{y:,.0f}<extra></extra>"), secondary_y=False)
+    if df["保有比率"].notna().any():
+        fig.add_trace(go.Scatter(
+            x=df["報告期"], y=df["保有比率"], name="保有比率",
+            line=dict(color=PRIMARY, width=2),
+            hovertemplate="%{x}<br>保有比率: %{y:.2f}%<extra></extra>"), secondary_y=True)
+    fig.update_yaxes(title_text="機関数", secondary_y=False)
+    fig.update_yaxes(title_text="保有比率(%)", secondary_y=True, showgrid=False)
+    fig.update_layout(title="機関投資家の保有推移", height=320, margin=dict(t=50, b=20),
+                      hovermode="x unified",
+                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    return fig
+
+
+def put_call_chart(df: pd.DataFrame) -> go.Figure:
+    """米国株オプション市場のPut/Callレシオ。1.0超で弱気寄り。"""
+    fig = go.Figure(go.Scatter(
+        x=df["日付"], y=df["Put/Call"], name="Put/Call",
+        line=dict(color=PRIMARY, width=2),
+        hovertemplate="%{x}<br>Put/Call: %{y:.2f}<extra></extra>"))
+    fig.add_hline(y=1.0, line=dict(color=MUTED, width=1, dash="dash"),
+                  annotation_text="1.0(強気と弱気の境目)",
+                  annotation_position="top left")
+    fig.update_layout(title="Put/Callレシオ(米国株オプション・出来高ベース)",
+                      height=300, margin=dict(t=50, b=20), showlegend=False,
+                      yaxis_title="Put/Call")
+    return fig
+
+
+def fed_watch_chart(df: pd.DataFrame, meeting: str) -> go.Figure:
+    """FedWatchの織り込み確率。指定の会合について金利レンジ別の確率を横棒で示す。"""
+    sub = df[df["meeting_date"] == meeting].copy()
+    sub["probability"] = pd.to_numeric(sub["probability"], errors="coerce")
+    sub = sub.dropna(subset=["probability"]).sort_values("probability")
+    if sub.empty:
+        return go.Figure()
+    top = sub["probability"].max()
+    colors = [PRIMARY if v == top else "#c3c2b7" for v in sub["probability"]]
+    fig = go.Figure(go.Bar(
+        x=sub["probability"], y=sub["target_range"], orientation="h",
+        marker_color=colors, marker_line_width=0,
+        text=[f"{v:.1f}%" for v in sub["probability"]], textposition="outside",
+        hovertemplate="%{y}: %{x:.1f}%<extra></extra>"))
+    fig.update_layout(title=f"{meeting} 会合の織り込み確率",
+                      height=max(240, 40 * len(sub) + 90),
+                      margin=dict(t=50, b=20), showlegend=False,
+                      xaxis_title="確率(%)", yaxis_title="政策金利レンジ")
     return fig
 
 

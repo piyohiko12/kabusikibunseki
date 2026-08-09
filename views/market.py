@@ -3,7 +3,8 @@
 import pandas as pd
 import streamlit as st
 
-from lib import charts, data_fetcher, market_mood, ui, watchlist_store
+from lib import (charts, data_fetcher, market_mood, moomoo_client, ui,
+                 watchlist_store)
 
 UP_COLOR = "#0ca30c"
 DOWN_COLOR = "#d03b3b"
@@ -54,10 +55,12 @@ else:
     with col_gauge:
         st.plotly_chart(charts.mood_gauge(mood["score"]),
                         config={"displayModeBar": False, "staticPlot": True})
+        zone_color = ("red" if mood["score"] < 45
+                      else "green" if mood["score"] > 55 else "gray")
+        zone_chip = ui.chip(f"現在: {mood['zone_label']}", zone_color)
         st.markdown(
-            f'<div style="text-align:center;margin-top:-14px;">'
-            f'{ui.chip(f"現在: {mood["zone_label"]}", "red" if mood["score"] < 45 else ("green" if mood["score"] > 55 else "gray"))}'
-            f'</div>', unsafe_allow_html=True)
+            f'<div style="text-align:center;margin-top:-14px;">{zone_chip}</div>',
+            unsafe_allow_html=True)
         st.caption("0=極度の恐怖 ←→ 100=極度の強欲(Fear & Greed方式の自作指数)")
     with col_verdict:
         with st.container(border=True):
@@ -277,3 +280,77 @@ for tab, (label, kind) in zip(tabs, SCREENERS):
                          "分析", display_text="開く →")})
 st.caption("出典: Yahoo Financeスクリーナー(15分キャッシュ)。気になる銘柄は"
            "「銘柄分析」ページにティッカーを入力すると詳細を確認できます。")
+
+# ------------------------------------------------- 時間外ランキング(moomoo)
+SESSION_TABS = [("🌅 プレマーケット", "pre"), ("🌆 アフターマーケット", "after"),
+                ("🌙 夜間取引", "overnight")]
+
+if moomoo_client.status()["state"] == "ok":
+    st.divider()
+    st.subheader("🕒 時間外のランキング(moomoo)")
+    st.caption("通常取引の前後に動いている銘柄です。Yahoo Financeでは取得できません。")
+
+    for tab, (label, session) in zip(st.tabs([t for t, _ in SESSION_TABS]),
+                                     SESSION_TABS):
+        with tab:
+            c_up, c_down = st.columns(2)
+            for col, losers, head in ((c_up, False, "値上がり"),
+                                      (c_down, True, "値下がり")):
+                with col:
+                    st.markdown(f"**{head}**")
+                    rank = moomoo_client.session_rank(session, count=10,
+                                                      losers=losers)
+                    if rank.empty:
+                        st.caption("データがありません(取引時間外か、権限がありません)。")
+                        continue
+                    view_df = rank.copy()
+                    view_df["リンク"] = "/?ticker=" + view_df["ティッカー"].astype(str)
+                    st.dataframe(
+                        view_df.style.format({
+                            "時間外価格": "${:,.2f}", "終値": "${:,.2f}",
+                            "時間外変化率": "{:+.2f}%", "出来高": "{:,.0f}",
+                        }, na_rep="—").map(_pct_color, subset=["時間外変化率"]),
+                        hide_index=True,
+                        column_config={"リンク": st.column_config.LinkColumn(
+                            "分析", display_text="開く →")})
+
+# ------------------------------------------------- FOMC織り込み・Put/Call
+if moomoo_client.status()["state"] == "ok":
+    fed = moomoo_client.fed_watch()
+    pcr = moomoo_client.put_call_ratio()
+    if not fed.empty or not pcr.empty:
+        st.divider()
+        st.subheader("🏛️ 金融政策とオプション市場の織り込み")
+        col_fed, col_pcr = st.columns(2)
+
+        with col_fed:
+            if fed.empty:
+                st.caption("FedWatchのデータを取得できませんでした。")
+            else:
+                meetings = list(dict.fromkeys(fed["meeting_date"].astype(str)))
+                pick = st.selectbox("FOMC会合", meetings, index=0)
+                st.plotly_chart(charts.fed_watch_chart(fed, pick),
+                                config={"displayModeBar": False})
+                sub = fed[fed["meeting_date"].astype(str) == pick]
+                if not sub.empty:
+                    top = sub.loc[sub["probability"].idxmax()]
+                    st.caption(f"最有力は **{top['target_range']}** "
+                               f"({top['probability']:.1f}%)。"
+                               "金利先物から算出された市場の織り込みで、"
+                               "決定を保証するものではありません。")
+
+        with col_pcr:
+            if pcr.empty:
+                st.caption("Put/Callレシオを取得できませんでした。")
+            else:
+                st.plotly_chart(charts.put_call_chart(pcr),
+                                config={"displayModeBar": False})
+                last_pcr = pcr.iloc[-1]["Put/Call"]
+                avg_pcr = pcr["Put/Call"].mean()
+                mood = ("弱気(プット買いが優勢)" if last_pcr > 1
+                        else "強気(コール買いが優勢)")
+                st.metric("直近のPut/Call", f"{last_pcr:.2f}",
+                          f"平均 {avg_pcr:.2f} との差 {last_pcr - avg_pcr:+.2f}",
+                          delta_color="off", border=True)
+                st.caption(f"現在は{mood}。極端に高い水準は逆に底打ちのサインと"
+                           "解釈されることもあります。")

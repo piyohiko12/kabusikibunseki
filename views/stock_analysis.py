@@ -5,8 +5,8 @@ import html
 import pandas as pd
 import streamlit as st
 
-from lib import (charts, data_fetcher, indicators, levels, news_fetcher,
-                 sensitivity, settings_store, ui)
+from lib import (charts, data_fetcher, indicators, levels, moomoo_client,
+                 news_fetcher, sensitivity, settings_store, ui)
 
 # 表示ラベル → (取得期間, 表示日数)。SMA200を期間の先頭から描くため長めに取得する。
 PERIODS = {
@@ -29,6 +29,28 @@ OVERLAY_OPTIONS = ["SMA20", "SMA50", "SMA200", "EMA20", "EMA50", "VWAP(日中)",
 HTF_MAP = {"1m": "日足", "5m": "日足", "15m": "日足", "1h": "日足",
            "1d": "週足", "1wk": "月足"}
 OSC_OPTIONS = ["出来高", "RSI", "MACD", "ストキャスティクス"]
+
+# ワンクリックで用途別の表示に切り替えるプリセット
+PRESETS = {
+    "🧭 シンプル": {
+        "overlays": ["SMA50", "SMA200"],
+        "oscillators": ["出来高"],
+    },
+    "📐 テクニカル": {
+        "overlays": ["SMA20", "SMA50", "SMA200", "サポレジライン"],
+        "oscillators": ["出来高", "RSI", "MACD"],
+    },
+    "🎯 スイング": {
+        "overlays": ["SMA50", "SMA200", "サポレジライン", "フィボナッチ",
+                     "出来高プロファイル"],
+        "oscillators": ["出来高", "RSI"],
+    },
+    "⚡ デイトレ": {
+        "overlays": ["VWAP(日中)", "SMA20", "ボリンジャーバンド", "サポレジライン"],
+        "oscillators": ["出来高", "ストキャスティクス"],
+    },
+}
+CUSTOM = "⚙️ カスタム"
 BENCHMARKS = {"S&P500": "^GSPC", "NASDAQ総合": "^IXIC", "ダウ平均": "^DJI"}
 NEWS_SOURCES = ["Yahoo Finance", "Google News", "🇯🇵 日本語", "SEC開示"]
 PLOT_CONFIG = {
@@ -132,8 +154,20 @@ if badges:
     st.markdown(" ".join(badges), unsafe_allow_html=True)
     st.markdown("")
 
+# moomooが使えるときは遅延のない現在値に差し替える(使えなければYahooの終値のまま)
+realtime = moomoo_client.snapshot((ticker,)).get(ticker)
+if realtime and realtime.get("price"):
+    price_now = float(realtime["price"])
+    base = realtime.get("previous_close") or prev
+    change = price_now - float(base)
+    change_pct = (price_now / float(base) - 1) * 100 if base else 0.0
+    price_label = "株価(リアルタイム)"
+else:
+    price_now = latest
+    price_label = "株価(直近終値)"
+
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("株価(直近終値)", f"${latest:,.2f}",
+m1.metric(price_label, f"${price_now:,.2f}",
           f"{change:+,.2f}({change_pct:+.2f}%)", border=True)
 m2.metric("52週高値", f"${year['High'].max():,.2f}", border=True)
 m3.metric("52週安値", f"${year['Low'].min():,.2f}", border=True)
@@ -149,28 +183,92 @@ if rsi_now is not None and pd.notna(rsi_now):
 else:
     m4.metric("RSI(14)", "—", border=True)
 
-tab_chart, tab_news = st.tabs(["📊 チャート・指標", "📰 ニュース・ネットの反応"])
+if realtime:
+    st.caption(f"🟢 株価はmoomooのリアルタイム値です(更新: "
+               f"{realtime.get('update_time') or '—'})。"
+               "チャート・指標はYahoo Financeの日足を使用しています。")
+else:
+    st.caption("株価はYahoo Financeの値で、15〜20分遅れています。"
+               "サイドバーの「moomooリアルタイム連携」を有効にすると即時値になります。")
+
+tab_chart, tab_news, tab_tape, tab_flow = st.tabs(
+    ["📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値", "🏦 需給・IV"])
 
 # ---------------------------------------------------------------- タブ1
 with tab_chart:
-    c_type, c_interval, c_cfg = st.columns([2.4, 2, 1.2])
+    # 前回の表示設定を復元する(data/settings.json に保存)
+    _saved_chart = _settings.get("chart") or {}
+    _preset_names = list(PRESETS) + [CUSTOM]
+    _saved_preset = _saved_chart.get("preset")
+    if _saved_preset not in _preset_names:
+        _saved_preset = "📐 テクニカル"
+
+    # 保存値が壊れていても既定値で開けるようにする
+    _def_type = _saved_chart.get("chart_type")
+    _def_type = _def_type if _def_type in CHART_TYPES else "ローソク足"
+    _def_bar = _saved_chart.get("bar_label")
+    _def_bar = _def_bar if _def_bar in INTERVALS else "日足"
+
+    c_type, c_interval = st.columns([2.2, 3])
     with c_type:
         chart_type = st.pills("チャート種別", CHART_TYPES,
-                              default="ローソク足") or "ローソク足"
+                              default=_def_type) or _def_type
     with c_interval:
-        bar_label = st.pills("足の間隔", list(INTERVALS), default="日足") or "日足"
+        bar_label = st.pills("足の間隔", list(INTERVALS),
+                             default=_def_bar) or _def_bar
+
+    c_preset, c_cfg = st.columns([3.4, 1.2])
+    with c_preset:
+        preset = st.pills("表示プリセット", _preset_names,
+                          default=_saved_preset) or _saved_preset
     with c_cfg:
-        with st.popover("⚙️ 表示設定"):
-            overlays = st.multiselect("オーバーレイ(価格に重ねる指標)",
-                                      OVERLAY_OPTIONS,
-                                      default=["SMA20", "SMA50", "SMA200",
-                                               "サポレジライン"])
-            oscillators = st.multiselect("サブチャート", OSC_OPTIONS,
-                                         default=["出来高", "RSI", "MACD"])
-            show_events = st.toggle("配当・分割マーカー", value=True)
-            log_scale = st.toggle("対数スケール(価格軸)", value=False)
-            benches = st.multiselect("パフォーマンス比較", list(BENCHMARKS),
-                                     default=[])
+        st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+        cfg_pop = st.popover("⚙️ 詳細設定", use_container_width=True)
+
+    # プリセットを選んだらその内容、カスタムなら前回の選択を初期値にする
+    if preset in PRESETS:
+        base_overlays = PRESETS[preset]["overlays"]
+        base_oscs = PRESETS[preset]["oscillators"]
+    else:
+        base_overlays = _saved_chart.get("overlays") or ["SMA50", "サポレジライン"]
+        base_oscs = _saved_chart.get("oscillators") or ["出来高", "RSI"]
+
+    with cfg_pop:
+        st.caption("プリセットを上書きすると「カスタム」として保存されます。")
+        overlays = st.multiselect("オーバーレイ(価格に重ねる指標)",
+                                  OVERLAY_OPTIONS,
+                                  default=[o for o in base_overlays
+                                           if o in OVERLAY_OPTIONS])
+        oscillators = st.multiselect("サブチャート", OSC_OPTIONS,
+                                     default=[o for o in base_oscs
+                                              if o in OSC_OPTIONS])
+        col_a, col_b = st.columns(2)
+        show_events = col_a.toggle("配当・分割マーカー",
+                                   value=_saved_chart.get("events", True))
+        log_scale = col_b.toggle("対数スケール",
+                                 value=_saved_chart.get("log_scale", False))
+        _heights = {360: "低い", 430: "標準", 520: "やや高い",
+                    640: "高い", 780: "最大"}
+        _def_h = _saved_chart.get("height")
+        _def_h = _def_h if _def_h in _heights else 430
+        chart_height = st.select_slider(
+            "チャートの高さ", options=list(_heights),
+            value=_def_h, format_func=lambda v: _heights[v])
+        benches = st.multiselect("パフォーマンス比較", list(BENCHMARKS), default=[])
+
+    # 設定が変わったら保存(次回起動時も同じ見た目で開ける)
+    _now_chart = {
+        "preset": preset if (preset in PRESETS
+                             and sorted(overlays) == sorted(PRESETS[preset]["overlays"])
+                             and sorted(oscillators) == sorted(PRESETS[preset]["oscillators"]))
+        else CUSTOM,
+        "chart_type": chart_type, "bar_label": bar_label,
+        "overlays": overlays, "oscillators": oscillators,
+        "events": show_events, "log_scale": log_scale, "height": chart_height,
+    }
+    if _now_chart != _saved_chart:
+        settings_store.save(chart=_now_chart)
+
     interval = INTERVALS[bar_label]
 
     chart_view = view
@@ -231,11 +329,14 @@ with tab_chart:
         "events": show_events,
         "log_scale": log_scale,
         "levels": lv_chart,
+        "height": chart_height,
     }
     st.plotly_chart(charts.price_chart(chart_view, ticker, opts),
                     config=PLOT_CONFIG)
-    st.caption("💡 チャート右上のツールバーからトレンドライン・矩形の描画や消去ができます。"
-               "◆=配当、★=株式分割。赤破線=抵抗線、緑破線=サポート。"
+    st.caption("💡 十字カーソルで価格と日付を読めます。ドラッグで拡大、ダブルクリックで戻る。"
+               "右上のツールバーからトレンドライン・矩形の描画も可能です。"
+               "◆=配当、★=株式分割。赤帯=抵抗ゾーン、緑帯=サポートゾーン"
+               "(濃く太いほど強いレベル)。"
                + (f" {limit_note}" if limit_note else ""))
 
     if benches:
@@ -280,6 +381,7 @@ with tab_chart:
             "価格": lv["price"],
             "現在比": lv["distance_pct"],
             "反発実績": _rate_str(lv),
+            "ヒゲ拒絶": lv.get("rejects", 0),
             "強さ": "★" * lv["strength"],
             "根拠": lv["basis"] + (" / " + "・".join(lv["confluence"])
                                    if lv["confluence"] else ""),
@@ -289,9 +391,27 @@ with tab_chart:
         ).map(lambda v: "color: #d03b3b" if v == "抵抗線" else "color: #006300",
               subset=["種別"])
         st.dataframe(styled_lv, hide_index=True)
-        st.caption("反発実績=接近時に反転した回数/接近回数。「日足合流」等は上位足でも"
-                   "同じレベルが確認できたもの。価格帯(ゾーン)はチャート上の帯で表示。"
-                   "期間を切り替えると再計算されます。参考情報です。")
+        st.caption("反発実績=接近時に反転した回数/接近回数。ヒゲ拒絶=実体では入らず"
+                   "ヒゲだけが刺さって押し戻された回数(反発の強い証拠)。"
+                   "「日足合流」等は上位足でも同じレベルが確認できたもの。"
+                   "期間を切り替えると再計算されます。")
+
+        with st.expander("ℹ️ 「強さ★」の意味と、検証でわかった限界"):
+            st.markdown(
+                "★は **レベル同士の優劣を並べるための相対評価** です。"
+                "S&P500構成銘柄の2013〜2018年の日次データで、6ヶ月分から算出した"
+                "レベルが40本先までにどうなったかを実測して較正しました。\n\n"
+                "較正に使っていない80銘柄での結果:\n\n"
+                "| 強さ | 接近後に反発した割合 |\n|---|---|\n"
+                "| ★5 | 65.0% |\n| ★4 | 58.0% |\n| ★3 | 60.2% |\n"
+                "| ★2 | 57.6% |\n| ★1 | 58.9% |\n\n"
+                "**★5は★1より約6pt反発しやすい**、という程度の差です。"
+                "★4以下の差はほとんどありません。\n\n"
+                "⚠️ さらに重要な限界として、**同じ距離にランダムに引いた線と比べた"
+                "反発率の差はほぼゼロ**でした。つまりレベルに触れたあと反発するか"
+                "抜けるかは、この手法では予測できていません。"
+                "★が高いレベルを「相対的に注目度が高い価格帯」として見る使い方に"
+                "留め、売買判断の根拠にはしないでください。")
 
         with st.expander("📋 詳細データ(ゾーン範囲・テスト履歴)"):
             st.dataframe(pd.DataFrame([{
@@ -514,3 +634,162 @@ with tab_news:
                     body = p["body"]
                     st.write(md_escape(body[:300] + ("…" if len(body) > 300 else "")))
 
+
+
+# ---------------------------------------------------------------- タブ3
+with tab_tape:
+    state = moomoo_client.status()
+    if state["state"] != "ok":
+        st.info(
+            "このタブはmoomoo OpenAPI(無料)に接続すると使えます。\n\n"
+            f"現在の状態: **{state['message']}**\n\n"
+            "1. moomoo証券の口座でログインできる **moomoo OpenD** をPCで起動する\n"
+            "2. サイドバーの「moomooリアルタイム連携」を有効にする\n\n"
+            "接続しても取得できるのは相場データだけで、このツールは発注を一切行いません。"
+        )
+    else:
+        st.caption(f"{ticker} の板・歩み値(moomoo・自動更新はしません。"
+                   "最新にするにはページを再読み込みしてください)")
+        col_book, col_tick = st.columns([1, 1])
+
+        with col_book:
+            book = moomoo_client.order_book(ticker)
+            if not book:
+                st.warning("板情報を取得できませんでした。"
+                           "米国株の板情報には対応する相場権限が必要です。")
+            else:
+                st.plotly_chart(charts.depth_chart(book["bids"], book["asks"]),
+                                config={"displayModeBar": False})
+                if book["bids"] and book["asks"]:
+                    spread = book["asks"][0][0] - book["bids"][0][0]
+                    mid = (book["asks"][0][0] + book["bids"][0][0]) / 2
+                    bid_vol = sum(v for _p, v, _n in book["bids"])
+                    ask_vol = sum(v for _p, v, _n in book["asks"])
+                    b1, b2 = st.columns(2)
+                    b1.metric("スプレッド", f"${spread:,.3f}",
+                              f"{spread / mid * 100:.3f}%" if mid else None,
+                              delta_color="off", border=True)
+                    total = bid_vol + ask_vol
+                    b2.metric("買い板の厚み", f"{bid_vol / total * 100:.0f}%" if total else "—",
+                              f"買{bid_vol:,} / 売{ask_vol:,}",
+                              delta_color="off", border=True)
+
+        with col_tick:
+            ticks = moomoo_client.recent_ticks(ticker, num=60)
+            if ticks.empty:
+                st.warning("歩み値を取得できませんでした。")
+            else:
+                buy = int((ticks.get("ticker_direction") == "BUY").sum())
+                sell = int((ticks.get("ticker_direction") == "SELL").sum())
+                if buy or sell:
+                    st.plotly_chart(ui.stacked_bar([
+                        ("買い約定", buy, "#0ca30c", "#ffffff"),
+                        ("売り約定", sell, "#d03b3b", "#ffffff"),
+                    ]), config={"displayModeBar": False})
+                st.dataframe(
+                    ticks.rename(columns={
+                        "time": "時刻", "price": "価格", "volume": "数量",
+                        "turnover": "代金", "ticker_direction": "方向", "type": "種別"}),
+                    hide_index=True, height=420,
+                    column_config={
+                        "価格": st.column_config.NumberColumn(format="$%.2f"),
+                        "数量": st.column_config.NumberColumn(format="%,d"),
+                        "代金": st.column_config.NumberColumn(format="$%,.0f"),
+                    })
+
+        cap = moomoo_client.capital_distribution(ticker)
+        if cap:
+            st.divider()
+            c_chart, c_note = st.columns([1.4, 1])
+            with c_chart:
+                st.plotly_chart(charts.capital_bar(cap["tiers"]),
+                                config={"displayModeBar": False})
+            with c_note:
+                st.markdown("#### 資金の出入り")
+                st.metric("本日の純流入", f"${cap['net']:+,.0f}",
+                          "買い越し" if cap["net"] >= 0 else "売り越し",
+                          delta_color="normal" if cap["net"] >= 0 else "inverse",
+                          border=True)
+                st.caption("大口ほど機関投資家の動きを反映しやすい参考情報です。"
+                           "売買代金の内訳であり、将来の値動きを示すものではありません。")
+
+
+# ---------------------------------------------------------------- タブ4
+with tab_flow:
+    if moomoo_client.status()["state"] != "ok":
+        st.info("このタブはmoomoo OpenAPI(無料)に接続すると使えます。"
+                "サイドバーの「moomooリアルタイム連携」から設定してください。")
+    else:
+        st.caption(f"{ticker} の需給(空売り・機関投資家)とオプションの変動率。"
+                   "いずれもmoomooから取得した参考情報です。")
+
+        # --- 空売り残高 ---
+        st.markdown("#### 🐻 空売り残高")
+        shorts = moomoo_client.short_interest(ticker)
+        if shorts.empty:
+            st.caption("空売り残高を取得できませんでした(対象外の銘柄か、権限がありません)。")
+        else:
+            latest_s = shorts.iloc[-1]
+            prev_s = shorts.iloc[-2] if len(shorts) > 1 else latest_s
+            s1, s2, s3 = st.columns(3)
+            delta_shares = latest_s["空売り株数"] - prev_s["空売り株数"]
+            s1.metric("空売り株数", f"{latest_s['空売り株数']:,.0f}株",
+                      f"{delta_shares:+,.0f}", delta_color="inverse", border=True)
+            if pd.notna(latest_s["浮動株比率"]):
+                s2.metric("浮動株に対する比率", f"{latest_s['浮動株比率']:.2f}%",
+                          f"{latest_s['浮動株比率'] - prev_s['浮動株比率']:+.2f}pt"
+                          if pd.notna(prev_s["浮動株比率"]) else None,
+                          delta_color="inverse", border=True)
+            if pd.notna(latest_s["買い戻し日数"]):
+                s3.metric("買い戻しにかかる日数", f"{latest_s['買い戻し日数']:.1f}日",
+                          "高いほど踏み上げが起きやすい", delta_color="off", border=True)
+            st.plotly_chart(charts.short_interest_chart(shorts),
+                            config={"displayModeBar": False})
+
+        # --- 機関投資家の保有推移 ---
+        st.divider()
+        st.markdown("#### 🏦 機関投資家の保有推移")
+        inst = moomoo_client.institutional_holding(ticker)
+        if inst.empty:
+            st.caption("機関投資家の保有データを取得できませんでした。")
+        else:
+            latest_i = inst.iloc[-1]
+            i1, i2, i3 = st.columns(3)
+            i1.metric("保有機関数", f"{latest_i['機関数']:,.0f}",
+                      f"{latest_i['機関数の増減']:+,.0f}"
+                      if pd.notna(latest_i["機関数の増減"]) else None, border=True)
+            if pd.notna(latest_i["保有比率"]):
+                i2.metric("機関の保有比率", f"{latest_i['保有比率']:.2f}%",
+                          f"{latest_i['保有比率の増減']:+.2f}pt"
+                          if pd.notna(latest_i["保有比率の増減"]) else None, border=True)
+            i3.metric("最新の報告期", str(latest_i["報告期"]), border=True)
+            st.plotly_chart(charts.institution_chart(inst),
+                            config={"displayModeBar": False})
+            st.caption("四半期ごとの報告(13F等)に基づくため、実際の売買からは遅れます。")
+
+        # --- オプションのIV ---
+        st.divider()
+        st.markdown("#### 🌪️ オプションの変動率(IV / HV)")
+        vol = moomoo_client.option_volatility(ticker)
+        if not vol:
+            st.caption("オプションの変動率を取得できませんでした"
+                       "(オプションが上場していない銘柄の可能性があります)。")
+        else:
+            v_chart, v_note = st.columns([1.6, 1])
+            with v_chart:
+                st.plotly_chart(charts.iv_hv_chart(vol["series"]),
+                                config={"displayModeBar": False})
+            with v_note:
+                last_v = vol["series"].iloc[-1]
+                if pd.notna(last_v.get("IV")):
+                    st.metric("現在のIV", f"{last_v['IV']:.1f}%",
+                              f"HVとの差 {last_v['IVプレミアム']:+.1f}pt"
+                              if pd.notna(last_v.get("IVプレミアム")) else None,
+                              delta_color="off", border=True)
+                if vol.get("average_iv") is not None and pd.notna(vol["average_iv"]):
+                    st.metric("平均IV", f"{vol['average_iv']:.1f}%", border=True)
+                if vol.get("analysis"):
+                    st.info(vol["analysis"])
+                st.caption("IVが高いほどオプション市場が今後の大きな値動きを"
+                           "見込んでいることを示します。HVを大きく上回るときは"
+                           "決算などのイベントが控えている場合があります。")

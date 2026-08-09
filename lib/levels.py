@@ -2,11 +2,23 @@
 
 手法:
 1. スイング高値/安値をフラクタル法で検出し、ATRの0.5倍幅でクラスタリング(ゾーン化)
-2. 各ゾーンへの接近イベントを「反発」「突破」に分類(接近方向と抜けた方向で判定)
-   → 反発実績(勝敗と反発率)を実測する
-3. イベントは経過時間(半減期)と出来高(20日平均比)で重み付けして採点
-4. 出来高プロファイル(バーのレンジに出来高を配分)の集中帯、期間高値/安値、
-   フィボナッチ・キリ番・SMA・ピボットとの合流(コンフルエンス)で加点
+2. 各ゾーンへの接近イベントを「ヒゲ拒絶」「反発」「突破」に分類する。
+   ヒゲだけがゾーンに刺さって実体は入らなかった接触(拒絶)は、
+   反発の証拠として最も強いため重く採点する
+3. イベントは経過時間(半減期)と出来高(20日平均比)で重み付けする
+4. ゾーン内で実際に商われた出来高の割合、期間高値/安値、
+   フィボナッチ・キリ番・SMA・ピボットとの合流(コンフルエンス)で加点し、
+   直近に実体で破られたレベルは減点する
+
+強さ(★1〜5)の較正:
+S&P500構成銘柄・2013〜2018の日次データ(505銘柄)を使い、6ヶ月窓でレベルを算出して
+40本先までの結末を実測するウォークフォワード検証で境界を決めた。
+較正に使っていない80銘柄での検証では、★5の反発率65.0%に対し★1は58.9%(差+6.1pt)。
+各★にほぼ均等(約20%ずつ)に分かれる。
+
+⚠️ 重要な限界: レベルの「当たり外れ」自体は、同じ距離にランダムに置いた線と
+ほぼ変わらない(層別調整後のエッジはほぼ0)。★はあくまで**レベル同士の優劣**を
+並べるための相対評価であり、反発を予測するものではない。
 """
 
 import numpy as np
@@ -14,6 +26,9 @@ import pandas as pd
 
 FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786)
 ROUND_STEPS = (1000, 500, 250, 100, 50, 25, 10, 5, 2.5, 1)
+
+# 素点 → ★ の境界(上記の検証で較正)。各★がほぼ均等に分かれる。
+STRENGTH_CUTS = (1.13, 1.52, 1.83, 2.12)
 
 
 def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
@@ -69,44 +84,78 @@ def _volume_nodes(df: pd.DataFrame, bins: int = 50, top: int = 5) -> list[float]
     return [float(v) for v in prof.nlargest(top).index]
 
 
-def _classify_events(df: pd.DataFrame, level: float, tol: float) -> list[dict]:
-    """レベルへの接近イベントを反発/突破に分類する。
+def _zone_volume_share(df: pd.DataFrame, zlo: float, zhi: float) -> float:
+    """ゾーン内で商われた出来高が全体に占める割合。"""
+    if "Volume" not in df.columns:
+        return 0.0
+    lo = df["Low"].to_numpy(float)
+    hi = np.maximum(df["High"].to_numpy(float), lo + 1e-9)
+    vol = df["Volume"].to_numpy(float)
+    total = vol.sum()
+    if total <= 0:
+        return 0.0
+    overlap = np.clip(np.minimum(hi, zhi) - np.maximum(lo, zlo), 0, None) / (hi - lo)
+    return float((vol * overlap).sum() / total)
 
-    接近方向(上から=サポートテスト、下から=抵抗テスト)を記録し、
-    終値がゾーンのどちら側へ抜けたかで結果を決める。進行中のテストは数えない。
+
+def _events(df: pd.DataFrame, zlo: float, zhi: float, atr: float,
+            min_gap: int = 3) -> list[dict]:
+    """ゾーンへの接触を、実体とヒゲを区別して分類する。
+
+    outcome:
+      reject … ヒゲはゾーンに入ったが実体は入らず、来た側へ戻した(最も強い反発)
+      bounce … 実体がゾーンに入ったが反対側へは抜けず、来た側へ戻した
+      break  … 反対側へ実体で抜けた
     """
-    lows = df["Low"].to_numpy(float)
-    highs = df["High"].to_numpy(float)
-    closes = df["Close"].to_numpy(float)
+    o = df["Open"].to_numpy(float)
+    h = df["High"].to_numpy(float)
+    lo_ = df["Low"].to_numpy(float)
+    c = df["Close"].to_numpy(float)
+    n = len(df)
     if "VOL_MA20" in df.columns and "Volume" in df.columns:
         with np.errstate(divide="ignore", invalid="ignore"):
-            vol_ratio = np.nan_to_num(
-                df["Volume"].to_numpy(float) / df["VOL_MA20"].to_numpy(float), nan=1.0)
+            vr = np.nan_to_num(df["Volume"].to_numpy(float)
+                               / df["VOL_MA20"].to_numpy(float), nan=1.0, posinf=1.0)
     else:
-        vol_ratio = np.ones(len(df))
+        vr = np.ones(n)
 
-    events = []
-    in_event = False
-    side, vmax = None, 1.0
-    for i in range(1, len(df)):
-        touching = lows[i] <= level + tol and highs[i] >= level - tol
-        if not in_event:
-            if not touching:
-                continue
-            in_event = True
-            side = "support" if closes[i - 1] > level else "resistance"
-            vmax = vol_ratio[i]
-        else:
-            vmax = max(vmax, vol_ratio[i])
+    out_up = zhi + 0.25 * atr
+    out_dn = zlo - 0.25 * atr
 
-        if closes[i] > level + tol:
-            outcome = "bounce" if side == "support" else "break"
-            events.append({"end": i, "side": side, "outcome": outcome, "vol": vmax})
-            in_event = False
-        elif closes[i] < level - tol:
-            outcome = "bounce" if side == "resistance" else "break"
-            events.append({"end": i, "side": side, "outcome": outcome, "vol": vmax})
-            in_event = False
+    events: list[dict] = []
+    i = 1
+    while i < n:
+        if not (lo_[i] <= zhi and h[i] >= zlo):
+            i += 1
+            continue
+        # 直前の位置で接近方向を決める
+        side = "support" if c[i - 1] > zhi else ("resistance" if c[i - 1] < zlo else None)
+        if side is None:
+            i += 1
+            continue
+
+        body_in = False
+        vmax = vr[i]
+        j = i
+        outcome = None
+        while j < n:
+            body_lo, body_hi = min(o[j], c[j]), max(o[j], c[j])
+            if body_lo <= zhi and body_hi >= zlo:
+                body_in = True
+            vmax = max(vmax, vr[j])
+            if c[j] > out_up:
+                outcome = "break" if side == "resistance" else (
+                    "bounce" if body_in else "reject")
+                break
+            if c[j] < out_dn:
+                outcome = "break" if side == "support" else (
+                    "bounce" if body_in else "reject")
+                break
+            j += 1
+        if outcome is None:
+            break
+        events.append({"end": j, "side": side, "outcome": outcome, "vol": vmax})
+        i = j + min_gap
     return events
 
 
@@ -143,7 +192,8 @@ def find_levels(df: pd.DataFrame, max_per_side: int = 4) -> list[dict]:
     """サポート/レジスタンスのゾーン一覧を強度順に返す。
 
     各レベル: {type, price, zone_low, zone_high, distance_pct, bounces, breaks,
-               touches, bounce_rate, strength, last_touch, basis, confluence}
+               touches, rejects, bounce_rate, raw_score, strength, vol_share,
+               last_touch, basis, confluence, last_event, swings}
     """
     if df is None or len(df) < 20:
         return []
@@ -151,72 +201,85 @@ def find_levels(df: pd.DataFrame, max_per_side: int = 4) -> list[dict]:
     n = len(df)
     current = float(df["Close"].iloc[-1])
     atr = float(_atr(df).iloc[-1])
+    if not np.isfinite(atr) or atr <= 0:
+        return []
     tol = max(atr * 0.5, current * 0.003)
     skip_band = current * 0.002
     window = max(2, min(5, n // 15))
     half_life = max(20, n // 4)
     conf = _ConfluenceCtx(df, current)
-    nodes = _volume_nodes(df)
+    prof = volume_profile(df, 50)
+    nodes = [float(v) for v in prof.nlargest(5).index] if not prof.empty else []
     dates = df.index
 
-    def build(center: float, zone_lo: float, zone_hi: float, basis: str,
-              swings: int, seed_last: str, seed_score: float) -> dict | None:
+    raw: list[dict] = []
+
+    def build(center, zone_lo, zone_hi, basis, swings, seed_last, seed_score):
         if abs(center - current) <= skip_band:
             return None
         zone_lo = min(zone_lo, center - atr * 0.25)
         zone_hi = max(zone_hi, center + atr * 0.25)
-        band = max((zone_hi - zone_lo) / 2, tol * 0.6)
 
-        events = _classify_events(df, center, band)
-        w_bounce = w_break = 0.0
+        evs = _events(df, zone_lo, zone_hi, atr)
+        w_pos = w_neg = 0.0
+        rejects = bounces = breaks = 0
         role_sides = set()
         last_i = None
-        for e in events:
+        for e in evs:
             w = 0.5 ** ((n - 1 - e["end"]) / half_life)
             vf = min(max(e["vol"], 0.5), 2.0)
-            if e["outcome"] == "bounce":
-                w_bounce += w * vf
+            if e["outcome"] == "reject":
+                w_pos += w * vf * 1.4   # ヒゲ拒絶は最も強い反発の証拠
+                rejects += 1
+                role_sides.add(e["side"])
+            elif e["outcome"] == "bounce":
+                w_pos += w * vf
+                bounces += 1
                 role_sides.add(e["side"])
             else:
-                w_break += w * vf
+                w_neg += w * vf
+                breaks += 1
             last_i = e["end"]
-        bounces = sum(1 for e in events if e["outcome"] == "bounce")
-        breaks = len(events) - bounces
-        last_event = None
-        if events:
-            e = events[-1]
-            last_event = {"outcome": e["outcome"], "side": e["side"],
-                          "bars_ago": n - 1 - e["end"]}
 
-        near_node = any(abs(center - v) <= band for v in nodes)
-        tags = [t for t in conf.tags(center, band) if t != basis]
-        role_reversal = len(role_sides) == 2
-        if role_reversal:
+        touches = len(evs)
+        good = rejects + bounces
+        vol_share = _zone_volume_share(df, zone_lo, zone_hi)
+        near_node = any(zone_lo <= v <= zone_hi for v in nodes)
+        tags = [t for t in conf.tags(center, (zone_hi - zone_lo) / 2) if t != basis]
+        if len(role_sides) == 2:
             tags = ["役割転換"] + tags
 
-        score = (seed_score + swings * 0.3 + w_bounce * 1.2 - w_break * 0.6
-                 + (0.5 if near_node else 0) + len(tags) * 0.5)
-        basis_full = basis + ("+出来高集中" if near_node and "出来高" not in basis else "")
-        last_touch = str(dates[last_i])[:10] if last_i is not None else seed_last
+        # 直近に実体で破られたレベルは、同じ役割としては弱い
+        fresh_break = 0.0
+        if evs and evs[-1]["outcome"] == "break":
+            bars = n - 1 - evs[-1]["end"]
+            fresh_break = max(0.0, 1.0 - bars / 20)
+
+        score = (seed_score
+                 + 0.9 * np.tanh(w_pos / 2.0)
+                 + 0.5 * (good / touches if touches else 0.0)
+                 + 0.6 * min(vol_share / 0.10, 1.0)
+                 + 0.25 * min(swings / 3, 1.0)
+                 + 0.20 * min(len(tags), 2)
+                 + (0.15 if near_node else 0.0)
+                 - 0.7 * np.tanh(w_neg / 2.0)
+                 - 0.6 * fresh_break)
+
         return {
             "type": "抵抗線" if center > current else "サポート",
-            "price": center,
-            "zone_low": zone_lo,
-            "zone_high": zone_hi,
+            "price": center, "zone_low": zone_lo, "zone_high": zone_hi,
             "distance_pct": (center / current - 1) * 100,
-            "bounces": bounces,
-            "breaks": breaks,
-            "touches": len(events),
-            "swings": swings,
-            "bounce_rate": bounces / len(events) * 100 if events else None,
-            "strength": int(min(5, max(1, round(1 + score)))),
-            "last_touch": last_touch,
-            "basis": basis_full,
+            "bounces": good, "breaks": breaks, "touches": touches,
+            "rejects": rejects, "swings": swings,
+            "bounce_rate": good / touches * 100 if touches else None,
+            "raw_score": float(score),
+            "vol_share": vol_share,
+            "last_touch": str(dates[last_i])[:10] if last_i is not None else seed_last,
+            "basis": basis + ("+出来高集中" if near_node and "出来高" not in basis else ""),
             "confluence": tags,
-            "last_event": last_event,
+            "last_event": ({"outcome": evs[-1]["outcome"], "side": evs[-1]["side"],
+                            "bars_ago": n - 1 - evs[-1]["end"]} if evs else None),
         }
-
-    levels: list[dict] = []
 
     # 1) スイングのクラスタ
     points = sorted(_swing_points(df, window), key=lambda x: x[1])
@@ -229,36 +292,36 @@ def find_levels(df: pd.DataFrame, max_per_side: int = 4) -> list[dict]:
     for cl in clusters:
         prices = [p for _, p, _ in cl]
         lv = build(float(pd.Series(prices).median()), min(prices), max(prices),
-                   "スイング", len(cl), str(max(i for i, _, _ in cl))[:10], 0.0)
+                   "スイング", len(cl), str(max(i for i, _, _ in cl))[:10], 0.25)
         if lv:
-            levels.append(lv)
+            raw.append(lv)
 
-    # 2) 期間高値/安値のアンカー(未カバー時)
+    # 2) 期間高値/安値
     for price, date in ((float(df["High"].max()), str(df["High"].idxmax())[:10]),
                         (float(df["Low"].min()), str(df["Low"].idxmin())[:10])):
-        if any(abs(price - lv["price"]) <= tol for lv in levels):
+        if any(abs(price - lv["price"]) <= tol for lv in raw):
             continue
-        name = "期間高値" if price > current else "期間安値"
-        lv = build(price, price, price, name, 0, date, 1.0)
+        lv = build(price, price, price,
+                   "期間高値" if price > current else "期間安値", 0, date, 0.45)
         if lv:
-            levels.append(lv)
+            raw.append(lv)
 
-    # 3) 独立した出来高集中帯
+    # 3) 出来高集中帯
     for v in nodes:
-        if any(abs(v - lv["price"]) <= tol for lv in levels):
+        if any(abs(v - lv["price"]) <= tol for lv in raw):
             continue
-        lv = build(float(v), v, v, "出来高集中帯", 0, "—", 0.3)
+        lv = build(float(v), v, v, "出来高集中帯", 0, "—", 0.30)
         if lv:
-            levels.append(lv)
+            raw.append(lv)
 
-    # 4) 未テストの節目候補で補完(高値/安値圏で片側のレベルが不足するとき)
+    # 4) 未テストの節目候補で補完
     hi, lo = float(df["High"].max()), float(df["Low"].min())
-    rng = hi - lo
+    rng_ = hi - lo
     fwd: dict[str, float] = {}
-    if rng > 0:
-        fwd.update({f"フィボ拡張{r * 100:.0f}%": lo + rng * r for r in (1.272, 1.618)})
-    piv_all = pivot_points(df) or {}
-    fwd.update({f"ピボット{k}": v for k, v in piv_all.items() if not k.startswith("P")})
+    if rng_ > 0:
+        fwd.update({f"フィボ拡張{r * 100:.0f}%": lo + rng_ * r for r in (1.272, 1.618)})
+    fwd.update({f"ピボット{k}": v for k, v in (pivot_points(df) or {}).items()
+                if not k.startswith("P")})
     if conf.steps:
         step = conf.steps[0]
         base = round(current / step) * step
@@ -267,36 +330,40 @@ def find_levels(df: pd.DataFrame, max_per_side: int = 4) -> list[dict]:
             if v > 0:
                 fwd[f"キリ番${v:,.0f}"] = float(v)
     for side_type, sign in (("抵抗線", 1), ("サポート", -1)):
-        need = 3 - sum(1 for l in levels if l["type"] == side_type)
+        need = 2 - sum(1 for l in raw if l["type"] == side_type)
         if need <= 0:
             continue
-        cands = sorted([(name, v) for name, v in fwd.items()
+        cands = sorted([(nm, v) for nm, v in fwd.items()
                         if (v - current) * sign > skip_band],
                        key=lambda x: abs(x[1] - current))
         added = 0
-        for name, v in cands:
+        for nm, v in cands:
             if added >= need:
                 break
-            if any(abs(v - l["price"]) <= tol for l in levels):
+            if any(abs(v - l["price"]) <= tol for l in raw):
                 continue
-            lv = build(v, v, v, name, 0, "—", 0.2)
+            lv = build(v, v, v, nm, 0, "—", 0.10)
             if lv:
-                levels.append(lv)
+                raw.append(lv)
                 added += 1
 
-    # 各サイド: 強度順で上位を採用しつつ、現在値に最も近いレベルは必ず含める
+    # 素点 → ★1〜5(固定境界で較正済み)
+    for lv in raw:
+        s = lv["raw_score"]
+        lv["strength"] = 1 + sum(1 for cut in STRENGTH_CUTS if s >= cut)
+
     def _pick(side: list[dict]) -> list[dict]:
         if not side:
             return []
-        chosen = sorted(side, key=lambda l: (-l["strength"],
+        chosen = sorted(side, key=lambda l: (-l["raw_score"],
                                              abs(l["distance_pct"])))[:max_per_side]
         nearest = min(side, key=lambda l: abs(l["distance_pct"]))
         if nearest not in chosen:
             chosen = chosen[:-1] + [nearest]
         return chosen
 
-    res = _pick([l for l in levels if l["type"] == "抵抗線"])
-    sup = _pick([l for l in levels if l["type"] == "サポート"])
+    res = _pick([l for l in raw if l["type"] == "抵抗線"])
+    sup = _pick([l for l in raw if l["type"] == "サポート"])
     return sorted(res + sup, key=lambda l: -l["price"])
 
 
