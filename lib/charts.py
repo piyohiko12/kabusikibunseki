@@ -268,12 +268,14 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
             label = f"${lv['price']:,.2f}"
             if strength:
                 label += " " + "★" * strength
+            # ラベルは枠の内側に置く。外側(left)だとY軸の目盛りと重なって読めない
             fig.add_hline(
                 y=lv["price"], line=dict(color=color, width=width, dash="dash"),
                 opacity=0.7, row=1, col=1,
                 annotation_text=label,
-                annotation_position="left",
+                annotation_position="top left",
                 annotation_font=dict(color=color, size=10),
+                annotation_bgcolor="rgba(252,252,251,0.72)",
             )
 
     if not df.empty:
