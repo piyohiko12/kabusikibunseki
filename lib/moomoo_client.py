@@ -557,12 +557,9 @@ def history_quota() -> dict | None:
         return None
     if not _ok(ret):
         return None
-    if isinstance(data, pd.DataFrame):
-        if data.empty:
-            return None
-        row = data.to_dict("records")[0]
-    elif isinstance(data, dict):
-        row = data
-    else:
+    # 実機SDKの [used, remain, [detail...]] 形式も、履歴取得側と同じ規則で解釈する。
+    from lib.moomoo_fetcher import _quota_parts
+    used, remain, _ = _quota_parts(data)
+    if used is None or remain is None:
         return None
-    return {"used": row.get("used_quota"), "remain": row.get("remain_quota")}
+    return {"used": used, "remain": remain}

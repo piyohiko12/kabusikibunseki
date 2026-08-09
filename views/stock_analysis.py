@@ -154,7 +154,7 @@ fetch_period, display_days = PERIODS[period_label]
 
 try:
     hist, _base_meta = data_fetcher.fetch_chart_history(
-        ticker, fetch_period, "1d")
+        ticker, fetch_period, "1d", allow_new_quota=True)
 except data_fetcher.FetchError:
     st.error("データの取得中にエラーが発生しました。ネットワーク接続を確認し、"
              "しばらく時間をおいてから再試行してください。")
@@ -434,7 +434,7 @@ with tab_chart:
 
     try:
         chart_hist, chart_meta = data_fetcher.fetch_chart_history(
-            ticker, chart_period, interval)
+            ticker, chart_period, interval, allow_new_quota=True)
     except data_fetcher.FetchError:
         chart_hist, chart_meta = pd.DataFrame(), {"source": "取得失敗"}
     if chart_hist.empty:
@@ -442,7 +442,7 @@ with tab_chart:
         interval = "1d"
         try:
             chart_hist, chart_meta = data_fetcher.fetch_chart_history(
-                ticker, fetch_period, interval)
+                ticker, fetch_period, interval, allow_new_quota=True)
         except data_fetcher.FetchError:
             chart_hist = hist
             chart_meta = {"source": "Yahoo Finance", "code": ticker,
@@ -467,7 +467,7 @@ with tab_chart:
             htf_period = "10y" if htf_iv == "1wk" else "max"
         try:
             htf_hist, _ = data_fetcher.fetch_chart_history(
-                ticker, htf_period, htf_iv)
+                ticker, htf_period, htf_iv, allow_new_quota=True)
         except data_fetcher.FetchError:
             htf_hist = pd.DataFrame()
         htf_view = (indicators.slice_display(
@@ -551,7 +551,7 @@ with tab_chart:
         for col, (label, mtf_iv, mtf_period, mtf_days) in zip(mtf_cols, mtf_specs):
             try:
                 mtf_hist, mtf_meta = data_fetcher.fetch_chart_history(
-                    ticker, mtf_period, mtf_iv)
+                    ticker, mtf_period, mtf_iv, allow_new_quota=True)
             except data_fetcher.FetchError:
                 mtf_hist, mtf_meta = pd.DataFrame(), {"source": "取得失敗"}
             with col:

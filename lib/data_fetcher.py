@@ -93,6 +93,16 @@ def _merge_corporate_actions(primary: pd.DataFrame, yahoo: pd.DataFrame,
     return out
 
 
+def _last_history_time(frame: pd.DataFrame) -> pd.Timestamp | None:
+    if frame is None or frame.empty:
+        return None
+    try:
+        stamp = pd.Timestamp(frame.index[-1])
+    except (TypeError, ValueError):
+        return None
+    return stamp.tz_localize(None) if stamp.tzinfo is not None else stamp
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def moomoo_status() -> dict:
     """moomoo SDK/OpenDの接続状態。"""
@@ -112,13 +122,22 @@ def fetch_realtime_snapshot(ticker: str) -> dict:
     return snapshot
 
 
-@st.cache_data(ttl=120, show_spinner="チャートデータを取得中...")
-def fetch_chart_history(ticker: str, period: str,
-                        interval: str = "1d") -> tuple[pd.DataFrame, dict]:
-    """チャート用OHLCVをmoomoo優先で取得し、取得元メタデータも返す。"""
+@st.cache_data(ttl=30, show_spinner="チャートデータを取得中...")
+def _fetch_chart_history_cached(ticker: str, period: str, interval: str,
+                                allow_new_quota: bool,
+                                settings_token: tuple) -> tuple[pd.DataFrame, dict]:
+    """チャート用OHLCVをmoomoo優先で取得し、取得元メタデータも返す。
+
+    ``allow_new_quota`` は新規銘柄の過去K線枠を使う明示指定。明示時も予約枠は
+    温存し、足種別の永続キャッシュを最優先する。
+    """
+    del settings_token  # Streamlitのキャッシュキーに設定値を含めるための引数。
     fallback_reason = None
+    moomoo_meta = {}
     try:
-        moomoo = moomoo_fetcher.fetch_history(ticker, period, interval)
+        moomoo = moomoo_fetcher.fetch_history(
+            ticker, period, interval, allow_new_quota=allow_new_quota)
+        moomoo_meta = dict(moomoo.attrs.get("moomoo_meta", {}))
     except moomoo_fetcher.MoomooError as exc:
         moomoo = pd.DataFrame()
         fallback_reason = str(exc)
@@ -128,18 +147,85 @@ def fetch_chart_history(ticker: str, period: str,
             yahoo = fetch_history(ticker, period, interval)
         except FetchError:
             yahoo = pd.DataFrame()
+        if moomoo_meta.get("cache_status") == "stale" and not yahoo.empty:
+            moomoo_last = _last_history_time(moomoo)
+            yahoo_last = _last_history_time(yahoo)
+            if (moomoo_last is None or yahoo_last is None
+                    or yahoo_last >= moomoo_last):
+                return yahoo, {
+                    "source": "Yahoo Finance",
+                    "code": ticker,
+                    "fetched_at": moomoo_meta.get("fetched_at"),
+                    "cache_status": "fallback",
+                    "quota": moomoo_meta.get("quota"),
+                    "remain": moomoo_meta.get("remain"),
+                    "fallback_reason": (
+                        "期限切れmoomooキャッシュより新しいYahoo系列を使用しました。 "
+                        + str(moomoo_meta.get("fallback_reason") or "")).rstrip(),
+                }
         enriched = _merge_corporate_actions(moomoo, yahoo, interval)
-        return enriched, {
+        metadata = {
             "source": "moomoo OpenAPI",
             "code": moomoo_fetcher.normalize_code(ticker),
-            "fallback_reason": None,
+            "fetched_at": None,
+            "cache_status": "refreshed",
+            "quota": None,
+            "remain": None,
+            "fallback_reason": fallback_reason,
         }
+        metadata.update({key: moomoo_meta.get(key, metadata[key]) for key in metadata})
+        return enriched, metadata
 
     yahoo = fetch_history(ticker, period, interval)
     return yahoo, {
         "source": "Yahoo Finance",
         "code": ticker,
-        "fallback_reason": fallback_reason or "moomooからデータを取得できませんでした",
+        "fetched_at": moomoo_meta.get("fetched_at"),
+        "cache_status": moomoo_meta.get("cache_status", "fallback"),
+        "quota": moomoo_meta.get("quota"),
+        "remain": moomoo_meta.get("remain"),
+        "fallback_reason": (fallback_reason or moomoo_meta.get("fallback_reason")
+                            or "moomooからデータを取得できませんでした"),
+    }
+
+
+def fetch_chart_history(ticker: str, period: str, interval: str = "1d",
+                        allow_new_quota: bool = False) -> tuple[pd.DataFrame, dict]:
+    """設定変更を即時反映しつつ、同じ設定内では30秒キャッシュする。"""
+    settings = moomoo_fetcher._integration_settings()
+    token = (
+        bool(settings.get("enabled")), str(settings.get("host")),
+        int(settings.get("port", 11111)), settings.get("history_reserve"),
+    )
+    return _fetch_chart_history_cached(
+        ticker, period, interval, allow_new_quota, token)
+
+
+# 既存のStreamlitキャッシュ関数と同じクリア操作を維持する。
+fetch_chart_history.clear = _fetch_chart_history_cached.clear
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_market_state(ticker: str) -> dict:
+    """moomooの市場状態。取得不能時はWAIT判定に使える失敗情報を返す。"""
+    try:
+        state = moomoo_fetcher.fetch_market_state(ticker)
+    except moomoo_fetcher.MoomooError as exc:
+        return {
+            "code": ticker,
+            "stock_name": "",
+            "market_state": None,
+            "source": "Unavailable",
+            "fallback_reason": str(exc),
+        }
+    if state:
+        return state
+    return {
+        "code": ticker,
+        "stock_name": "",
+        "market_state": None,
+        "source": "Unavailable",
+        "fallback_reason": "moomooから市場状態を取得できませんでした",
     }
 
 

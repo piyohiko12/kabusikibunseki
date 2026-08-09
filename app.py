@@ -49,12 +49,30 @@ with st.sidebar:
                 moomoo_client.status.clear()
                 st.rerun()
 
+            reserve = st.number_input(
+                "履歴K線の予約枠",
+                min_value=0,
+                max_value=2000,
+                step=5,
+                value=int(saved.get("moomoo_history_reserve", 10)),
+                help=("過去30日間に未取得の銘柄は、残り枠がこの数以下なら"
+                      "moomooへ取りに行かずYahooへ切り替えます。取得済み銘柄の"
+                      "再利用とローカルキャッシュは枠を追加消費しません。"),
+            )
+            if int(reserve) != int(saved.get("moomoo_history_reserve", 10)):
+                settings_store.save(moomoo_history_reserve=int(reserve))
+                st.rerun()
+
             if state["state"] == "ok":
                 st.success(state["message"], icon="🟢")
                 quota = moomoo_client.history_quota()
                 if quota and quota.get("remain") is not None:
                     st.caption(f"履歴K線の残りクォータ: {quota['remain']}"
-                               f"(使用済み {quota.get('used', '—')})")
+                               f"(使用済み {quota.get('used', '—')} / "
+                               f"予約 {int(reserve)})")
+                    if int(quota["remain"]) <= int(reserve):
+                        st.warning("予約枠に達したため、新しい銘柄の過去K線は"
+                                   "Yahoo Financeへ自動切替します。", icon="🛡️")
             else:
                 st.warning(state["message"], icon="⚠️")
                 st.caption("OpenDを起動してログインすると使えます。"
