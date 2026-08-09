@@ -5,45 +5,80 @@ import pandas as pd
 SMA_WINDOWS = (20, 50, 200)
 EMA_SPANS = (20, 50)
 
+DEFAULT_PARAMS = {
+    "sma_periods": SMA_WINDOWS,
+    "ema_periods": EMA_SPANS,
+    "boll_period": 20,
+    "boll_std": 2.0,
+    "rsi_period": 14,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "stoch_period": 14,
+    "stoch_k": 3,
+    "stoch_d": 3,
+    "volume_ma": 20,
+}
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+
+def indicator_params(overrides: dict | None = None) -> dict:
+    """チャート用指標パラメータを正規化する。"""
+    params = {**DEFAULT_PARAMS, **(overrides or {})}
+    params["sma_periods"] = tuple(max(1, int(v)) for v in params["sma_periods"])
+    params["ema_periods"] = tuple(max(1, int(v)) for v in params["ema_periods"])
+    for key in ("boll_period", "rsi_period", "macd_fast", "macd_slow",
+                "macd_signal", "stoch_period", "stoch_k", "stoch_d",
+                "volume_ma"):
+        params[key] = max(1, int(params[key]))
+    params["boll_std"] = max(0.1, float(params["boll_std"]))
+    return params
+
+
+def add_indicators(df: pd.DataFrame, params: dict | None = None) -> pd.DataFrame:
     """テクニカル指標の列を追加したコピーを返す。
 
-    SMA(20/50/200)、EMA(20/50)、ボリンジャーバンド(20, ±2σ)、RSI(14)、
-    MACD(12,26,9)、スローストキャスティクス(14,3,3)、一目均衡表(9,26,52)、
-    出来高20日平均。
+    既定はSMA(20/50/200)、EMA(20/50)、ボリンジャーバンド(20, ±2σ)、
+    RSI(14)、MACD(12,26,9)、スローストキャスティクス(14,3,3)、
+    一目均衡表(9,26,52)、出来高20日平均。paramsで期間を変更できる。
     """
+    cfg = indicator_params(params)
     out = df.copy()
     close, high, low = out["Close"], out["High"], out["Low"]
 
-    for w in SMA_WINDOWS:
+    for w in dict.fromkeys(cfg["sma_periods"]):
         out[f"SMA{w}"] = close.rolling(w).mean()
-    for s in EMA_SPANS:
+    for s in dict.fromkeys(cfg["ema_periods"]):
         out[f"EMA{s}"] = close.ewm(span=s, adjust=False).mean()
 
-    # ボリンジャーバンド(20期間, ±2σ)
-    std20 = close.rolling(20).std()
-    out["BB_up"] = out["SMA20"] + 2 * std20
-    out["BB_low"] = out["SMA20"] - 2 * std20
+    # ボリンジャーバンド
+    boll_mid = close.rolling(cfg["boll_period"]).mean()
+    boll_std = close.rolling(cfg["boll_period"]).std()
+    out["BB_mid"] = boll_mid
+    out["BB_up"] = boll_mid + cfg["boll_std"] * boll_std
+    out["BB_low"] = boll_mid - cfg["boll_std"] * boll_std
 
-    # RSI(14): Wilder方式(初期14本はNaN)
+    # RSI: Wilder方式
+    rsi_period = cfg["rsi_period"]
     delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    gain = delta.clip(lower=0).ewm(
+        alpha=1 / rsi_period, min_periods=rsi_period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(
+        alpha=1 / rsi_period, min_periods=rsi_period, adjust=False).mean()
     out["RSI"] = 100 - 100 / (1 + gain / loss)
 
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    out["MACD"] = ema12 - ema26
-    out["MACD_signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
+    ema_fast = close.ewm(span=cfg["macd_fast"], adjust=False).mean()
+    ema_slow = close.ewm(span=cfg["macd_slow"], adjust=False).mean()
+    out["MACD"] = ema_fast - ema_slow
+    out["MACD_signal"] = out["MACD"].ewm(
+        span=cfg["macd_signal"], adjust=False).mean()
     out["MACD_hist"] = out["MACD"] - out["MACD_signal"]
 
-    # スローストキャスティクス(14, 3, 3)
-    ll14 = low.rolling(14).min()
-    hh14 = high.rolling(14).max()
-    fast_k = (close - ll14) / (hh14 - ll14) * 100
-    out["STOCH_K"] = fast_k.rolling(3).mean()
-    out["STOCH_D"] = out["STOCH_K"].rolling(3).mean()
+    # スローストキャスティクス
+    lowest = low.rolling(cfg["stoch_period"]).min()
+    highest = high.rolling(cfg["stoch_period"]).max()
+    fast_k = (close - lowest) / (highest - lowest) * 100
+    out["STOCH_K"] = fast_k.rolling(cfg["stoch_k"]).mean()
+    out["STOCH_D"] = out["STOCH_K"].rolling(cfg["stoch_d"]).mean()
 
     # 一目均衡表(9, 26, 52)。先行スパンは26期間先行(表示は既存日付範囲内)
     out["ICHI_TENKAN"] = (high.rolling(9).max() + low.rolling(9).min()) / 2
@@ -53,7 +88,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ICHI_CHIKOU"] = close.shift(-26)
 
     if "Volume" in out.columns:
-        out["VOL_MA20"] = out["Volume"].rolling(20).mean()
+        out["VOL_MA"] = out["Volume"].rolling(cfg["volume_ma"]).mean()
+        # 既存ページとの後方互換性
+        if cfg["volume_ma"] == 20:
+            out["VOL_MA20"] = out["VOL_MA"]
         # VWAP(日ごとにリセット)。分足・時間足での利用を想定
         tp = (out["High"] + out["Low"] + out["Close"]) / 3
         day = out.index.date
