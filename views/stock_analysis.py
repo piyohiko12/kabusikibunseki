@@ -1,6 +1,7 @@
 """銘柄分析ページ。"""
 
 import html
+import re
 
 import pandas as pd
 import streamlit as st
@@ -108,6 +109,83 @@ def fmt_et_jst(value) -> str:
     et = stamp.tz_convert("America/New_York")
     jst = stamp.tz_convert("Asia/Tokyo")
     return f"{et:%m/%d %H:%M ET} / {jst:%m/%d %H:%M JST}"
+
+
+EVENT_SOURCE_LABELS_JA = {
+    "Federal Reserve": "米連邦準備制度理事会（FRB）",
+    "U.S. Bureau of Labor Statistics": "米国労働統計局（BLS）",
+    "Yahoo Finance calendar": "Yahoo Finance 決算カレンダー",
+    "Yahoo Finance corporate actions": "Yahoo Finance 企業アクション",
+    "Yahoo Finance": "Yahoo Finance",
+    "SEC EDGAR": "米国証券取引委員会（SEC）",
+}
+
+
+def event_source_label_ja(source) -> str:
+    """取得元を日本語中心で表示し、未知の固有名は詳細欄だけに残す。"""
+    text = str(source or "").strip()
+    if not text:
+        return "取得元不明"
+    if text in EVENT_SOURCE_LABELS_JA:
+        return EVENT_SOURCE_LABELS_JA[text]
+    if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text):
+        return text
+    return f"外部ニュース配信（{text}）"
+
+
+def localize_event_warning(message) -> str:
+    """取得失敗の内部キーを利用者向け日本語へ置換する。"""
+    text = str(message or "")
+    replacements = {
+        "company_info": "企業基本情報", "calendar": "決算予定",
+        "earnings_history": "過去の決算日", "price_history": "株価履歴",
+        "yahoo_news": "Yahooニュース", "sec_filings": "米SEC開示",
+    }
+    for internal, label in replacements.items():
+        text = text.replace(internal, label)
+    return text
+
+
+def japanese_evidence(event: dict) -> list[str]:
+    """主表示には日本語の根拠だけを残し、英語原文は詳細欄へ分離する。"""
+    rows = []
+    original = str(event.get("original_name") or "").strip()
+    for item in event.get("evidence") or []:
+        text = str(item or "").strip()
+        if not text or text == original:
+            continue
+        if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text):
+            rows.append(text)
+    return rows
+
+
+JP_WEEKDAYS = ("月", "火", "水", "木", "金", "土", "日")
+
+
+def event_datetime_labels(event: dict) -> tuple[str, str, str]:
+    """米東部基準のイベント日時を、日本時間優先の短い表示へ整える。"""
+    day = pd.to_datetime(event.get("event_date"), errors="coerce")
+    if pd.isna(day):
+        return "日付未定", "発表時刻未定", "—"
+    date_label = f"{day.month}月{day.day}日（{JP_WEEKDAYS[day.weekday()]}）"
+    raw_time = str(event.get("event_time_et") or "").strip()
+    if not re.fullmatch(r"\d{1,2}:\d{2}", raw_time):
+        return date_label, "発表時刻未定", "—"
+    try:
+        event_et = pd.Timestamp(
+            f"{day.strftime('%Y-%m-%d')} {raw_time}",
+            tz="America/New_York",
+        )
+        event_jst = event_et.tz_convert("Asia/Tokyo")
+    except (TypeError, ValueError):
+        return date_label, "発表時刻未定", "—"
+    date_label = (
+        f"{event_jst.month}月{event_jst.day}日"
+        f"（{JP_WEEKDAYS[event_jst.weekday()]}）"
+    )
+    primary = f"{event_jst:%H:%M} JST"
+    secondary = f"{event_et.month}/{event_et.day} {event_et:%H:%M} 米東部"
+    return date_label, primary, secondary
 
 
 def fetch_opening_market_features() -> dict:
@@ -455,10 +533,15 @@ with tab_today:
         else:
             st.info(diagnosis["reason"])
 
+        feature_status_labels = {
+            "ok": "利用中", "missing": "未取得", "stale": "鮮度不足",
+            "invalid_time": "時刻不正",
+        }
         feature_df = pd.DataFrame([{
             "特徴": row["label"],
             "値": "—" if row["value"] is None else f"{row['value']:.3f}",
-            "状態": row["status"], "固定重み": row["weight"],
+            "状態": feature_status_labels.get(row["status"], "利用対象外"),
+            "固定重み": row["weight"],
             "寄与": row["contribution"], "取得元": row.get("source") or "—",
         } for row in diagnosis["features"]])
         with st.expander("参考確率の内訳（固定重み・データ鮮度）"):
@@ -468,34 +551,168 @@ with tab_today:
             st.caption(diagnosis["disclaimer"])
 
         event_report = result["events"]
-        st.markdown("#### イベントの影響度と上下シナリオ")
-        visible_events = list(event_report.get("events") or [])[:8]
+        st.markdown("#### イベント影響カレンダー")
+        st.caption("★は株価が動く方向ではなく、**影響を受けやすい大きさ**です。"
+                   "過去の実測が十分なら平常時との比較を優先し、不足時はイベント種類別の"
+                   "目安を表示します。")
+        localized_events = [
+            event_intelligence.localize_event_for_display(event)
+            for event in event_report.get("events") or []
+        ]
+        scope_column, sort_column = st.columns([2.2, 1.2])
+        with scope_column:
+            event_scope = st.segmented_control(
+                "表示範囲", ["今後の予定", "最近の材料も含む"],
+                default="今後の予定",
+                key=f"event_scope_{ticker}_{target_session}")
+        with sort_column:
+            event_sort = st.pills(
+                "並び順", ["日付順", "影響度順"], default="日付順",
+                key=f"event_sort_{ticker}_{target_session}") or "日付順"
+        upcoming_events = [
+            event for event in localized_events if event.get("status") == "UPCOMING"]
+        visible_events = list(upcoming_events if event_scope == "今後の予定"
+                              else localized_events)
+        if event_sort == "影響度順":
+            visible_events.sort(
+                key=lambda event: (
+                    -int(event.get("impact_stars") or 0),
+                    str(event.get("event_date") or "9999-12-31"),
+                ))
+        visible_events = visible_events[:8]
         if not visible_events:
-            st.info("表示期間内にイベント候補を確認できませんでした。")
+            st.info("表示期間内に今後のイベントを確認できませんでした。"
+                    "「最近の材料も含む」に切り替えると直近ニュースも確認できます。")
         else:
-            event_df = pd.DataFrame([{
-                "日付": event.get("event_date") or "—",
-                "時刻(ET)": event.get("event_time_et") or "—",
-                "イベント": event["name"], "影響セッション": event["session_label"],
-                "影響度": f"{event['impact_level']} ({event['impact_score']})",
-                "過去方向": event["directional_bias"],
-                "根拠信頼度": f"{event['confidence']}%",
-            } for event in visible_events])
-            st.dataframe(event_df, hide_index=True, use_container_width=True)
-            for event in visible_events[:4]:
-                with st.expander(
-                    f"{event.get('event_date') or '日付不明'} — {event['name']} "
-                    f"({event['impact_level']})"):
-                    scenarios = event["scenarios"]
-                    st.markdown(f"- 上向き: {scenarios['up']}\n"
-                                f"- 下向き: {scenarios['down']}\n"
-                                f"- 両方向: {scenarios['two_sided']}")
-                    if event.get("evidence"):
-                        st.caption("根拠: " + " / ".join(event["evidence"][:3]))
+            scored_events = [
+                event for event in visible_events if event.get("impact_available")]
+            largest = (max(scored_events, key=lambda event: event["impact_stars"])
+                       if scored_events else None)
+            next_event = upcoming_events[0] if upcoming_events else None
+            if next_event is None:
+                next_event_time = "—"
+            else:
+                next_date, next_time, _ = event_datetime_labels(next_event)
+                next_event_time = f"{next_date} {next_time}"
+            high_count = sum(
+                int(event.get("impact_stars") or 0) >= 4 for event in upcoming_events)
+            e1, e2, e3 = st.columns(3)
+            e1.metric(
+                "次の予定イベント",
+                next_event_time,
+                "予定なし" if next_event is None else next_event["display_name_ja"],
+                delta_color="off", border=True)
+            e2.metric(
+                "表示中の最大影響度",
+                "—" if largest is None else largest["impact_stars_text"],
+                "判定材料なし" if largest is None else largest["display_name_ja"],
+                delta_color="off", border=True)
+            e3.metric(
+                "今後の予定",
+                f"{len(upcoming_events)}件",
+                f"★★★★以上 {high_count}件", delta_color="off", border=True)
+
+            event_rows = []
+            for event in visible_events:
+                date_label, primary_time, _ = event_datetime_labels(event)
+                event_rows.append({
+                    "日本時間": f"{date_label} {primary_time}",
+                    "イベント": event["display_name_ja"],
+                    "影響度": event["impact_stars_accessible_ja"],
+                    "対象時間": event["session_label_ja"],
+                    "過去の反応": event["directional_bias_label_ja"],
+                    "評価根拠": event.get("impact_star_source_ja") or "判定材料不足",
+                })
+            event_df = pd.DataFrame(event_rows)
+            with st.expander("イベントを一覧で比較", expanded=False):
+                st.dataframe(event_df, hide_index=True, width="stretch")
+                st.caption("日本時間を優先表示しています。詳しい根拠と米東部時間は"
+                           "下の各カードで確認できます。")
+
+            for index, event in enumerate(visible_events):
+                with st.container(border=True):
+                    date_label, primary_time, secondary_time = event_datetime_labels(event)
+                    h1, h2, h3 = st.columns([1.15, 4.6, 1.45])
+                    h1.markdown(f"**{date_label}**")
+                    h1.caption(primary_time)
+                    if secondary_time != "—":
+                        h1.caption(secondary_time)
+                    h2.markdown(f"**{event['display_name_ja']}**")
+                    h2.markdown(
+                        ui.chip(event["status_label_ja"],
+                                "blue" if event.get("status") == "UPCOMING" else "gray")
+                        + " " + ui.chip(event["session_label_ja"], "violet"),
+                        unsafe_allow_html=True)
+                    h3.markdown(f"### {event['impact_stars_text']}"
+                                if event["impact_available"] else "### —")
+                    h3.caption(
+                        "判定材料なし" if not event["impact_available"]
+                        else f"{event['impact_stars']} / 5・{event['impact_label_ja']}")
+                    h3.caption(event.get("impact_star_source_ja") or "判定材料不足")
+
+                    study = event.get("historical_sensitivity") or {}
+                    sample_size = int(study.get("sample_size") or 0)
+                    median_move = study.get("median_abs_move_pct")
+                    sensitivity_ratio = study.get("sensitivity_ratio")
+                    up_rate = study.get("up_rate_pct")
+                    s1, s2, s3, s4 = st.columns(4)
+                    s1.metric("過去の実測", f"{sample_size}回" if sample_size else "—",
+                              border=True)
+                    s2.metric("中央値の変動幅",
+                              "—" if median_move is None else f"±{median_move:.2f}%",
+                              border=True)
+                    s3.metric("平常時との比較",
+                              "—" if sensitivity_ratio is None else f"{sensitivity_ratio:.2f}倍",
+                              border=True)
+                    s4.metric("過去の上昇割合",
+                              "—" if up_rate is None else f"{up_rate:.0f}%",
+                              event["directional_bias_label_ja"],
+                              delta_color="off", border=True)
+
+                    with st.expander("上下シナリオ・根拠・原文を確認"):
+                        scenario_columns = st.columns(3)
+                        scenario_icons = {"up": "🟢", "down": "🔴", "two_sided": "🟡"}
+                        for column, scenario in zip(
+                                scenario_columns, event["scenario_rows_ja"]):
+                            with column.container(border=True):
+                                st.markdown(
+                                    f"**{scenario_icons[scenario['key']]} "
+                                    f"{scenario['label_ja']}**")
+                                st.write(scenario["description"])
+
+                        evidence = japanese_evidence(event)
+                        if evidence:
+                            st.markdown("**日本語で確認できる根拠**")
+                            for item in evidence[:4]:
+                                st.markdown(f"- {md_escape(item)}")
+                        original_name = event.get("original_name")
+                        english_evidence = [
+                            str(item) for item in event.get("evidence") or []
+                            if item and not re.search(
+                                r"[\u3040-\u30ff\u3400-\u9fff]", str(item))
+                        ]
+                        if original_name or english_evidence:
+                            st.markdown("**英語原文（必要な場合のみ）**")
+                            if original_name:
+                                st.text(str(original_name))
+                            for item in english_evidence[:2]:
+                                if str(item) != str(original_name):
+                                    st.text(str(item))
+                        source_text = event_source_label_ja(event.get("source"))
+                        st.caption(
+                            f"取得元: {source_text} ・ 根拠の充足度: "
+                            f"{event['confidence_label_ja']}")
+                        st.caption(
+                            "根拠の充足度は、過去標本数・情報源・日程の確かさを"
+                            "まとめた説明用の目安で、統計的な信頼区間ではありません。")
+                        if event.get("url"):
+                            st.link_button(
+                                "原文の情報源を開く", event["url"],
+                                key=f"event_source_{ticker}_{target_session}_{index}")
             st.caption("イベントは不確実性の確認材料で、売買スコアへ自動加点していません。"
-                       "過去方向は将来の上下を保証せず、発表値と市場予想の差を確認してください。")
+                       "過去の方向や★の数は将来を保証せず、発表値と市場予想の差を確認してください。")
         for warning in event_report.get("warnings") or []:
-            st.warning(warning)
+            st.warning(localize_event_warning(warning))
     else:
         st.info("ボタンを押すと、市場の直近5分足・イベント日程・ニュースを必要時だけ"
                 "読み込みます。データが不足・古い場合は確率を表示しません。")

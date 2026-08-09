@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import re
+from copy import deepcopy
 from hashlib import sha1
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Mapping, Sequence
@@ -70,6 +71,62 @@ _SESSION_LABELS = {
     "DATE_ONLY": "日付のみ（時刻不明）",
     "UNKNOWN": "セッション不明",
 }
+
+# 表示専用の日本語辞書。保存・判定に使うコード値は変更せず、
+# ``localize_event_for_display`` でUI向け表示だけを組み立てる。
+_KIND_LABELS_JA = {
+    "earnings": "決算発表",
+    "fomc": "FOMC政策金利発表",
+    "cpi": "米国消費者物価指数（CPI）",
+    "employment": "米国雇用統計",
+    "dividend": "配当・権利落ち",
+    "split": "株式分割・併合",
+    "merger": "合併・買収",
+    "regulatory": "規制・訴訟",
+    "guidance": "業績見通し",
+    "filing": "企業開示",
+    "company_news": "企業ニュース",
+}
+
+_STATUS_LABELS_JA = {
+    "UPCOMING": "今後の予定",
+    "RECENT": "最近のイベント",
+    "HISTORICAL": "過去のイベント",
+    "UNKNOWN": "時期不明",
+}
+
+_DIRECTIONAL_BIAS_LABELS_JA = {
+    "UP_HISTORY_BIASED": "過去は上昇寄り",
+    "DOWN_HISTORY_BIASED": "過去は下落寄り",
+    "TWO_SIDED": "過去は上下両方向",
+    "UNKNOWN": "方向性の材料不足",
+}
+
+_CONFIDENCE_LABELS_JA = {
+    "HIGH": "十分",
+    "MEDIUM": "一部あり",
+    "LOW": "少ない",
+    "UNKNOWN": "判定材料不足",
+}
+
+_SCENARIO_LABELS_JA = {
+    "up": "上振れシナリオ",
+    "down": "下振れシナリオ",
+    "two_sided": "上下に振れるシナリオ",
+}
+
+# impact_score（1〜100）をおおむね20点刻みで★1〜5へ変換する。0・欠損は
+# 「判定材料なし」とし、低影響（★1）と区別する。星の数はimpact_scoreに対して
+# 単調非減少となり、判定ロジックそのものには影響しない。
+IMPACT_STAR_BASIS = (
+    "影響スコア0・欠損: 判定材料なし、1〜19: ★1、20〜39: ★2、40〜59: ★3、"
+    "60〜79: ★4、80〜100: ★5"
+)
+
+HISTORICAL_IMPACT_STAR_BASIS = (
+    "過去イベント時の変動÷平常時の変動が4倍以上: ★5、3倍以上: ★4、"
+    "2倍以上: ★3、1.3倍以上: ★2、1.3倍未満: ★1"
+)
 
 _SCENARIOS = {
     "earnings": {
@@ -169,6 +226,148 @@ def _round_or_none(value: object, digits: int = 2) -> float | None:
     except (TypeError, ValueError):
         return None
     return round(number, digits) if math.isfinite(number) else None
+
+
+def impact_score_to_stars(impact_score: object) -> int:
+    """影響スコアを表示用の★0〜5へ単調変換する。
+
+    スコアは0〜100へ丸め、1〜19を★1、20〜39を★2、40〜59を
+    ★3、60〜79を★4、80〜100を★5とする。0・欠損・非数値・負数は
+    「判定材料なし」の★0とし、低影響の★1と区別する。元のイベント判定や
+    売買スコアは変更しない。
+    """
+    numeric = _round_or_none(impact_score, 8)
+    if numeric is None or numeric <= 0:
+        return 0
+    score = min(100.0, numeric)
+    return min(5, int(score // 20) + 1)
+
+
+def _contains_japanese(value: str) -> bool:
+    return re.search(r"[\u3040-\u30ff\u3400-\u9fff]", value) is not None
+
+
+def _sample_size(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _historical_impact_stars(study: object) -> int | None:
+    """旧イベント感応度と同じ閾値で実測比率を星へ変換する。"""
+    if not isinstance(study, Mapping) or _sample_size(study.get("sample_size")) < 3:
+        return None
+    ratio = _round_or_none(study.get("sensitivity_ratio"), 8)
+    if ratio is None or ratio < 0:
+        return None
+    for threshold, stars in ((4.0, 5), (3.0, 4), (2.0, 3), (1.3, 2)):
+        if ratio >= threshold:
+            return stars
+    return 1
+
+
+def localize_event_for_display(event: Mapping[str, object]) -> dict:
+    """イベントを日本語UI向けに投影する純粋な公開ヘルパー。
+
+    元のコード値と全フィールドを保持したコピーに、``*_label_ja`` と
+    ★表示を追加する。日本語名はそのまま主見出しに使うが、英語だけの名称・
+    ニュース見出しは機械翻訳せず、イベント種別の日本語名を主見出し、原文を
+    ``original_name`` に分ける。これによりUIは英語原文を補助欄へ表示できる。
+    入力オブジェクトとその入れ子は変更しない。
+    """
+    if not isinstance(event, Mapping):
+        raise TypeError("eventは辞書形式で指定してください")
+
+    localized = deepcopy(dict(event))
+    kind = str(event.get("kind") or "").strip().casefold()
+    status = str(event.get("status") or "UNKNOWN").strip().upper()
+    session = str(event.get("session") or "UNKNOWN").strip().upper()
+    directional_bias = str(
+        event.get("directional_bias") or "UNKNOWN").strip().upper()
+    confidence_label = str(
+        event.get("confidence_label") or "UNKNOWN").strip().upper()
+
+    kind_label = _KIND_LABELS_JA.get(kind, "その他のイベント")
+    raw_name = str(event.get("name") or "").strip()
+    if raw_name and _contains_japanese(raw_name):
+        display_name = raw_name
+        original_name = None
+    else:
+        # 原文が英語だけの場合は翻訳を生成せず、既知の種別名を主見出しにする。
+        display_name = kind_label
+        original_name = raw_name or None
+
+    historical_sensitivity = event.get("historical_sensitivity")
+    historical_stars = _historical_impact_stars(historical_sensitivity)
+    if historical_stars is not None:
+        stars = historical_stars
+        star_source = "過去実測（平常時比）"
+        star_basis = HISTORICAL_IMPACT_STAR_BASIS
+    else:
+        stars = impact_score_to_stars(event.get("impact_score"))
+        star_source = "イベント種類別の目安" if stars else "判定材料なし"
+        star_basis = IMPACT_STAR_BASIS
+    display_impact_label = (
+        "影響大" if stars >= 4 else "影響中" if stars == 3
+        else "影響小" if stars else "判定材料不足"
+    )
+
+    sample_size = (
+        _sample_size(historical_sensitivity.get("sample_size"))
+        if isinstance(historical_sensitivity, Mapping) else 0
+    )
+    scenario_rows = []
+    scenarios = event.get("scenarios")
+    if isinstance(scenarios, Mapping):
+        for key in ("up", "down", "two_sided"):
+            if key in scenarios:
+                scenario_rows.append({
+                    "key": key,
+                    "label_ja": _SCENARIO_LABELS_JA[key],
+                    "description": deepcopy(scenarios[key]),
+                })
+
+    labels = {
+        "kind": kind_label,
+        "status": _STATUS_LABELS_JA.get(status, "時期不明"),
+        "session": _SESSION_LABELS.get(session, _SESSION_LABELS["UNKNOWN"]),
+        # 主表示の言葉と★数を一致させる。内部impact_levelは元データに保持する。
+        "impact": display_impact_label,
+        "directional_bias": (
+            "過去データ不足で方向不明"
+            if directional_bias == "TWO_SIDED" and sample_size < 5
+            else _DIRECTIONAL_BIAS_LABELS_JA.get(
+                directional_bias, "方向性の材料不足")
+        ),
+        "confidence": _CONFIDENCE_LABELS_JA.get(
+            confidence_label, "判定材料不足"),
+    }
+    localized.update({
+        "display_name_ja": display_name,
+        "original_name": original_name,
+        "original_name_label_ja": "原文見出し",
+        "kind_label_ja": labels["kind"],
+        "status_label_ja": labels["status"],
+        "session_label_ja": labels["session"],
+        "impact_label_ja": labels["impact"],
+        "directional_bias_label_ja": labels["directional_bias"],
+        "confidence_label_ja": labels["confidence"],
+        "impact_stars": stars,
+        "impact_stars_text": "★" * stars + "☆" * (5 - stars),
+        "impact_stars_label": "—" if stars == 0 else "★" * stars,
+        "impact_stars_accessible_ja": (
+            "判定材料なし" if stars == 0
+            else f"{'★' * stars}{'☆' * (5 - stars)}（{stars}/5・{labels['impact']}）"
+        ),
+        "impact_available": stars > 0,
+        "impact_star_source_ja": star_source,
+        "impact_star_basis": star_basis,
+        "scenario_labels_ja": dict(_SCENARIO_LABELS_JA),
+        "scenario_rows_ja": scenario_rows,
+        "labels_ja": labels,
+    })
+    return localized
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -667,13 +866,17 @@ def build_event_intelligence(
         if summary:
             evidence.append(summary[:240])
         provider = str(item.get("provider") or "ニュース")
-        events.append(_make_event(
+        news_event = _make_event(
             kind=kind, name=title, event_date=event_date, event_time_et=event_time,
             session=session, study=study, evidence=evidence, source=provider,
             url=url or None, fetched_at=now,
             source_as_of=str(item.get("pub_date") or "") or None,
             source_quality="secondary", as_of=current_date,
-        ))
+        )
+        # ニュースは取得時点ですでに公表済み。同日記事を「今後の予定」へ
+        # 混ぜると、予定イベントと既知材料を取り違えるため明示的に分ける。
+        news_event["status"] = "RECENT" if event_date is not None else "UNKNOWN"
+        events.append(news_event)
         news_count += 1
 
     def sort_key(item: Mapping[str, object]):
