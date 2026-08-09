@@ -1,12 +1,15 @@
-"""yfinanceからのデータ取得。
+"""yfinanceとmoomoo OpenAPIからのデータ取得。
 
 すべての取得関数を st.cache_data でキャッシュし、同じ銘柄への
-重複リクエストを避ける。戻り値はpickle可能な型(DataFrame/dict)のみ。
+重複リクエストを避ける。チャート・最新価格・板情報はmoomooを優先し、
+OpenDや権限に問題がある場合はyfinanceへ自動フォールバックする。
 """
 
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+
+from lib import moomoo_client, moomoo_fetcher
 
 
 class FetchError(Exception):
@@ -59,6 +62,107 @@ def fetch_intraday_batch(tickers: tuple[str, ...], period: str = "1d",
         if not df.empty:
             out[t] = df
     return out
+
+
+def _date_keys(index: pd.Index) -> pd.Index:
+    dates = pd.DatetimeIndex(index)
+    if dates.tz is not None:
+        dates = dates.tz_localize(None)
+    return pd.Index(dates.date)
+
+
+def _merge_corporate_actions(primary: pd.DataFrame, yahoo: pd.DataFrame,
+                             interval: str) -> pd.DataFrame:
+    """moomooのOHLCVにYahooの配当・分割イベントを付加する。"""
+    out = primary.copy()
+    for column in ("Dividends", "Stock Splits"):
+        out[column] = 0.0
+    if yahoo.empty or interval not in {"1d", "1wk", "1mo"}:
+        return out
+
+    yahoo_keys = _date_keys(yahoo.index)
+    primary_keys = _date_keys(out.index)
+    for column in ("Dividends", "Stock Splits"):
+        if column not in yahoo.columns:
+            continue
+        values = pd.Series(
+            pd.to_numeric(yahoo[column], errors="coerce").fillna(0).to_numpy(),
+            index=yahoo_keys,
+        ).groupby(level=0).sum()
+        out[column] = [float(values.get(key, 0.0)) for key in primary_keys]
+    return out
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def moomoo_status() -> dict:
+    """moomoo SDK/OpenDの接続状態。"""
+    return moomoo_fetcher.connection_status()
+
+
+def fetch_realtime_snapshot(ticker: str) -> dict:
+    """moomooの最新価格。利用できなければフォールバック理由のみ返す。
+
+    取得はmoomoo_client.snapshotに一本化している(そちらが5秒キャッシュを持つ)。
+    """
+    state = moomoo_client.status()
+    if state["state"] != moomoo_client._State.OK:
+        return {"source": "Yahoo Finance", "fallback_reason": state["message"]}
+    snap = moomoo_client.snapshot((ticker,)).get(ticker)
+    if not snap or not snap.get("price"):
+        return {"source": "Yahoo Finance",
+                "fallback_reason": "moomooから最新価格を取得できませんでした"}
+    return {**snap, "code": moomoo_client.to_code(ticker) or ticker,
+            "source": "moomoo OpenAPI"}
+
+
+@st.cache_data(ttl=120, show_spinner="チャートデータを取得中...")
+def fetch_chart_history(ticker: str, period: str,
+                        interval: str = "1d") -> tuple[pd.DataFrame, dict]:
+    """チャート用OHLCVを取得し、取得元メタデータも返す。
+
+    既定ではYahoo Financeを使う。moomooの履歴K線は口座ごとのクォータを
+    消費するため、設定で明示的にオンにしたときだけ優先する。
+    """
+    fallback_reason = None
+    if not moomoo_fetcher.history_enabled():
+        # クォータを消費しないよう、moomooには問い合わせない。
+        return fetch_history(ticker, period, interval), {
+            "source": "Yahoo Finance", "code": ticker, "fallback_reason": None,
+        }
+    try:
+        moomoo = moomoo_fetcher.fetch_history(ticker, period, interval)
+    except moomoo_fetcher.MoomooError as exc:
+        moomoo = pd.DataFrame()
+        fallback_reason = str(exc)
+
+    if not moomoo.empty:
+        try:
+            yahoo = fetch_history(ticker, period, interval)
+        except FetchError:
+            yahoo = pd.DataFrame()
+        enriched = _merge_corporate_actions(moomoo, yahoo, interval)
+        return enriched, {
+            "source": "moomoo OpenAPI",
+            "code": moomoo_fetcher.normalize_code(ticker),
+            "fallback_reason": None,
+        }
+
+    yahoo = fetch_history(ticker, period, interval)
+    return yahoo, {
+        "source": "Yahoo Finance",
+        "code": ticker,
+        "fallback_reason": fallback_reason or "moomooからデータを取得できませんでした",
+    }
+
+
+@st.cache_data(ttl=10, show_spinner="moomooの板情報を取得中...")
+def fetch_order_book(ticker: str, num: int = 10) -> pd.DataFrame:
+    """moomooの板情報を読み取り専用で取得する。"""
+    try:
+        return moomoo_fetcher.fetch_order_book(ticker, num)
+    except moomoo_fetcher.MoomooError as exc:
+        raise FetchError(str(exc)) from exc
+
 
 
 @st.cache_data(ttl=900, show_spinner="銘柄情報を取得中...")

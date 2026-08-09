@@ -84,9 +84,10 @@ def _drawdown_52w(df) -> float | None:
 
 
 def _volume_ratio(df) -> float | None:
-    if "VOL_MA20" not in df.columns or "Volume" not in df.columns:
+    col = next((c for c in ("VOL_MA20", "VOL_MA") if c in df.columns), None)
+    if col is None or "Volume" not in df.columns:
         return None
-    ma, vol = _last(df["VOL_MA20"]), _last(df["Volume"])
+    ma, vol = _last(df[col]), _last(df["Volume"])
     if ma in (None, 0) or vol is None:
         return None
     return vol / ma

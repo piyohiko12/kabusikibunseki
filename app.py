@@ -1,6 +1,6 @@
 import streamlit as st
 
-from lib import moomoo_client, settings_store
+from lib import data_fetcher, moomoo_client, settings_store
 
 st.set_page_config(
     page_title="米国株式分析ツール",
@@ -48,6 +48,19 @@ with st.sidebar:
                 settings_store.save(moomoo_host=host, moomoo_port=int(port))
                 moomoo_client.status.clear()
                 st.rerun()
+
+            chart_hist = st.toggle(
+                "チャート履歴もmoomooから取得する",
+                value=bool(saved.get("moomoo_chart_history", False)),
+                help="オフ(推奨)ならチャートはYahoo Financeから取得します。"
+                     "オンにすると request_history_kline を使うため、口座資産に応じた"
+                     "「歴史的K線クォータ」を消費します。一度使った銘柄枠は30日間戻りません。")
+            if chart_hist != bool(saved.get("moomoo_chart_history", False)):
+                settings_store.save(moomoo_chart_history=chart_hist)
+                data_fetcher.fetch_chart_history.clear()
+                st.rerun()
+            if chart_hist:
+                st.caption("⚠️ 銘柄を切り替えるたびにクォータを消費します。")
 
             if state["state"] == "ok":
                 st.success(state["message"], icon="🟢")

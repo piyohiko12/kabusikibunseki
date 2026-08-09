@@ -16,13 +16,13 @@ PERIODS = {
     "5年": ("10y", 1826),
 }
 
-CHART_TYPES = ["ローソク足", "平均足", "ライン"]
+CHART_TYPES = ["ローソク足", "平均足", "OHLCバー", "ライン", "エリア"]
 INTERVALS = {"1分": "1m", "5分": "5m", "15分": "15m", "1時間": "1h",
              "日足": "1d", "週足": "1wk", "月足": "1mo"}
-# 分足はYahooの無料提供範囲に上限がある: (取得期間, 表示できる最大日数)
+# 取得量とyfinanceフォールバック互換性を保つための範囲: (取得期間, 最大日数)
 INTRADAY_LIMITS = {"1m": ("5d", 5), "5m": ("1mo", 30),
                    "15m": ("1mo", 30), "1h": ("1y", 365)}
-OVERLAY_OPTIONS = ["SMA20", "SMA50", "SMA200", "EMA20", "EMA50", "VWAP(日中)",
+OVERLAY_OPTIONS = ["移動平均線(SMA)", "指数移動平均線(EMA)", "VWAP(日中)",
                    "ボリンジャーバンド", "一目均衡表", "サポレジライン",
                    "フィボナッチ", "出来高プロファイル"]
 # サポレジの上位足マージ: 表示中の足 → 参照する上位足
@@ -31,31 +31,43 @@ HTF_MAP = {"1m": "日足", "5m": "日足", "15m": "日足", "1h": "日足",
 OSC_OPTIONS = ["出来高", "RSI", "MACD", "ストキャスティクス"]
 
 # ワンクリックで用途別の表示に切り替えるプリセット
-PRESETS = {
-    "🧭 シンプル": {
-        "overlays": ["SMA50", "SMA200"],
-        "oscillators": ["出来高"],
-    },
-    "📐 テクニカル": {
-        "overlays": ["SMA20", "SMA50", "SMA200", "サポレジライン"],
-        "oscillators": ["出来高", "RSI", "MACD"],
-    },
-    "🎯 スイング": {
-        "overlays": ["SMA50", "SMA200", "サポレジライン", "フィボナッチ",
-                     "出来高プロファイル"],
-        "oscillators": ["出来高", "RSI"],
-    },
-    "⚡ デイトレ": {
-        "overlays": ["VWAP(日中)", "SMA20", "ボリンジャーバンド", "サポレジライン"],
-        "oscillators": ["出来高", "ストキャスティクス"],
-    },
-}
-CUSTOM = "⚙️ カスタム"
 BENCHMARKS = {"S&P500": "^GSPC", "NASDAQ総合": "^IXIC", "ダウ平均": "^DJI"}
 NEWS_SOURCES = ["Yahoo Finance", "Google News", "🇯🇵 日本語", "SEC開示"]
 PLOT_CONFIG = {
     "displaylogo": False,
-    "modeBarButtonsToAdd": ["drawline", "drawopenpath", "drawrect", "eraseshape"],
+    "displayModeBar": True,
+    "scrollZoom": True,
+    "responsive": True,
+    "doubleClick": "reset+autosize",
+    "modeBarButtonsToAdd": ["drawline", "drawopenpath", "drawclosedpath",
+                            "drawcircle", "drawrect", "eraseshape"],
+    "toImageButtonOptions": {"format": "png", "scale": 2,
+                             "filename": "stock-chart"},
+}
+
+CHART_PRESETS = {
+    "標準": {
+        "interval": "日足", "chart_type": "ローソク足",
+        "overlays": ["移動平均線(SMA)", "サポレジライン"],
+        "oscillators": ["出来高", "RSI", "MACD"],
+    },
+    "デイトレ": {
+        "interval": "5分", "chart_type": "ローソク足",
+        "overlays": ["指数移動平均線(EMA)", "VWAP(日中)",
+                     "ボリンジャーバンド"],
+        "oscillators": ["出来高", "MACD"],
+    },
+    "スイング": {
+        "interval": "日足", "chart_type": "ローソク足",
+        "overlays": ["移動平均線(SMA)", "ボリンジャーバンド",
+                     "サポレジライン"],
+        "oscillators": ["出来高", "RSI", "MACD"],
+    },
+    "長期": {
+        "interval": "週足", "chart_type": "エリア",
+        "overlays": ["移動平均線(SMA)", "サポレジライン"],
+        "oscillators": ["出来高", "RSI"],
+    },
 }
 
 
@@ -121,7 +133,8 @@ if len(_recent) > 1:
 fetch_period, display_days = PERIODS[period_label]
 
 try:
-    hist = data_fetcher.fetch_history(ticker, fetch_period)
+    hist, _base_meta = data_fetcher.fetch_chart_history(
+        ticker, fetch_period, "1d")
 except data_fetcher.FetchError:
     st.error("データの取得中にエラーが発生しました。ネットワーク接続を確認し、"
              "しばらく時間をおいてから再試行してください。")
@@ -137,8 +150,11 @@ try:
 except data_fetcher.FetchError:
     info = {}
 
-latest = hist["Close"].iloc[-1]
-prev = hist["Close"].iloc[-2] if len(hist) > 1 else latest
+snapshot = data_fetcher.fetch_realtime_snapshot(ticker)
+hist_latest = float(hist["Close"].iloc[-1])
+hist_prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else hist_latest
+latest = snapshot.get("price") or hist_latest
+prev = snapshot.get("previous_close") or hist_prev
 change = latest - prev
 change_pct = (latest / prev - 1) * 100 if prev else 0.0
 
@@ -155,10 +171,10 @@ if badges:
     st.markdown("")
 
 # moomooが使えるときは遅延のない現在値に差し替える(使えなければYahooの終値のまま)
-realtime = moomoo_client.snapshot((ticker,)).get(ticker)
-if realtime and realtime.get("price"):
-    price_now = float(realtime["price"])
-    base = realtime.get("previous_close") or prev
+# snapshotはdata_fetcher.fetch_realtime_snapshot経由で1回だけ取得済み。
+if snapshot.get("price"):
+    price_now = float(snapshot["price"])
+    base = snapshot.get("previous_close") or prev
     change = price_now - float(base)
     change_pct = (price_now / float(base) - 1) * 100 if base else 0.0
     price_label = "株価(リアルタイム)"
@@ -183,95 +199,207 @@ if rsi_now is not None and pd.notna(rsi_now):
 else:
     m4.metric("RSI(14)", "—", border=True)
 
-if realtime:
-    st.caption(f"🟢 株価はmoomooのリアルタイム値です(更新: "
-               f"{realtime.get('update_time') or '—'})。"
-               "チャート・指標はYahoo Financeの日足を使用しています。")
+if snapshot.get("source") == "moomoo OpenAPI":
+    spread = ""
+    if snapshot.get("bid") is not None and snapshot.get("ask") is not None:
+        spread = f"・Bid ${snapshot['bid']:,.2f} / Ask ${snapshot['ask']:,.2f}"
+    updated = f"・更新 {snapshot['update_time']}" if snapshot.get("update_time") else ""
+    st.caption(f"⚡ 最新価格: moomoo OpenAPI({snapshot.get('code', ticker)})"
+               f"{spread}{updated}。財務・ニュースはYahoo Finance等を併用。")
 else:
-    st.caption("株価はYahoo Financeの値で、15〜20分遅れています。"
-               "サイドバーの「moomooリアルタイム連携」を有効にすると即時値になります。")
+    reason = snapshot.get("fallback_reason")
+    st.caption("データ源: Yahoo Finance"
+               + (f"(moomooフォールバック: {reason})" if reason else ""))
 
 tab_chart, tab_news, tab_tape, tab_flow = st.tabs(
     ["📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値", "🏦 需給・IV"])
 
 # ---------------------------------------------------------------- タブ1
 with tab_chart:
-    # 前回の表示設定を復元する(data/settings.json に保存)
-    _saved_chart = _settings.get("chart") or {}
-    _preset_names = list(PRESETS) + [CUSTOM]
-    _saved_preset = _saved_chart.get("preset")
-    if _saved_preset not in _preset_names:
-        _saved_preset = "📐 テクニカル"
+    _saved_adv = _settings.get("advanced_chart") or {}
+    _saved_preset = _saved_adv.get("preset")
+    if _saved_preset not in CHART_PRESETS:
+        _saved_preset = "標準"
 
-    # 保存値が壊れていても既定値で開けるようにする
-    _def_type = _saved_chart.get("chart_type")
-    _def_type = _def_type if _def_type in CHART_TYPES else "ローソク足"
-    _def_bar = _saved_chart.get("bar_label")
-    _def_bar = _def_bar if _def_bar in INTERVALS else "日足"
-
-    c_type, c_interval = st.columns([2.2, 3])
+    c_preset, c_type, c_interval, c_action, c_cfg, c_refresh = st.columns(
+        [1.35, 2.1, 2.15, 1.65, 0.75, 0.45])
+    with c_preset:
+        chart_preset = st.pills(
+            "分析プリセット", list(CHART_PRESETS), default=_saved_preset,
+            key="chart_preset") or _saved_preset
+    preset_cfg = CHART_PRESETS[chart_preset]
+    use_saved = _saved_adv.get("preset") == chart_preset
+    default_type = (_saved_adv.get("chart_type") if use_saved
+                    else preset_cfg["chart_type"])
+    if default_type not in CHART_TYPES:
+        default_type = preset_cfg["chart_type"]
+    default_interval = (_saved_adv.get("bar_label") if use_saved
+                        else preset_cfg["interval"])
+    if default_interval not in INTERVALS:
+        default_interval = preset_cfg["interval"]
     with c_type:
         chart_type = st.pills("チャート種別", CHART_TYPES,
-                              default=_def_type) or _def_type
+                              default=default_type,
+                              key=f"chart_type_{chart_preset}") or "ローソク足"
     with c_interval:
-        bar_label = st.pills("足の間隔", list(INTERVALS),
-                             default=_def_bar) or _def_bar
-
-    c_preset, c_cfg = st.columns([3.4, 1.2])
-    with c_preset:
-        preset = st.pills("表示プリセット", _preset_names,
-                          default=_saved_preset) or _saved_preset
+        bar_label = st.pills(
+            "足の間隔", list(INTERVALS), default=default_interval,
+            key=f"chart_interval_{chart_preset}") or default_interval
+    with c_action:
+        default_interaction = _saved_adv.get("interaction", "クロスヘア")
+        if default_interaction not in ["クロスヘア", "ズーム", "移動", "ライン描画"]:
+            default_interaction = "クロスヘア"
+        interaction = st.pills(
+            "マウス操作", ["クロスヘア", "ズーム", "移動", "ライン描画"],
+            default=default_interaction,
+            key="chart_interaction") or default_interaction
     with c_cfg:
+        with st.popover("⚙️ 詳細", width="stretch"):
+            tab_ind, tab_look = st.tabs(["指標", "表示・パネル"])
+            with tab_ind:
+                overlays = st.multiselect(
+                    "メインチャート指標", OVERLAY_OPTIONS,
+                    default=(_saved_adv.get("overlays", preset_cfg["overlays"])
+                             if use_saved else preset_cfg["overlays"]),
+                    key=f"overlays_{chart_preset}")
+                oscillators = st.multiselect(
+                    "サブチャート(複数可)", OSC_OPTIONS,
+                    default=(_saved_adv.get("oscillators", preset_cfg["oscillators"])
+                             if use_saved else preset_cfg["oscillators"]),
+                    key=f"oscillators_{chart_preset}")
+
+                st.caption("移動平均線・ボリンジャーバンド")
+                saved_params = _saved_adv.get("indicator_params") or {}
+                p1, p2, p3 = st.columns(3)
+                sma_fast = p1.number_input("短期SMA", 2, 100,
+                                           int(saved_params.get("sma_periods", [20, 50, 200])[0]),
+                                           key=f"sma_fast_{chart_preset}")
+                sma_mid = p2.number_input("中期SMA", 5, 200,
+                                          int(saved_params.get("sma_periods", [20, 50, 200])[1]),
+                                          key=f"sma_mid_{chart_preset}")
+                sma_long = p3.number_input("長期SMA", 20, 500,
+                                           int(saved_params.get("sma_periods", [20, 50, 200])[2]),
+                                           key=f"sma_long_{chart_preset}")
+                p1, p2, p3 = st.columns(3)
+                ema_fast = p1.number_input("短期EMA", 2, 100,
+                                           int(saved_params.get("ema_periods", [20, 50])[0]),
+                                           key=f"ema_fast_{chart_preset}")
+                ema_slow = p2.number_input("長期EMA", 3, 200,
+                                           int(saved_params.get("ema_periods", [20, 50])[1]),
+                                           key=f"ema_slow_{chart_preset}")
+                boll_period = p3.number_input("BOLL期間", 5, 100,
+                                              int(saved_params.get("boll_period", 20)),
+                                              key=f"boll_period_{chart_preset}")
+                boll_std = st.slider(
+                    "BOLL標準偏差", 0.5, 4.0,
+                    float(saved_params.get("boll_std", 2.0)), 0.1,
+                    key=f"boll_std_{chart_preset}")
+
+                st.caption("オシレーター")
+                p1, p2, p3 = st.columns(3)
+                rsi_period = p1.number_input("RSI", 2, 50,
+                                             int(saved_params.get("rsi_period", 14)),
+                                             key=f"rsi_period_{chart_preset}")
+                macd_fast = p2.number_input("MACD短期", 2, 50,
+                                             int(saved_params.get("macd_fast", 12)),
+                                             key=f"macd_fast_{chart_preset}")
+                macd_slow_input = p3.number_input(
+                    "MACD長期", 3, 100, int(saved_params.get("macd_slow", 26)),
+                    key=f"macd_slow_{chart_preset}")
+                p1, p2, p3 = st.columns(3)
+                macd_signal = p1.number_input(
+                    "MACDシグナル", 2, 50,
+                    int(saved_params.get("macd_signal", 9)),
+                    key=f"macd_signal_{chart_preset}")
+                stoch_period = p2.number_input(
+                    "STOCH期間", 3, 50, int(saved_params.get("stoch_period", 14)),
+                    key=f"stoch_period_{chart_preset}")
+                volume_ma = p3.number_input(
+                    "出来高MA", 2, 100, int(saved_params.get("volume_ma", 20)),
+                    key=f"volume_ma_{chart_preset}")
+                show_signals = st.toggle(
+                    "MACD / RSIテクニカルイベント",
+                    value=bool(_saved_adv.get("show_signals", False)),
+                    key=f"signals_{chart_preset}")
+
+            with tab_look:
+                chart_theme = st.segmented_control(
+                    "チャートテーマ", ["ダーク", "ライト"],
+                    default=_saved_adv.get("theme", "ダーク"),
+                    key="chart_theme") or "ダーク"
+                color_scheme = st.segmented_control(
+                    "値動きの色", ["緑上昇 / 赤下落", "赤上昇 / 緑下落"],
+                    default=_saved_adv.get("color_scheme", "緑上昇 / 赤下落"),
+                    key="chart_color_scheme") or \
+                    "緑上昇 / 赤下落"
+                show_events = st.toggle("配当・分割マーカー",
+                                        value=bool(_saved_adv.get("events", True)))
+                current_price_line = st.toggle(
+                    "現在値ライン", value=bool(_saved_adv.get("current_price_line", True)))
+                show_grid = st.toggle("グリッド",
+                                      value=bool(_saved_adv.get("grid", True)))
+                range_selector = st.toggle(
+                    "期間ショートカット", value=bool(_saved_adv.get("range_selector", True)))
+                range_slider = st.toggle(
+                    "期間スライダー", value=bool(_saved_adv.get("range_slider", False)))
+                compact_sessions = st.toggle(
+                    "休場時間を詰める", value=bool(_saved_adv.get("compact_sessions", True)))
+                log_scale = st.toggle(
+                    "対数スケール(価格軸)", value=bool(_saved_adv.get("log_scale", False)))
+                _heights = {360: "低い", 430: "標準", 520: "やや高い",
+                            640: "高い", 780: "最大"}
+                saved_height = int(_saved_adv.get("height", 520))
+                if saved_height not in _heights:
+                    saved_height = 520
+                chart_height = st.select_slider(
+                    "チャートの高さ", options=list(_heights), value=saved_height,
+                    format_func=lambda value: _heights[value])
+                multi_timeframe = st.toggle(
+                    "マルチタイムフレーム(2画面追加)",
+                    value=bool(_saved_adv.get("multi_timeframe", False)))
+                show_order_book = st.toggle(
+                    "moomoo板情報(読み取り専用)",
+                    value=bool(_saved_adv.get("show_order_book", False)),
+                    help="OpenDと相場権限が利用できる場合のみ表示します。注文は行いません",
+                )
+                benches = st.multiselect(
+                    "パフォーマンス比較", list(BENCHMARKS),
+                    default=_saved_adv.get("benchmarks", []))
+    with c_refresh:
         st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
-        cfg_pop = st.popover("⚙️ 詳細設定", use_container_width=True)
+        if st.button("↻", help="最新データを再取得", key="refresh_chart"):
+            data_fetcher.fetch_chart_history.clear()
+            data_fetcher.fetch_order_book.clear()
+            moomoo_client.snapshot.clear()
+            st.rerun()
 
-    # プリセットを選んだらその内容、カスタムなら前回の選択を初期値にする
-    if preset in PRESETS:
-        base_overlays = PRESETS[preset]["overlays"]
-        base_oscs = PRESETS[preset]["oscillators"]
-    else:
-        base_overlays = _saved_chart.get("overlays") or ["SMA50", "サポレジライン"]
-        base_oscs = _saved_chart.get("oscillators") or ["出来高", "RSI"]
-
-    with cfg_pop:
-        st.caption("プリセットを上書きすると「カスタム」として保存されます。")
-        overlays = st.multiselect("オーバーレイ(価格に重ねる指標)",
-                                  OVERLAY_OPTIONS,
-                                  default=[o for o in base_overlays
-                                           if o in OVERLAY_OPTIONS])
-        oscillators = st.multiselect("サブチャート", OSC_OPTIONS,
-                                     default=[o for o in base_oscs
-                                              if o in OSC_OPTIONS])
-        col_a, col_b = st.columns(2)
-        show_events = col_a.toggle("配当・分割マーカー",
-                                   value=_saved_chart.get("events", True))
-        log_scale = col_b.toggle("対数スケール",
-                                 value=_saved_chart.get("log_scale", False))
-        _heights = {360: "低い", 430: "標準", 520: "やや高い",
-                    640: "高い", 780: "最大"}
-        _def_h = _saved_chart.get("height")
-        _def_h = _def_h if _def_h in _heights else 430
-        chart_height = st.select_slider(
-            "チャートの高さ", options=list(_heights),
-            value=_def_h, format_func=lambda v: _heights[v])
-        benches = st.multiselect("パフォーマンス比較", list(BENCHMARKS), default=[])
-
-    # 設定が変わったら保存(次回起動時も同じ見た目で開ける)
-    _now_chart = {
-        "preset": preset if (preset in PRESETS
-                             and sorted(overlays) == sorted(PRESETS[preset]["overlays"])
-                             and sorted(oscillators) == sorted(PRESETS[preset]["oscillators"]))
-        else CUSTOM,
-        "chart_type": chart_type, "bar_label": bar_label,
-        "overlays": overlays, "oscillators": oscillators,
-        "events": show_events, "log_scale": log_scale, "height": chart_height,
+    macd_slow = max(int(macd_fast) + 1, int(macd_slow_input))
+    indicator_params = {
+        "sma_periods": (int(sma_fast), int(sma_mid), int(sma_long)),
+        "ema_periods": (int(ema_fast), int(ema_slow)),
+        "boll_period": int(boll_period), "boll_std": float(boll_std),
+        "rsi_period": int(rsi_period), "macd_fast": int(macd_fast),
+        "macd_slow": macd_slow, "macd_signal": int(macd_signal),
+        "stoch_period": int(stoch_period), "stoch_k": 3, "stoch_d": 3,
+        "volume_ma": int(volume_ma),
     }
-    if _now_chart != _saved_chart:
-        settings_store.save(chart=_now_chart)
-
+    _now_adv = {
+        "preset": chart_preset, "chart_type": chart_type,
+        "bar_label": bar_label, "interaction": interaction,
+        "overlays": overlays, "oscillators": oscillators,
+        "indicator_params": indicator_params, "show_signals": show_signals,
+        "theme": chart_theme, "color_scheme": color_scheme,
+        "events": show_events, "current_price_line": current_price_line,
+        "grid": show_grid, "range_selector": range_selector,
+        "range_slider": range_slider, "compact_sessions": compact_sessions,
+        "log_scale": log_scale, "height": chart_height,
+        "multi_timeframe": multi_timeframe,
+        "show_order_book": show_order_book, "benchmarks": benches,
+    }
+    if _now_adv != _saved_adv:
+        settings_store.save(advanced_chart=_now_adv)
     interval = INTERVALS[bar_label]
 
-    chart_view = view
     chart_period = fetch_period
     chart_days = display_days
     limit_note = ""
@@ -279,23 +407,33 @@ with tab_chart:
         chart_period, cap = INTRADAY_LIMITS[interval]
         chart_days = min(display_days, cap)
         if display_days > cap:
-            limit_note = (f"※ {bar_label}足はYahooの無料提供範囲の都合で"
+            limit_note = (f"※ {bar_label}足は取得量を抑えるため"
                           f"直近{cap}日分まで表示します。")
     elif interval != "1d":
         chart_period = "10y" if interval == "1wk" else "max"
 
-    if interval != "1d":
+    try:
+        chart_hist, chart_meta = data_fetcher.fetch_chart_history(
+            ticker, chart_period, interval)
+    except data_fetcher.FetchError:
+        chart_hist, chart_meta = pd.DataFrame(), {"source": "取得失敗"}
+    if chart_hist.empty:
+        st.warning("この足の間隔のデータを取得できなかったため、日足で表示しています。")
+        interval = "1d"
         try:
-            chart_hist = data_fetcher.fetch_history(ticker, chart_period, interval)
+            chart_hist, chart_meta = data_fetcher.fetch_chart_history(
+                ticker, fetch_period, interval)
         except data_fetcher.FetchError:
-            chart_hist = pd.DataFrame()
-        if chart_hist.empty:
-            st.warning("この足の間隔のデータを取得できなかったため、日足で表示しています。")
-            interval = "1d"
-            chart_view = view
-        else:
-            chart_view = indicators.slice_display(
-                indicators.add_indicators(chart_hist), chart_days)
+            chart_hist = hist
+            chart_meta = {"source": "Yahoo Finance", "code": ticker,
+                          "fallback_reason": "moomoo・再取得とも利用不可"}
+        chart_days = display_days
+    if chart_hist.empty:
+        chart_hist = hist
+        chart_meta = {"source": "Yahoo Finance", "code": ticker,
+                      "fallback_reason": "moomooからデータを取得できませんでした"}
+    chart_view = indicators.slice_display(
+        indicators.add_indicators(chart_hist, indicator_params), chart_days)
 
     lv_list = levels.find_levels(chart_view)
 
@@ -303,17 +441,18 @@ with tab_chart:
     htf_label = HTF_MAP.get(interval)
     if htf_label and lv_list:
         if htf_label == "日足":
-            htf_view = view
+            htf_iv, htf_period = "1d", fetch_period
         else:
             htf_iv = "1wk" if htf_label == "週足" else "1mo"
-            try:
-                htf_hist = data_fetcher.fetch_history(
-                    ticker, "10y" if htf_iv == "1wk" else "max", htf_iv)
-            except data_fetcher.FetchError:
-                htf_hist = pd.DataFrame()
-            htf_view = (indicators.slice_display(
-                indicators.add_indicators(htf_hist), max(display_days * 4, 730))
-                if not htf_hist.empty else pd.DataFrame())
+            htf_period = "10y" if htf_iv == "1wk" else "max"
+        try:
+            htf_hist, _ = data_fetcher.fetch_chart_history(
+                ticker, htf_period, htf_iv)
+        except data_fetcher.FetchError:
+            htf_hist = pd.DataFrame()
+        htf_view = (indicators.slice_display(
+            indicators.add_indicators(htf_hist), max(display_days * 4, 730))
+            if not htf_hist.empty else pd.DataFrame())
         if not htf_view.empty:
             lv_list = levels.merge_mtf(lv_list, levels.find_levels(htf_view),
                                        htf_label)
@@ -330,14 +469,88 @@ with tab_chart:
         "log_scale": log_scale,
         "levels": lv_chart,
         "height": chart_height,
+        "indicator_params": indicator_params,
+        "theme": chart_theme,
+        "color_scheme": color_scheme,
+        "grid": show_grid,
+        "range_slider": range_slider,
+        "range_selector": range_selector,
+        "current_price_line": current_price_line,
+        "signals": show_signals,
+        "compact_sessions": compact_sessions,
+        "interaction": interaction,
+        "current_price": snapshot.get("price"),
     }
     st.plotly_chart(charts.price_chart(chart_view, ticker, opts),
-                    config=PLOT_CONFIG)
-    st.caption("💡 十字カーソルで価格と日付を読めます。ドラッグで拡大、ダブルクリックで戻る。"
-               "右上のツールバーからトレンドライン・矩形の描画も可能です。"
-               "◆=配当、★=株式分割。赤帯=抵抗ゾーン、緑帯=サポートゾーン"
+                    config=PLOT_CONFIG, key=f"main_chart_{ticker}")
+    source_text = (f"データ源: {chart_meta.get('source', '不明')}"
+                   f"({chart_meta.get('code', ticker)})")
+    if chart_meta.get("fallback_reason"):
+        reason = str(chart_meta["fallback_reason"])
+        source_text += f" / moomooフォールバック: {reason[:160]}"
+    st.caption(source_text)
+    st.caption("💡 ホイール=拡大縮小、ダブルクリック=リセット、凡例クリック=線の表示/非表示。"
+               "右上のツールバーでトレンドライン・パス・円・矩形を描画できます。"
+               " ◆=配当、★=株式分割。赤帯=抵抗ゾーン、緑帯=サポートゾーン"
                "(濃く太いほど強いレベル)。"
                + (f" {limit_note}" if limit_note else ""))
+
+    if multi_timeframe:
+        st.subheader("🔲 マルチタイムフレーム")
+        if interval in INTRADAY_LIMITS:
+            mtf_specs = [("日足・6ヶ月", "1d", "2y", 182),
+                         ("週足・5年", "1wk", "10y", 1826)]
+        elif interval == "1d":
+            mtf_specs = [("1時間足・30日", "1h", "1mo", 30),
+                         ("週足・5年", "1wk", "10y", 1826)]
+        elif interval == "1wk":
+            mtf_specs = [("日足・1年", "1d", "2y", 365),
+                         ("月足・10年", "1mo", "max", 3653)]
+        else:
+            mtf_specs = [("日足・1年", "1d", "2y", 365),
+                         ("週足・5年", "1wk", "10y", 1826)]
+
+        mtf_cols = st.columns(2)
+        for col, (label, mtf_iv, mtf_period, mtf_days) in zip(mtf_cols, mtf_specs):
+            try:
+                mtf_hist, mtf_meta = data_fetcher.fetch_chart_history(
+                    ticker, mtf_period, mtf_iv)
+            except data_fetcher.FetchError:
+                mtf_hist, mtf_meta = pd.DataFrame(), {"source": "取得失敗"}
+            with col:
+                if mtf_hist.empty:
+                    st.info(f"{label}を取得できませんでした。")
+                else:
+                    mtf_view = indicators.slice_display(
+                        indicators.add_indicators(mtf_hist), mtf_days)
+                    st.plotly_chart(
+                        charts.mini_price_chart(
+                            mtf_view, label, interval=mtf_iv,
+                            theme_name=chart_theme),
+                        config={"displaylogo": False, "scrollZoom": True},
+                        key=f"mtf_{ticker}_{mtf_iv}",
+                    )
+                    st.caption(f"{mtf_meta.get('source', '不明')} / SMA20・50")
+
+    if show_order_book:
+        st.subheader("📖 moomoo 板情報")
+        try:
+            order_book = data_fetcher.fetch_order_book(ticker, 10)
+        except data_fetcher.FetchError as exc:
+            st.info(f"板情報を取得できませんでした: {exc}")
+        else:
+            if order_book.empty:
+                st.info("利用可能な板情報がありません。")
+            else:
+                styled_book = order_book.style.format({
+                    "売数量": lambda v: "—" if pd.isna(v) else f"{v:,.0f}",
+                    "売気配値": lambda v: "—" if pd.isna(v) else f"${v:,.3f}",
+                    "買気配値": lambda v: "—" if pd.isna(v) else f"${v:,.3f}",
+                    "買数量": lambda v: "—" if pd.isna(v) else f"{v:,.0f}",
+                })
+                st.dataframe(styled_book, hide_index=True)
+                st.caption("OpenD経由の読み取り専用データです。相場権限により"
+                           "表示段数やリアルタイム性が異なります。")
 
     if benches:
         series = {ticker: chart_view["Close"]}
