@@ -150,6 +150,26 @@ def fetch_order_book(ticker: str, num: int = 10) -> pd.DataFrame:
         return moomoo_fetcher.fetch_order_book(ticker, num)
     except moomoo_fetcher.MoomooError as exc:
         raise FetchError(str(exc)) from exc
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_recent_ticks(ticker: str, num: int = 60) -> pd.DataFrame:
+    """支持線・抵抗線の再評価用に直近の歩み値を取得する。"""
+    try:
+        return moomoo_fetcher.fetch_recent_ticks(ticker, num)
+    except moomoo_fetcher.MoomooError as exc:
+        raise FetchError(str(exc)) from exc
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_capital_distribution(ticker: str) -> dict | None:
+    """支持線・抵抗線の再評価用に当日の資金フローを取得する。"""
+    try:
+        return moomoo_fetcher.fetch_capital_distribution(ticker)
+    except moomoo_fetcher.MoomooError as exc:
+        raise FetchError(str(exc)) from exc
+
+
 @st.cache_data(ttl=900, show_spinner="銘柄情報を取得中...")
 def fetch_info(ticker: str) -> dict:
     """企業情報・ファンダメンタル指標を取得する。

@@ -283,3 +283,71 @@ def fetch_order_book(ticker: str, num: int = 10) -> pd.DataFrame:
     finally:
         if ctx is not None:
             ctx.close()
+
+
+def fetch_recent_ticks(ticker: str, num: int = 60) -> pd.DataFrame:
+    """直近の歩み値を取得する。取引方向と出来高を再評価に利用する。"""
+    code = normalize_code(ticker)
+    ctx = None
+    try:
+        ctx = _open_context()
+        ret, message = ctx.subscribe([code], [SubType.TICKER])
+        if ret != RET_OK:
+            raise MoomooError(str(message))
+        ret, data = ctx.get_rt_ticker(code, num=num)
+        if ret != RET_OK:
+            raise MoomooError(str(data))
+        if data is None or data.empty:
+            return pd.DataFrame()
+        columns = [column for column in
+                   ("time", "price", "volume", "turnover", "ticker_direction", "type")
+                   if column in data.columns]
+        return data[columns].copy().reset_index(drop=True)
+    except MoomooError:
+        raise
+    except Exception as exc:
+        raise MoomooError(str(exc)) from exc
+    finally:
+        if ctx is not None:
+            ctx.close()
+
+
+def fetch_capital_distribution(ticker: str) -> dict | None:
+    """大口・中口・小口の当日純流入を取得する。"""
+    code = normalize_code(ticker)
+    ctx = None
+    try:
+        ctx = _open_context()
+        ret, data = ctx.get_capital_distribution(code)
+        if ret != RET_OK:
+            raise MoomooError(str(data))
+        if data is None or data.empty:
+            return None
+        row = data.iloc[0]
+
+        def number(key: str) -> float:
+            return _as_float(row.get(key), 0.0) or 0.0
+
+        tiers = [
+            ("大口", number("capital_in_big") - number("capital_out_big"),
+             number("capital_in_big"), number("capital_out_big")),
+            ("中口", number("capital_in_mid") - number("capital_out_mid"),
+             number("capital_in_mid"), number("capital_out_mid")),
+            ("小口", number("capital_in_small") - number("capital_out_small"),
+             number("capital_in_small"), number("capital_out_small")),
+        ]
+        if not any(item[2] or item[3] for item in tiers):
+            return None
+        return {
+            "code": code,
+            "tiers": tiers,
+            "net": sum(item[1] for item in tiers),
+            "update_time": str(row.get("update_time") or ""),
+        }
+    except MoomooError:
+        raise
+    except Exception as exc:
+        raise MoomooError(str(exc)) from exc
+    finally:
+        if ctx is not None:
+            ctx.close()

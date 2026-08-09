@@ -5,7 +5,7 @@ import html
 import pandas as pd
 import streamlit as st
 
-from lib import (charts, data_fetcher, indicators, levels, moomoo_client,
+from lib import (charts, data_fetcher, indicators, level_review, levels, moomoo_client,
                  news_fetcher, sensitivity, settings_store, ui)
 
 # 表示ラベル → (取得期間, 表示日数)。SMA200を期間の先頭から描くため長めに取得する。
@@ -477,8 +477,25 @@ with tab_chart:
             lv_list = levels.merge_mtf(lv_list, levels.find_levels(htf_view),
                                        htf_label)
 
-    lv_chart = ([l for l in lv_list if l["type"] == "抵抗線"][:3]
-                + [l for l in lv_list if l["type"] == "サポート"][:3])
+    # 再評価の適用状態は銘柄・足・期間・最新バーが一致する間だけ有効。
+    # 時間軸を切り替えた際に古い板情報を持ち越さない。
+    base_lv_list = [dict(level) for level in lv_list]
+    review_context = (f"{ticker}|{interval}|{chart_period}|{len(chart_view)}|"
+                      f"{chart_view.index[-1] if not chart_view.empty else 'empty'}")
+    applied_review = st.session_state.get("moomoo_level_review_applied")
+    review_is_applied = bool(
+        applied_review
+        and applied_review.get("context") == review_context
+        and applied_review.get("levels")
+    )
+    if review_is_applied:
+        lv_list = [dict(level) for level in applied_review["levels"]]
+
+    lv_chart = (sorted(
+        [level for level in lv_list if level["type"] == "抵抗線"],
+        key=lambda level: abs(level["distance_pct"]))[:3]
+        + sorted([level for level in lv_list if level["type"] == "サポート"],
+                 key=lambda level: abs(level["distance_pct"]))[:3])
 
     opts = {
         "chart_type": chart_type,
@@ -588,6 +605,105 @@ with tab_chart:
     if lv_list:
         st.subheader("🧱 サポート / レジスタンス(表示期間ベース)")
 
+        st.markdown("#### 🤖 moomooデータによるAI再評価")
+        st.caption(
+            "OHLCVで算出した基礎レベルに、moomoo OpenAPIの板・歩み値・"
+            "当日資金フローを重ねて更新案を作ります。moomooアプリ内AIの"
+            "非公開チャットAPIではなく、根拠を確認できる読み取り専用の再評価です。")
+        moomoo_state = data_fetcher.moomoo_status()
+        if review_is_applied:
+            st.success(
+                f"再評価を適用中: {applied_review.get('summary', '—')} "
+                f"({applied_review.get('reviewed_at', '時刻不明')})",
+                icon="✅",
+            )
+            if st.button("基礎レベルに戻す", key=f"reset_level_review_{review_context}"):
+                st.session_state.pop("moomoo_level_review_applied", None)
+                st.rerun()
+
+        if st.button(
+            "moomooデータで再評価",
+            key=f"run_level_review_{review_context}",
+            type="primary" if not review_is_applied else "secondary",
+            disabled=not moomoo_state.get("available", False),
+            help="OpenDから板・歩み値・資金フローを取得して更新候補を作ります",
+        ):
+            warnings = []
+            book = pd.DataFrame()
+            ticks = pd.DataFrame()
+            capital = None
+            with st.spinner("moomooの需給データを確認しています..."):
+                try:
+                    book = data_fetcher.fetch_order_book(ticker, 10)
+                except data_fetcher.FetchError as exc:
+                    warnings.append(f"板情報: {exc}")
+                try:
+                    ticks = data_fetcher.fetch_recent_ticks(ticker, 60)
+                except data_fetcher.FetchError as exc:
+                    warnings.append(f"歩み値: {exc}")
+                try:
+                    capital = data_fetcher.fetch_capital_distribution(ticker)
+                except data_fetcher.FetchError as exc:
+                    warnings.append(f"資金フロー: {exc}")
+                proposal = level_review.review_levels(
+                    chart_view, base_lv_list, order_book=book,
+                    capital=capital, ticks=ticks,
+                )
+            proposal.update({"context": review_context, "warnings": warnings})
+            if proposal.get("sources"):
+                st.session_state["moomoo_level_review_preview"] = proposal
+            else:
+                st.session_state.pop("moomoo_level_review_preview", None)
+                st.warning("再評価に使える板・歩み値・資金フローを取得できませんでした。"
+                           "OpenDのログイン状態と相場権限を確認してください。")
+
+        if not moomoo_state.get("available", False):
+            st.info(f"再評価を使うにはOpenDを起動してログインしてください。"
+                    f"現在: {moomoo_state.get('message', '接続できません')}")
+
+        preview = st.session_state.get("moomoo_level_review_preview")
+        if preview and preview.get("context") == review_context:
+            st.info(f"更新案: {preview['summary']} / 使用データ: "
+                    f"{', '.join(preview['sources'])}", icon="💡")
+            metrics = preview.get("metrics", {})
+            m1, m2, m3 = st.columns(3)
+            m1.metric("板の買い優勢度",
+                      f"{metrics.get('book_imbalance', 0):+.0%}", border=True,
+                      help="買い板数量−売り板数量を合計板数量で割った値")
+            m2.metric("直近約定の買い優勢度",
+                      f"{metrics.get('tick_imbalance', 0):+.0%}", border=True)
+            m3.metric("当日資金純流入",
+                      f"{metrics.get('capital_net', 0):+,.0f}", border=True)
+
+            proposal_table = pd.DataFrame([{
+                "種別": level["type"],
+                "価格": level["price"],
+                "基礎★": ("—" if level.get("base_strength", 0) == 0 else
+                          "★" * level.get("base_strength", 1)),
+                "再評価★": "★" * level["strength"],
+                "スコア": level.get("moomoo_score"),
+                "信頼度": level.get("moomoo_confidence", "低"),
+                "根拠": level.get("moomoo_reason", "—"),
+            } for level in preview["levels"]])
+            st.dataframe(
+                proposal_table.style.format({"価格": "${:,.2f}", "スコア": "{:.0f}"}),
+                hide_index=True,
+            )
+            for warning in preview.get("warnings", []):
+                st.caption(f"一部データ未取得: {warning}")
+            apply_col, dismiss_col, _ = st.columns([1, 1, 3])
+            if apply_col.button("更新案を適用", type="primary",
+                                key=f"apply_level_review_{review_context}"):
+                st.session_state["moomoo_level_review_applied"] = preview
+                st.session_state.pop("moomoo_level_review_preview", None)
+                st.rerun()
+            if dismiss_col.button("却下", key=f"dismiss_level_review_{review_context}"):
+                st.session_state.pop("moomoo_level_review_preview", None)
+                st.rerun()
+
+        st.caption("再評価★はライブ需給を加えた表示用評価です。基礎★の"
+                   "ウォークフォワード検証結果とは別物で、板候補は時間とともに変化します。")
+
         for kind, msg in levels.level_alerts(
                 lv_list, float(chart_view["Close"].iloc[-1])):
             (st.warning if kind == "testing" else st.info)(msg)
@@ -616,8 +732,16 @@ with tab_chart:
             "反発実績": _rate_str(lv),
             "ヒゲ拒絶": lv.get("rejects", 0),
             "強さ": "★" * lv["strength"],
-            "根拠": lv["basis"] + (" / " + "・".join(lv["confluence"])
-                                   if lv["confluence"] else ""),
+            "基礎★": ("—" if lv.get("base_strength", lv["strength"]) == 0 else
+                      "★" * lv.get("base_strength", lv["strength"])),
+            "再評価": (f"{lv.get('moomoo_score', 0):.0f}点・"
+                      f"信頼度{lv.get('moomoo_confidence', '—')}"
+                      if lv.get("moomoo_reviewed") else "—"),
+            "根拠": (lv["basis"]
+                    + (" / " + "・".join(lv["confluence"])
+                       if lv["confluence"] else "")
+                    + (" / moomoo: " + lv.get("moomoo_reason", "")
+                       if lv.get("moomoo_reviewed") else "")),
         } for lv in lv_list])
         styled_lv = lv_table.style.format(
             {"価格": "${:,.2f}", "現在比": "{:+.1f}%"}
@@ -627,6 +751,7 @@ with tab_chart:
         st.caption("反発実績=接近時に反転した回数/接近回数。ヒゲ拒絶=実体では入らず"
                    "ヒゲだけが刺さって押し戻された回数(反発の強い証拠)。"
                    "「日足合流」等は上位足でも同じレベルが確認できたもの。"
+                   "適用中の強さは再評価★、基礎★は履歴データだけの評価です。"
                    "期間を切り替えると再計算されます。")
 
         with st.expander("ℹ️ 「強さ★」の意味と、検証でわかった限界"):
