@@ -5,8 +5,8 @@ import html
 import pandas as pd
 import streamlit as st
 
-from lib import (charts, data_fetcher, indicators, level_review, levels, moomoo_client,
-                 news_fetcher, sensitivity, settings_store, ui)
+from lib import (charts, data_fetcher, derivatives_context, indicators, level_review,
+                 levels, moomoo_client, news_fetcher, sensitivity, settings_store, ui)
 
 # 表示ラベル → (取得期間, 表示日数)。SMA200を期間の先頭から描くため長めに取得する。
 PERIODS = {
@@ -88,6 +88,14 @@ def fmt_market_cap(value):
     if value >= 1e12:
         return f"{value / 1e12:,.2f}兆ドル"
     return f"{value / 1e8:,.0f}億ドル"
+
+
+def fmt_utc_time(value) -> str:
+    """API時刻をJSTで表示し、欠損をNaTのまま画面へ出さない。"""
+    stamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(stamp):
+        return "—"
+    return stamp.tz_convert("Asia/Tokyo").strftime("%Y-%m-%d %H:%M JST")
 
 
 st.title("📈 銘柄分析")
@@ -211,8 +219,10 @@ else:
     st.caption("データ源: Yahoo Finance"
                + (f"(moomooフォールバック: {reason})" if reason else ""))
 
-tab_chart, tab_news, tab_tape, tab_flow = st.tabs(
-    ["📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値", "🏦 需給・IV"])
+tab_chart, tab_news, tab_tape, tab_flow, tab_derivatives = st.tabs([
+    "📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値",
+    "🏦 需給・IV", "🌐 先物・PERP",
+])
 
 # ---------------------------------------------------------------- タブ1
 with tab_chart:
@@ -1131,3 +1141,291 @@ with tab_flow:
                 st.caption("IVが高いほどオプション市場が今後の大きな値動きを"
                            "見込んでいることを示します。HVを大きく上回るときは"
                            "決算などのイベントが控えている場合があります。")
+
+
+# ---------------------------------------------------------------- タブ5
+with tab_derivatives:
+    st.caption(
+        "関連市場の値動きを独立したコンテキストとして表示します。"
+        "このタブのデータは売買判定の点数・アラート・注文には使用しません。")
+
+    product = st.pills(
+        "表示する商品", ["先物", "PERP"], default="先物",
+        key=f"derivatives_product_{ticker}",
+    ) or "先物"
+    result_store = st.session_state.setdefault("derivatives_context_results", {})
+
+    def remember_result(key, value):
+        result_store[key] = value
+        # 長時間に多数の組合せを試してもDataFrameを無制限に保持しない。
+        while len(result_store) > 20:
+            result_store.pop(next(iter(result_store)))
+
+    def fresh_result(key, ttl_seconds):
+        result = result_store.get(key)
+        if not result:
+            return None
+        fetched_at = pd.to_datetime(
+            (result.get("meta") or {}).get("fetched_at"), utc=True, errors="coerce")
+        if pd.isna(fetched_at):
+            result_store.pop(key, None)
+            return None
+        age = (pd.Timestamp.now(tz="UTC") - fetched_at).total_seconds()
+        if age < -30 or age > ttl_seconds:
+            result_store.pop(key, None)
+            return None
+        return result
+
+    if product == "先物":
+        defaults = list(derivatives_context.suggested_future_symbols(
+            info.get("sector", ""), info.get("industry", ""), ticker))
+        catalog = derivatives_context.FUTURES_CATALOG
+        period_options = {"1ヶ月": "1mo", "3ヶ月": "3mo", "6ヶ月": "6mo"}
+        c_symbols, c_period, c_load = st.columns([3.4, 1.2, 1.1])
+        with c_symbols:
+            selected_futures = st.multiselect(
+                "関連先物（最大3本）", list(catalog), default=defaults,
+                max_selections=3,
+                format_func=lambda symbol: (
+                    f"{symbol}  {catalog[symbol].get('name', symbol)}"),
+                key=f"future_symbols_{ticker}",
+            )
+        with c_period:
+            future_period_label = st.selectbox(
+                "比較期間", list(period_options), index=1,
+                key=f"future_period_{ticker}")
+        future_period = period_options[future_period_label]
+        future_key = (ticker, "futures", tuple(selected_futures), future_period)
+        with c_load:
+            st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+            future_load = st.button(
+                "読み込む / 更新",
+                type="primary", disabled=not selected_futures,
+                key=f"load_futures_{ticker}")
+
+        if future_load:
+            if future_key in result_store:
+                clear = getattr(derivatives_context.fetch_yahoo_futures, "clear", None)
+                if clear:
+                    clear(tuple(selected_futures), period=future_period)
+            with st.spinner("関連先物を取得しています…"):
+                try:
+                    future_summary, future_normalized, future_meta = (
+                        derivatives_context.fetch_yahoo_futures(
+                            tuple(selected_futures), period=future_period))
+                except Exception as exc:
+                    future_summary = pd.DataFrame(
+                        columns=derivatives_context.FUTURES_SUMMARY_COLUMNS)
+                    future_normalized = pd.DataFrame()
+                    future_meta = {
+                        "status": "unavailable",
+                        "errors": {"取得処理": str(exc)},
+                        "fetched_at": pd.Timestamp.now(tz="UTC"),
+                    }
+            remember_result(future_key, {
+                "summary": future_summary,
+                "normalized": future_normalized,
+                "meta": future_meta,
+            })
+
+        future_result = fresh_result(future_key, 300)
+        if future_result is None:
+            st.info("先物を選び「読み込む / 更新」を押してください。"
+                    "この操作はmoomooの過去K線利用枠を消費しません。")
+        else:
+            future_summary = future_result["summary"]
+            future_normalized = future_result["normalized"]
+            future_meta = future_result.get("meta") or {}
+            if future_summary.empty:
+                st.warning("選択した先物を取得できませんでした。"
+                           "時間をおいて再読み込みしてください。")
+                for failed_symbol, reason in future_meta.get("errors", {}).items():
+                    st.caption(f"{failed_symbol}: {reason}")
+            else:
+                metric_columns = st.columns(min(3, len(future_summary)))
+                for column, (_, row) in zip(metric_columns, future_summary.iterrows()):
+                    daily = row.get("change_1d_pct")
+                    delta = (f"{daily:+.2f}%（前営業日比）"
+                             if pd.notna(daily) else None)
+                    price_date = (pd.Timestamp(row["as_of"]).date().isoformat()
+                                  if pd.notna(row.get("as_of")) else "—")
+                    digits = int(catalog.get(row.get("symbol"), {}).get("digits", 2))
+                    column.metric(
+                        f"{row.get('symbol')}  {row.get('name')}",
+                        f"{fmt(row.get('price'), digits=digits)} {row.get('unit', '')}",
+                        delta, border=True)
+                    column.caption(
+                        f"{row.get('relation', '市場コンテキスト')}｜"
+                        f"価格日 {price_date}")
+
+                compare_frame = future_normalized.copy()
+                compare_frame.index = (
+                    pd.to_datetime(compare_frame.index).tz_localize(None).normalize())
+                stock_for_compare = hist["Close"].copy()
+                stock_for_compare.index = (
+                    pd.to_datetime(stock_for_compare.index).tz_localize(None).normalize())
+                compare_frame[ticker] = stock_for_compare
+                compare_frame = compare_frame.dropna(
+                    subset=[ticker, *future_normalized.columns])
+                series_map = {ticker: compare_frame[ticker]}
+                for symbol in future_normalized.columns:
+                    series_map[symbol] = compare_frame[symbol]
+                if not compare_frame.empty and len(series_map) > 1:
+                    st.plotly_chart(
+                        charts.comparison_chart(series_map),
+                        config={"displaylogo": False, "responsive": True})
+
+                stock_series = hist["Close"].copy()
+                stock_series.index = pd.to_datetime(stock_series.index).tz_localize(None).normalize()
+                relation_rows = []
+                for symbol in future_normalized.columns:
+                    future_series = future_normalized[symbol].copy()
+                    future_series.index = (
+                        pd.to_datetime(future_series.index).tz_localize(None).normalize())
+                    aligned = pd.concat(
+                        [stock_series.rename("stock"), future_series.rename("future")],
+                        axis=1, join="inner").dropna().pct_change(fill_method=None).dropna()
+                    corr_20 = aligned.tail(20).corr().iloc[0, 1] if len(aligned) >= 20 else None
+                    corr_60 = aligned.tail(60).corr().iloc[0, 1] if len(aligned) >= 60 else None
+                    variance = aligned.tail(60)["future"].var() if len(aligned) >= 60 else None
+                    beta = (aligned.tail(60).cov().loc["stock", "future"] / variance
+                            if variance is not None and pd.notna(variance) and variance > 0
+                            else None)
+                    relation_rows.append({
+                        "先物": symbol,
+                        "20日相関": corr_20,
+                        "60日相関": corr_60,
+                        "60日β": beta,
+                        "共通日数": len(aligned),
+                        "相関符号": (
+                            "不足" if corr_20 is None or corr_60 is None
+                            or pd.isna(corr_20) or pd.isna(corr_60)
+                            else "一致" if corr_20 * corr_60 > 0 else "不一致"),
+                    })
+                if relation_rows:
+                    with st.expander(f"{ticker}との実測関連性"):
+                        relation_table = pd.DataFrame(relation_rows)
+                        st.dataframe(
+                            relation_table.style.format({
+                                "20日相関": lambda value: "—" if pd.isna(value) else f"{value:+.2f}",
+                                "60日相関": lambda value: "—" if pd.isna(value) else f"{value:+.2f}",
+                                "60日β": lambda value: "—" if pd.isna(value) else f"{value:+.2f}",
+                            }), hide_index=True)
+                        st.caption("日次リターンの同時点比較です。相関・βは変化し、"
+                                   "因果関係や将来の方向を示しません。")
+
+                display_table = future_summary.rename(columns={
+                    "symbol": "コード", "name": "名称", "category": "分類",
+                    "price": "価格", "unit": "単位", "change_1d_pct": "1日%",
+                    "change_5d_pct": "5日%", "change_1m_pct": "1ヶ月%",
+                    "as_of": "価格日", "source": "データ源", "relation": "関連理由",
+                })
+                display_table["価格日"] = pd.to_datetime(
+                    display_table["価格日"], utc=True, errors="coerce").dt.date
+                st.dataframe(display_table, hide_index=True)
+                for failed_symbol, reason in future_meta.get("errors", {}).items():
+                    st.warning(f"{failed_symbol}: {reason}")
+                st.caption(
+                    "先物はYahoo Financeの検証済み連続先物コードです。実限月ではなく、"
+                    "ロール時に価格差の影響を受ける場合があります。遅延データであり、"
+                    "moomooの履歴K線利用枠は使いません。"
+                    f"取得状態: {future_meta.get('status', '—')}")
+
+    else:
+        assets = list(derivatives_context.PERP_ASSETS)
+        related_assets = derivatives_context.related_perp_assets(ticker)
+        direct_relation = bool(related_assets)
+        default_candidates = related_assets or ("BTC", "ETH")
+        default_assets = [asset for asset in default_candidates if asset in assets]
+        c_assets, c_load = st.columns([4.6, 1.1])
+        with c_assets:
+            selected_assets = st.multiselect(
+                "PERP（OKX・USDT建て）", assets, default=default_assets,
+                max_selections=3, key=f"perp_assets_{ticker}")
+        perp_key = (ticker, "perp", tuple(selected_assets), "snapshot")
+        with c_load:
+            st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+            perp_load = st.button(
+                "読み込む / 更新",
+                type="primary", disabled=not selected_assets,
+                key=f"load_perp_{ticker}")
+
+        if direct_relation:
+            st.info(f"{ticker}は暗号資産関連株のホワイトリスト対象です。"
+                    "それでもPERPは株式そのものの先物ではありません。")
+        else:
+            st.info(f"{ticker}との直接対応は設定していません。"
+                    "暗号資産市場全体のリスク選好をみる参考欄です。")
+        st.warning("表示するPERPは、この株式の先物・直接ヘッジ・株価連動商品では"
+                   "ありません。相関や因果関係を示すものでもありません。")
+
+        if perp_load:
+            if perp_key in result_store:
+                clear = getattr(derivatives_context.fetch_okx_perpetuals, "clear", None)
+                if clear:
+                    clear(tuple(selected_assets))
+            with st.spinner("PERPの公開市場データを取得しています…"):
+                try:
+                    perp_frame, perp_meta = derivatives_context.fetch_okx_perpetuals(
+                        tuple(selected_assets))
+                except Exception as exc:
+                    perp_frame = pd.DataFrame(columns=derivatives_context.PERP_COLUMNS)
+                    perp_meta = {
+                        "status": "unavailable",
+                        "errors": {"取得処理": str(exc)},
+                        "fetched_at": pd.Timestamp.now(tz="UTC"),
+                    }
+            remember_result(perp_key, {"frame": perp_frame, "meta": perp_meta})
+
+        perp_result = fresh_result(perp_key, 60)
+        if perp_result is None:
+            st.info("PERPを選び「読み込む / 更新」を押してください。"
+                    "APIキーやログインは不要です。")
+        else:
+            perp_frame = perp_result["frame"]
+            perp_meta = perp_result.get("meta") or {}
+            if perp_frame.empty or perp_meta.get("status") == "unavailable":
+                st.warning("PERP情報を取得できませんでした。"
+                           "OKXの公開API状態を確認し、時間をおいて再読み込みしてください。")
+                for failed_asset, reason in perp_meta.get("errors", {}).items():
+                    st.caption(f"{failed_asset}: {reason}")
+            else:
+                for start in range(0, len(perp_frame), 3):
+                    card_columns = st.columns(min(3, len(perp_frame) - start))
+                    for column, (_, row) in zip(
+                            card_columns, perp_frame.iloc[start:start + 3].iterrows()):
+                        with column.container(border=True):
+                            st.markdown(f"#### {row.get('instrument', row.get('asset', 'PERP'))}")
+                            change_24h = row.get("change_24h_pct")
+                            price_digits = derivatives_context.PERP_PRICE_DIGITS.get(
+                                row.get("asset"), 4)
+                            st.metric(
+                                "Mark価格",
+                                f"{row['mark_price']:,.{price_digits}f} USDT"
+                                if pd.notna(row.get("mark_price")) else "—",
+                                f"{change_24h:+.2f}%（24時間）"
+                                if pd.notna(change_24h) else None)
+                            st.caption(
+                                f"Last {fmt(row.get('last'), digits=price_digits)} USDT / "
+                                f"Funding premium "
+                                f"{fmt(row.get('funding_premium_pct'), '%', 4)}")
+                            st.metric(
+                                f"Funding / {fmt(row.get('funding_interval_hours'), 'h', 0)}",
+                                fmt(row.get("funding_rate_pct"), "%", 4),
+                                f"単純年率 {fmt(row.get('funding_annualized_pct'), '%', 2)}",
+                                delta_color="off")
+                            st.caption(
+                                f"OI {fmt(row.get('open_interest_usd'), ' USD', 0)}｜"
+                                f"24h出来高 {fmt(row.get('volume_base_24h'), '', 0)} "
+                                f"{row.get('asset', '')}\n\n"
+                                f"次回Funding決済 {fmt_utc_time(row.get('funding_time'))}｜"
+                                f"更新 {fmt_utc_time(row.get('as_of'))}")
+                            if row.get("error"):
+                                st.warning(str(row["error"]))
+
+                st.caption(
+                    "データ源: OKX公開・読み取り専用API。Mark価格を主表示し、"
+                    "Funding premiumはFunding計算に使われる参考値です（現在の"
+                    "Mark-Index乖離そのものではありません）。正のFundingは通常ロング側からショート側への"
+                    "支払いを示します。単純年率は現在レートの機械換算で、予測ではありません。"
+                    f"取得状態: {perp_meta.get('status', '—')}")
