@@ -1,7 +1,8 @@
-streamlit>=1.40
+streamlit>=1.41
 yfinance>=0.2.50
 # moomoo OpenAPI。未接続でもyfinanceへ自動フォールバックする
 moomoo-api>=10.4.6408
 pandas>=2.0
 plotly>=5.24
 lxml>=5.0
+requests>=2.31

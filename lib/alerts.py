@@ -30,7 +30,13 @@ KINDS = {
                         "needs_value": True},
     "rule_buy": {"label": "売買ルールが買い判定になる", "unit": "",
                  "needs_value": False},
-    "rule_sell": {"label": "売買ルールが売り判定になる", "unit": "",
+    "rule_take_profit": {"label": "保有ルールが利益確定判定になる", "unit": "",
+                         "needs_value": False},
+    "rule_risk_exit": {"label": "保有ルールがリスク退出判定になる", "unit": "",
+                       "needs_value": False},
+    # 旧保存データとの互換用。SELLを空売り開始とは解釈せず、いずれかの
+    # ロング手仕舞い判定で成立させる。
+    "rule_sell": {"label": "保有ルールが手仕舞い判定になる（旧形式）", "unit": "",
                   "needs_value": False},
 }
 
@@ -84,7 +90,10 @@ def check(alert: dict, ctx: dict) -> dict:
     df = ctx.get("df")
     kind = alert.get("kind")
     value = alert.get("value")
-    price = _price(df)
+    try:
+        price = float(ctx.get("price")) if ctx.get("price") is not None else _price(df)
+    except (TypeError, ValueError):
+        price = _price(df)
 
     def out(trig, actual, reason=""):
         return {"triggered": bool(trig), "actual": actual, "reason": reason}
@@ -96,7 +105,14 @@ def check(alert: dict, ctx: dict) -> dict:
         return out(hit, f"${price:,.2f}")
 
     if kind in ("change_above", "change_below"):
-        chg = _change_pct(df)
+        previous_close = ctx.get("previous_close")
+        try:
+            chg = ((price / float(previous_close) - 1) * 100
+                   if price is not None and float(previous_close) != 0 else None)
+        except (TypeError, ValueError, ZeroDivisionError):
+            chg = None
+        if chg is None:
+            chg = _change_pct(df)
         if chg is None:
             return out(False, "取得できず", "前日比を計算できませんでした")
         hit = chg > value if kind == "change_above" else chg < value
@@ -116,12 +132,22 @@ def check(alert: dict, ctx: dict) -> dict:
             return out(False, "取得できず", f"{side}が検出されていません")
         return out(dist <= value, f"{dist:.2f}%")
 
-    if kind in ("rule_buy", "rule_sell"):
-        verdict = ctx.get("rule_verdict")
+    if kind in ("rule_buy", "rule_take_profit", "rule_risk_exit", "rule_sell"):
+        verdict = (ctx.get("entry_verdict") if kind == "rule_buy"
+                   else ctx.get("holding_verdict"))
+        if verdict is None:  # 旧呼び出し側との互換
+            verdict = ctx.get("rule_verdict")
         if verdict is None:
             return out(False, "未評価", "売買ルールを評価できませんでした")
-        want = "BUY" if kind == "rule_buy" else "SELL"
-        return out(verdict == want, verdict)
+        if kind == "rule_buy":
+            hit = verdict == "BUY"
+        elif kind == "rule_take_profit":
+            hit = verdict == "TAKE_PROFIT"
+        elif kind == "rule_risk_exit":
+            hit = verdict == "RISK_EXIT"
+        else:
+            hit = verdict in {"SELL", "TAKE_PROFIT", "RISK_EXIT"}
+        return out(hit, verdict)
 
     return out(False, "—", f"未知のアラート種別: {kind}")
 

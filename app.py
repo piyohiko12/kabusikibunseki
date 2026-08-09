@@ -9,6 +9,7 @@ st.set_page_config(
 )
 
 pages = [
+    st.Page("views/trade_desk.py", title="今日のトレードデスク", icon="🧭"),
     st.Page("views/stock_analysis.py", title="銘柄分析", icon="📈", default=True),
     st.Page("views/compare.py", title="銘柄比較", icon="⚖️"),
     st.Page("views/market.py", title="市場概況", icon="🌐"),
@@ -50,24 +51,46 @@ with st.sidebar:
                 st.rerun()
 
             chart_hist = st.toggle(
-                "チャート履歴もmoomooから取得する",
+                "過去K線もmoomooを使用（枠保護あり）",
                 value=bool(saved.get("moomoo_chart_history", False)),
-                help="オフ(推奨)ならチャートはYahoo Financeから取得します。"
-                     "オンにすると request_history_kline を使うため、口座資産に応じた"
-                     "「歴史的K線クォータ」を消費します。一度使った銘柄枠は30日間戻りません。")
+                help=("オフ（既定）では過去K線をYahoo Financeから取得します。オンでも、"
+                      "取得済み銘柄・ローカルキャッシュを優先し、新しい銘柄は予約枠を"
+                      "超える場合に限って明示的な単一銘柄表示から取得します。"),
+            )
             if chart_hist != bool(saved.get("moomoo_chart_history", False)):
                 settings_store.save(moomoo_chart_history=chart_hist)
                 data_fetcher.fetch_chart_history.clear()
                 st.rerun()
+
+            reserve = st.number_input(
+                "履歴K線の予約枠",
+                min_value=0,
+                max_value=2000,
+                step=5,
+                value=int(saved.get("moomoo_history_reserve", 10)),
+                help=("過去30日間に未取得の銘柄は、残り枠がこの数以下なら"
+                      "moomooへ取りに行かずYahooへ切り替えます。取得済み銘柄の"
+                      "再利用とローカルキャッシュは枠を追加消費しません。"),
+            )
+            if int(reserve) != int(saved.get("moomoo_history_reserve", 10)):
+                settings_store.save(moomoo_history_reserve=int(reserve))
+                st.rerun()
             if chart_hist:
-                st.caption("⚠️ 銘柄を切り替えるたびにクォータを消費します。")
+                st.caption("取得済み銘柄とキャッシュは追加枠なしで再利用します。"
+                           "未取得銘柄は残り枠が予約枠を超える場合だけ取得します。")
+            else:
+                st.caption("過去K線はYahoo Financeを使い、moomooの履歴枠を消費しません。")
 
             if state["state"] == "ok":
                 st.success(state["message"], icon="🟢")
                 quota = moomoo_client.history_quota()
                 if quota and quota.get("remain") is not None:
                     st.caption(f"履歴K線の残りクォータ: {quota['remain']}"
-                               f"(使用済み {quota.get('used', '—')})")
+                               f"(使用済み {quota.get('used', '—')} / "
+                               f"予約 {int(reserve)})")
+                    if int(quota["remain"]) <= int(reserve):
+                        st.warning("予約枠に達したため、新しい銘柄の過去K線は"
+                                   "Yahoo Financeへ自動切替します。", icon="🛡️")
             else:
                 st.warning(state["message"], icon="⚠️")
                 st.caption("OpenDを起動してログインすると使えます。"
