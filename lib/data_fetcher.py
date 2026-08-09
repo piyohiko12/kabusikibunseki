@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-from lib import moomoo_fetcher
+from lib import moomoo_client, moomoo_fetcher
 
 
 class FetchError(Exception):
@@ -99,24 +99,36 @@ def moomoo_status() -> dict:
     return moomoo_fetcher.connection_status()
 
 
-@st.cache_data(ttl=30, show_spinner=False)
 def fetch_realtime_snapshot(ticker: str) -> dict:
-    """moomooの最新価格。利用できなければフォールバック理由のみ返す。"""
-    try:
-        snapshot = moomoo_fetcher.fetch_snapshot(ticker)
-    except moomoo_fetcher.MoomooError as exc:
-        return {"source": "Yahoo Finance", "fallback_reason": str(exc)}
-    if not snapshot or not snapshot.get("price"):
+    """moomooの最新価格。利用できなければフォールバック理由のみ返す。
+
+    取得はmoomoo_client.snapshotに一本化している(そちらが5秒キャッシュを持つ)。
+    """
+    state = moomoo_client.status()
+    if state["state"] != moomoo_client._State.OK:
+        return {"source": "Yahoo Finance", "fallback_reason": state["message"]}
+    snap = moomoo_client.snapshot((ticker,)).get(ticker)
+    if not snap or not snap.get("price"):
         return {"source": "Yahoo Finance",
                 "fallback_reason": "moomooから最新価格を取得できませんでした"}
-    return snapshot
+    return {**snap, "code": moomoo_client.to_code(ticker) or ticker,
+            "source": "moomoo OpenAPI"}
 
 
 @st.cache_data(ttl=120, show_spinner="チャートデータを取得中...")
 def fetch_chart_history(ticker: str, period: str,
                         interval: str = "1d") -> tuple[pd.DataFrame, dict]:
-    """チャート用OHLCVをmoomoo優先で取得し、取得元メタデータも返す。"""
+    """チャート用OHLCVを取得し、取得元メタデータも返す。
+
+    既定ではYahoo Financeを使う。moomooの履歴K線は口座ごとのクォータを
+    消費するため、設定で明示的にオンにしたときだけ優先する。
+    """
     fallback_reason = None
+    if not moomoo_fetcher.history_enabled():
+        # クォータを消費しないよう、moomooには問い合わせない。
+        return fetch_history(ticker, period, interval), {
+            "source": "Yahoo Finance", "code": ticker, "fallback_reason": None,
+        }
     try:
         moomoo = moomoo_fetcher.fetch_history(ticker, period, interval)
     except moomoo_fetcher.MoomooError as exc:
@@ -150,6 +162,9 @@ def fetch_order_book(ticker: str, num: int = 10) -> pd.DataFrame:
         return moomoo_fetcher.fetch_order_book(ticker, num)
     except moomoo_fetcher.MoomooError as exc:
         raise FetchError(str(exc)) from exc
+
+
+
 @st.cache_data(ttl=900, show_spinner="銘柄情報を取得中...")
 def fetch_info(ticker: str) -> dict:
     """企業情報・ファンダメンタル指標を取得する。

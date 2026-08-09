@@ -81,3 +81,87 @@ class AdvancedChartTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubplotIsolationTests(unittest.TestCase):
+    """サブチャートが価格パネルに侵食されないことを確認する。"""
+
+    def setUp(self):
+        self.prices = indicators.add_indicators(sample_prices())
+
+    def test_rangeslider_is_off_on_every_row_by_default(self):
+        # ローソク足はrangesliderの既定がTrueで、消さないと1行目のスライダーが
+        # 出来高パネルの位置に価格チャートの縮小版を描いてしまう。
+        figure = charts.price_chart(self.prices, "TEST", {
+            "oscillators": ["出来高", "RSI", "MACD"], "range_slider": False,
+        })
+        for name in ("xaxis", "xaxis2", "xaxis3", "xaxis4"):
+            self.assertFalse(bool(figure.layout[name].rangeslider.visible), name)
+
+    def test_rangeslider_only_on_bottom_row_when_enabled(self):
+        figure = charts.price_chart(self.prices, "TEST", {
+            "oscillators": ["出来高", "RSI"], "range_slider": True,
+        })
+        self.assertFalse(bool(figure.layout.xaxis.rangeslider.visible))
+        self.assertFalse(bool(figure.layout.xaxis2.rangeslider.visible))
+        self.assertTrue(bool(figure.layout.xaxis3.rangeslider.visible))
+
+    def test_volume_profile_does_not_hijack_a_subplot_axis(self):
+        # 重ね描き用の軸がサブプロットの軸(x2, x3...)と衝突すると、
+        # その行のトレースが別の座標系に飛んでしまう。
+        for oscillators in ([], ["出来高"], ["出来高", "RSI", "MACD"]):
+            with self.subTest(oscillators=oscillators):
+                figure = charts.price_chart(self.prices, "TEST", {
+                    "overlays": ["出来高プロファイル"], "oscillators": oscillators,
+                })
+                rows = 1 + len(oscillators)
+                for i in range(1, rows + 1):
+                    name = "xaxis" if i == 1 else f"xaxis{i}"
+                    self.assertIsNone(figure.layout[name].overlaying, name)
+                overlay = figure.layout[f"xaxis{rows + 1}"]
+                self.assertEqual(overlay.overlaying, "x")
+                self.assertEqual(overlay.anchor, "y")
+                profile = [t for t in figure.data if t.name == "出来高プロファイル"]
+                self.assertEqual(len(profile), 1)
+                self.assertEqual(profile[0].xaxis, f"x{rows + 1}")
+                self.assertEqual(profile[0].yaxis, "y")
+
+    def test_volume_traces_stay_on_their_own_row(self):
+        figure = charts.price_chart(self.prices, "TEST", {
+            "overlays": ["移動平均線(SMA)", "出来高プロファイル"],
+            "oscillators": ["出来高", "RSI"],
+        })
+        volume = [t for t in figure.data if t.name in ("出来高", "出来高MA20")]
+        self.assertEqual(len(volume), 2)
+        for trace in volume:
+            self.assertEqual((trace.xaxis, trace.yaxis), ("x2", "y2"))
+        price = [t for t in figure.data if t.type == "candlestick"]
+        self.assertEqual(len(price), 1)
+        self.assertIn(price[0].xaxis, (None, "x"))
+        self.assertIn(price[0].yaxis, (None, "y"))
+
+
+class VolumeMovingAverageTests(unittest.TestCase):
+    """VOL_MA20はチャートの期間設定に左右されない固定の20日平均。"""
+
+    def test_vol_ma20_is_always_the_20_period_mean(self):
+        prices = sample_prices()
+        expected = prices["Volume"].rolling(20).mean()
+        for volume_ma in (5, 20, 60):
+            with self.subTest(volume_ma=volume_ma):
+                result = indicators.add_indicators(prices, {"volume_ma": volume_ma})
+                self.assertIn("VOL_MA20", result.columns)
+                self.assertIn("VOL_MA", result.columns)
+                pd.testing.assert_series_equal(
+                    result["VOL_MA20"], expected, check_names=False)
+                pd.testing.assert_series_equal(
+                    result["VOL_MA"],
+                    prices["Volume"].rolling(volume_ma).mean(), check_names=False)
+
+    def test_consumers_fall_back_to_vol_ma(self):
+        from lib import levels, rules
+        result = indicators.add_indicators(sample_prices(), {"volume_ma": 10})
+        without = result.drop(columns=["VOL_MA20"])
+        self.assertIsNotNone(rules.METRICS["vol_ratio"]["fn"]({"df": without}))
+        self.assertEqual(len(levels.find_levels(without)),
+                         len(levels.find_levels(result)))
