@@ -5,8 +5,10 @@ import html
 import pandas as pd
 import streamlit as st
 
-from lib import (charts, data_fetcher, derivatives_context, indicators, level_review,
-                 levels, moomoo_client, news_fetcher, sensitivity, settings_store, ui)
+from lib import (charts, daily_decision, data_fetcher, derivatives_context,
+                 event_intelligence, indicators, level_review, levels,
+                 moomoo_client, news_fetcher, sensitivity, session_intelligence,
+                 settings_store, today_inputs, ui)
 
 # 表示ラベル → (取得期間, 表示日数)。SMA200を期間の先頭から描くため長めに取得する。
 PERIODS = {
@@ -96,6 +98,65 @@ def fmt_utc_time(value) -> str:
     if pd.isna(stamp):
         return "—"
     return stamp.tz_convert("Asia/Tokyo").strftime("%Y-%m-%d %H:%M JST")
+
+
+def fmt_et_jst(value) -> str:
+    """セッション時刻をET/JSTの両方で表示する。"""
+    stamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(stamp):
+        return "—"
+    et = stamp.tz_convert("America/New_York")
+    jst = stamp.tz_convert("Asia/Tokyo")
+    return f"{et:%m/%d %H:%M ET} / {jst:%m/%d %H:%M JST}"
+
+
+def fetch_opening_market_features() -> dict:
+    """寄付き診断用の市場特徴を履歴K線枠なしで取得する。
+
+    SPY/QQQはmoomooの読み取り専用snapshotを優先する。先物と不足分は
+    Yahoo Financeの5分足（遅延あり）を使い、最初の足からの変化として明示する。
+    """
+    result = {}
+    try:
+        live = moomoo_client.snapshot(("SPY", "QQQ"))
+    except Exception:
+        live = {}
+    for ticker_key, feature_key in (("SPY", "spy_pct"), ("QQQ", "qqq_pct")):
+        row = live.get(ticker_key) or {}
+        value = row.get("change_percent")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and pd.notna(value):
+            result[feature_key] = {
+                "value": value, "timestamp": row.get("update_time"),
+                "source": "moomoo OpenAPI snapshot（前日終値比）", "quality": 1.0,
+            }
+
+    try:
+        intraday = data_fetcher.fetch_intraday_batch(
+            ("ES=F", "SPY", "QQQ"), period="1d", interval="5m")
+    except data_fetcher.FetchError:
+        intraday = {}
+    for ticker_key, feature_key in (
+        ("ES=F", "futures_pct"), ("SPY", "spy_pct"), ("QQQ", "qqq_pct"),
+    ):
+        if feature_key in result:
+            continue
+        frame = intraday.get(ticker_key)
+        if frame is None or frame.empty or "Close" not in frame:
+            continue
+        close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+        if len(close) < 2 or float(close.iloc[0]) <= 0:
+            continue
+        result[feature_key] = {
+            "value": (float(close.iloc[-1]) / float(close.iloc[0]) - 1) * 100,
+            "timestamp": close.index[-1],
+            "source": "Yahoo Finance 5分足（当日最初の足比・遅延あり）",
+            "quality": 0.65,
+        }
+    return result
 
 
 st.title("📈 銘柄分析")
@@ -219,12 +280,229 @@ else:
     st.caption("データ源: Yahoo Finance"
                + (f"(moomooフォールバック: {reason})" if reason else ""))
 
-tab_chart, tab_news, tab_tape, tab_flow, tab_derivatives = st.tabs([
-    "📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値",
-    "🏦 需給・IV", "🌐 先物・PERP",
+tab_today, tab_chart, tab_news, tab_tape, tab_flow, tab_derivatives = st.tabs([
+    "🧭 今日の判断", "📊 チャート・指標", "📰 ニュース・ネットの反応",
+    "🔬 板・歩み値", "🏦 需給・IV", "🌐 先物・PERP",
 ])
 
-# ---------------------------------------------------------------- タブ1
+# ---------------------------------------------------------------- 今日の判断
+with tab_today:
+    st.caption("現在セッション → 当日の方向 → 支持抵抗 → 次回寄付き → イベントの順に"
+               "確認します。ここでの数値は説明可能な参考診断で、注文や利益を保証しません。")
+
+    eligibility = today_inputs.overnight_eligibility(snapshot)
+    market_state = data_fetcher.fetch_market_state(ticker)
+    session_state = session_intelligence.detect_current_session(
+        market_state=market_state.get("market_state"),
+        overnight_eligible=eligibility,
+    )
+    session_rows = today_inputs.session_prices(snapshot, hist.iloc[-1])
+    session_changes = session_intelligence.compute_session_changes(
+        session_rows, previous_close=prev)
+    session_labels = {
+        "premarket": "プレ", "regular": "立会", "afterhours": "アフター",
+        "overnight": "夜間・24h",
+    }
+    session_names = {
+        "premarket": "プレマーケット", "regular": "立会時間",
+        "afterhours": "アフターマーケット", "overnight": "夜間・24時間帯",
+        "closed": "セッション外・休場", "unknown": "取引可否を確認",
+    }
+
+    current = session_state["session"]
+    session_color = ("green" if current == "regular" else
+                     "blue" if current in {"premarket", "afterhours", "overnight"}
+                     else "orange")
+    st.markdown(
+        ui.chip(f"現在: {session_names.get(current, current)}", session_color)
+        + " " + ui.chip(
+            session_state["as_of"].strftime("%m/%d %H:%M ET"), "gray"),
+        unsafe_allow_html=True,
+    )
+
+    session_cols = st.columns(4)
+    for column, key in zip(session_cols,
+                           ("premarket", "regular", "afterhours", "overnight")):
+        row = session_changes["sessions"][key]
+        price = row.get("price")
+        change_vs_close = row.get("change_vs_previous_close_pct")
+        value = "—" if price is None else f"${price:,.2f}"
+        delta = ("データなし" if change_vs_close is None
+                 else f"前日終値比 {change_vs_close:+.2f}%")
+        column.metric(
+            session_labels[key] + (" ●" if session_state.get("calendar_session") == key else ""),
+            value, delta, delta_color="off", border=True)
+        if row.get("source"):
+            column.caption(str(row["source"]))
+    if snapshot.get("source") != "moomoo OpenAPI":
+        st.info("moomoo snapshotを取得できないため、確定日足だけを立会欄に表示しています。"
+                "欠損したプレ・アフター・夜間価格を終値で推測していません。")
+    elif eligibility is None:
+        st.caption("夜間値がないだけでは24時間取引の対象外と断定しません。"
+                   "対象可否はmoomooの銘柄詳細でも確認してください。")
+
+    st.markdown("#### 当日の方向と重要価格帯")
+    trend = daily_decision.intraday_trend(snapshot, hist.iloc[-1])
+    level_frame = with_ind.tail(252)
+    today_levels = levels.find_levels(level_frame)
+    nearby = daily_decision.nearest_levels(today_levels, price_now, min_strength=3)
+    support, resistance = nearby["support"], nearby["resistance"]
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("当日の方向", trend["label"],
+              ("強さ —" if trend["strength"] is None
+               else f"観測一致度 {trend['strength']:.0f}%"),
+              delta_color="off", border=True)
+    t2.metric("最寄り支持帯（★3以上）",
+              "—" if support is None else f"${support['edge_price']:,.2f}",
+              "データ不足" if support is None else f"現在値から {support['distance_pct']:+.2f}%",
+              delta_color="off", border=True)
+    t3.metric("最寄り抵抗帯（★3以上）",
+              "—" if resistance is None else f"${resistance['edge_price']:,.2f}",
+              "データ不足" if resistance is None else f"現在値から {resistance['distance_pct']:+.2f}%",
+              delta_color="off", border=True)
+    rr = nearby.get("reward_risk")
+    t4.metric("支持帯までの下方余地 : 抵抗帯までの上方余地",
+              "—" if rr is None else f"1 : {rr:.2f}",
+              "両側の強い帯が必要", delta_color="off", border=True)
+
+    check_df = pd.DataFrame([{
+        "観測": row["label"],
+        "方向": {"up": "上向き", "down": "下向き", "flat": "横ばい",
+                "unknown": "未取得"}.get(row["status"], row["status"]),
+        "実測": row["actual"],
+    } for row in trend["checks"]])
+    st.dataframe(check_df, hide_index=True, use_container_width=True)
+    quality_label = ("リアルタイムsnapshot" if trend["data_quality"] == "realtime"
+                     else "直近確定日足" if trend["data_quality"] == "close_only"
+                     else "取得不能")
+    st.caption(f"方向のデータ品質: {quality_label}。支持抵抗は既存の検証済み検出器から"
+               "★3以上だけを抜粋し、反発保証ではなく損益幅の確認に使います。")
+
+    st.markdown("#### 次回寄付き・セッション開始の方向診断")
+    target_labels = {
+        "regular": "次の立会寄付き", "premarket": "次のプレ開始",
+        "afterhours": "次のアフター開始", "overnight": "次の夜間開始",
+    }
+    target_session = st.selectbox(
+        "予想する開始時点", list(target_labels),
+        format_func=lambda key: target_labels[key], key=f"today_target_{ticker}")
+    load_today = st.button(
+        "寄付き・イベント診断を読み込む", type="primary",
+        key=f"load_today_intelligence_{ticker}_{target_session}",
+        help="必要なYahooデータとニュースをこの操作時だけ取得します。moomoo過去K線枠は使いません。",
+    )
+
+    result_store = st.session_state.setdefault("today_intelligence_results", {})
+    result_key = (ticker, target_session)
+    if load_today:
+        try:
+            with st.spinner("市場・寄付き・イベント影響を整理中..."):
+                event_report = event_intelligence.fetch_event_intelligence(
+                    ticker, include_news=True, horizon_days=120)
+                market_features = fetch_opening_market_features()
+                features = today_inputs.opening_features(
+                    hist, snapshot, market_features, event_report)
+                session_report = session_intelligence.analyze_session_intelligence(
+                    market_state=market_state.get("market_state"),
+                    overnight_eligible=eligibility,
+                    session_prices=session_rows,
+                    previous_close=prev,
+                    target_session=target_session,
+                    features=features,
+                )
+            result_store[result_key] = {
+                "loaded_at": pd.Timestamp.now(tz="UTC"),
+                "session": session_report, "events": event_report,
+            }
+            while len(result_store) > 8:
+                result_store.pop(next(iter(result_store)))
+        except Exception as exc:
+            st.warning(f"寄付き・イベント診断を取得できませんでした: {exc}")
+
+    result = result_store.get(result_key)
+    if result:
+        loaded_at = pd.to_datetime(result.get("loaded_at"), utc=True, errors="coerce")
+        if (pd.isna(loaded_at)
+                or pd.Timestamp.now(tz="UTC") - loaded_at > pd.Timedelta(minutes=15)):
+            result_store.pop(result_key, None)
+            result = None
+
+    if result:
+        diagnosis = result["session"]["next_open_diagnosis"]
+        direction_labels = {
+            "up": "上向き", "down": "下向き", "neutral": "方向拮抗",
+            "unknown": "入力不足で判定しない",
+        }
+        up_probability = diagnosis.get("probability_up")
+        down_probability = diagnosis.get("probability_down")
+        quality = diagnosis["data_quality"]
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("参考方向", direction_labels.get(diagnosis["direction"], "—"),
+                  "未校正ヒューリスティック", delta_color="off", border=True)
+        d2.metric("上向き参考確率（未校正）",
+                  "—" if up_probability is None else f"{up_probability * 100:.0f}%",
+                  border=True)
+        d3.metric("下向き参考確率（未校正）",
+                  "—" if down_probability is None else f"{down_probability * 100:.0f}%",
+                  border=True)
+        d4.metric("データ品質", f"{quality['score'] * 100:.0f}%",
+                  f"方向特徴 {quality['directional_feature_count']}件",
+                  delta_color="off", border=True)
+        st.caption("対象開始: " + fmt_et_jst(
+            diagnosis.get("target_open", {}).get("open_time")))
+        if up_probability is None:
+            st.warning(diagnosis["reason"])
+        else:
+            st.info(diagnosis["reason"])
+
+        feature_df = pd.DataFrame([{
+            "特徴": row["label"],
+            "値": "—" if row["value"] is None else f"{row['value']:.3f}",
+            "状態": row["status"], "固定重み": row["weight"],
+            "寄与": row["contribution"], "取得元": row.get("source") or "—",
+        } for row in diagnosis["features"]])
+        with st.expander("参考確率の内訳（固定重み・データ鮮度）"):
+            st.dataframe(feature_df.style.format({
+                "固定重み": "{:.2f}", "寄与": "{:+.3f}",
+            }), hide_index=True, use_container_width=True)
+            st.caption(diagnosis["disclaimer"])
+
+        event_report = result["events"]
+        st.markdown("#### イベントの影響度と上下シナリオ")
+        visible_events = list(event_report.get("events") or [])[:8]
+        if not visible_events:
+            st.info("表示期間内にイベント候補を確認できませんでした。")
+        else:
+            event_df = pd.DataFrame([{
+                "日付": event.get("event_date") or "—",
+                "時刻(ET)": event.get("event_time_et") or "—",
+                "イベント": event["name"], "影響セッション": event["session_label"],
+                "影響度": f"{event['impact_level']} ({event['impact_score']})",
+                "過去方向": event["directional_bias"],
+                "根拠信頼度": f"{event['confidence']}%",
+            } for event in visible_events])
+            st.dataframe(event_df, hide_index=True, use_container_width=True)
+            for event in visible_events[:4]:
+                with st.expander(
+                    f"{event.get('event_date') or '日付不明'} — {event['name']} "
+                    f"({event['impact_level']})"):
+                    scenarios = event["scenarios"]
+                    st.markdown(f"- 上向き: {scenarios['up']}\n"
+                                f"- 下向き: {scenarios['down']}\n"
+                                f"- 両方向: {scenarios['two_sided']}")
+                    if event.get("evidence"):
+                        st.caption("根拠: " + " / ".join(event["evidence"][:3]))
+            st.caption("イベントは不確実性の確認材料で、売買スコアへ自動加点していません。"
+                       "過去方向は将来の上下を保証せず、発表値と市場予想の差を確認してください。")
+        for warning in event_report.get("warnings") or []:
+            st.warning(warning)
+    else:
+        st.info("ボタンを押すと、市場の直近5分足・イベント日程・ニュースを必要時だけ"
+                "読み込みます。データが不足・古い場合は確率を表示しません。")
+
+    st.link_button("🎯 詳細な売買判定・アラートへ", f"/signals?ticker={ticker}")
+
+# ---------------------------------------------------------------- チャート・指標
 with tab_chart:
     _saved_adv = _settings.get("advanced_chart") or {}
     _saved_preset = _saved_adv.get("preset")

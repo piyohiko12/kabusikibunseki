@@ -9,6 +9,7 @@ st.set_page_config(
 )
 
 pages = [
+    st.Page("views/trade_desk.py", title="今日のトレードデスク", icon="🧭"),
     st.Page("views/stock_analysis.py", title="銘柄分析", icon="📈", default=True),
     st.Page("views/compare.py", title="銘柄比較", icon="⚖️"),
     st.Page("views/market.py", title="市場概況", icon="🌐"),

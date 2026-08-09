@@ -371,6 +371,33 @@ class HybridDataTests(unittest.TestCase):
         self.assertEqual(state["source"], "Unavailable")
         self.assertEqual(state["fallback_reason"], "offline")
 
+
+class SessionSnapshotTests(unittest.TestCase):
+    def test_snapshot_exposes_pre_after_and_overnight_fields(self):
+        context = Mock()
+        context.get_market_snapshot.return_value = (0, pd.DataFrame([{
+            "code": "US.AAPL", "name": "Apple", "last_price": 225.0,
+            "prev_close_price": 220.0, "pre_price": 221.5,
+            "pre_high_price": 222.0, "pre_low_price": 219.5,
+            "pre_volume": 1000, "pre_change_rate": 0.68,
+            "after_price": 226.0, "after_high_price": 227.0,
+            "after_low_price": 224.5, "after_volume": 800,
+            "after_change_rate": 0.44, "overnight_price": 224.0,
+            "overnight_high_price": 225.0, "overnight_low_price": 223.0,
+            "overnight_volume": 500, "overnight_change_rate": -0.44,
+            "volume_ratio": 1.3,
+        }]))
+        with patch.object(moomoo_client, "_ctx", return_value=context), \
+                patch.object(moomoo_client, "_ok", return_value=True):
+            result = moomoo_client.snapshot.__wrapped__(("AAPL",))
+
+        row = result["AAPL"]
+        self.assertEqual(row["pre_price"], 221.5)
+        self.assertEqual(row["after_change_percent"], 0.44)
+        self.assertEqual(row["overnight_volume"], 500)
+        self.assertEqual(row["volume_ratio"], 1.3)
+
+
 class ConnectionIsolationTests(unittest.TestCase):
     """OpenDが応答しないときにUIを固まらせないための約束事。"""
 

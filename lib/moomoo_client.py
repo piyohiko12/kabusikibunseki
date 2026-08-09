@@ -252,13 +252,33 @@ def snapshot(tickers: tuple[str, ...]) -> dict[str, dict]:
             "open": row.get("open_price"),
             "high": row.get("high_price"),
             "low": row.get("low_price"),
+            "average_price": row.get("avg_price"),
             "volume": row.get("volume"),
             "turnover": row.get("turnover"),
+            "turnover_rate": row.get("turnover_rate"),
+            "amplitude": row.get("amplitude"),
             "per": row.get("pe_ttm_ratio") or row.get("pe_ratio"),
             "pbr": row.get("pb_ratio"),
             "dividend_yield": row.get("dividend_ratio_ttm"),
             "market_cap": row.get("total_market_val"),
             "eps": row.get("earning_per_share"),
+            # セッション別データもsnapshot 1回から返す。購読も履歴K線枠も不要。
+            "pre_price": row.get("pre_price"),
+            "pre_high": row.get("pre_high_price"),
+            "pre_low": row.get("pre_low_price"),
+            "pre_volume": row.get("pre_volume"),
+            "pre_change_percent": row.get("pre_change_rate"),
+            "after_price": row.get("after_price"),
+            "after_high": row.get("after_high_price"),
+            "after_low": row.get("after_low_price"),
+            "after_volume": row.get("after_volume"),
+            "after_change_percent": row.get("after_change_rate"),
+            "overnight_price": row.get("overnight_price"),
+            "overnight_high": row.get("overnight_high_price"),
+            "overnight_low": row.get("overnight_low_price"),
+            "overnight_volume": row.get("overnight_volume"),
+            "overnight_change_percent": row.get("overnight_change_rate"),
+            "volume_ratio": row.get("volume_ratio"),
             "update_time": row.get("update_time"),
             "suspension": row.get("suspension"),
         }
@@ -433,6 +453,62 @@ def fed_watch() -> pd.DataFrame:
     out = data[cols].copy()
     out["probability"] = pd.to_numeric(out["probability"], errors="coerce")
     return out.dropna(subset=["probability"])
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def economic_calendar(days: int = 7) -> pd.DataFrame:
+    """米国の重要経済イベントを読み取り専用で取得する。
+
+    履歴K線APIではないため月間K線枠を消費しない。SDK/OpenD/権限が未対応なら
+    空DataFrameを返し、他の市場分析を止めない。
+    """
+    ctx = _ctx()
+    if ctx is None or not hasattr(ctx, "get_economic_calendar"):
+        return pd.DataFrame()
+    try:
+        from moomoo import EconomicImportance, Market
+        start = pd.Timestamp.now(tz="America/New_York").date()
+        end = start + pd.Timedelta(days=max(0, min(int(days), 30)))
+        result = ctx.get_economic_calendar(
+            begin_date=start.isoformat(), end_date=end.isoformat(),
+            market_list=[Market.US], importance=EconomicImportance.HIGH, count=100)
+    except Exception:
+        return pd.DataFrame()
+    if not isinstance(result, tuple) or len(result) < 2 or not _ok(result[0]):
+        return pd.DataFrame()
+    data = result[1]
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return pd.DataFrame()
+    columns = [c for c in ["timestamp", "country", "title", "star",
+                           "previous", "consensus", "actual"] if c in data.columns]
+    return data[columns].copy().reset_index(drop=True)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def earnings_calendar(days: int = 7, count: int = 50) -> pd.DataFrame:
+    """直近の米国株決算予定を時価総額順で取得する(読み取り専用)。"""
+    ctx = _ctx()
+    if ctx is None or not hasattr(ctx, "get_earnings_calendar"):
+        return pd.DataFrame()
+    try:
+        from moomoo import EarningsCalendarSortType, Market
+        start = pd.Timestamp.now(tz="America/New_York").date()
+        # OpenAPIは1回につき最大7日幅。
+        end = start + pd.Timedelta(days=max(0, min(int(days), 7)))
+        ret, data = ctx.get_earnings_calendar(
+            market=Market.US, sort_type=EarningsCalendarSortType.MARKET_CAP,
+            begin_date=start.isoformat(), end_date=end.isoformat())
+    except Exception:
+        return pd.DataFrame()
+    if not _ok(ret) or not isinstance(data, pd.DataFrame) or data.empty:
+        return pd.DataFrame()
+    columns = [c for c in ["security", "name", "earnings_date", "pub_type",
+                           "eps_predict", "revenue_predict", "iv", "iv_rank",
+                           "market_cap", "price"] if c in data.columns]
+    out = data[columns].copy().head(max(1, min(int(count), 100)))
+    if "security" in out:
+        out["ticker"] = out["security"].map(_strip_market)
+    return out.reset_index(drop=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
