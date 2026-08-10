@@ -6,9 +6,11 @@ import re
 import pandas as pd
 import streamlit as st
 
-from lib import (alerts as alerts_lib, charts, daily_decision, data_fetcher, derivatives_context,
+from lib import (alerts as alerts_lib, board_ui, charts, daily_decision, data_fetcher,
+                 derivatives_context,
                  event_intelligence, indicators, level_review, levels,
-                 moomoo_client, news_fetcher, sensitivity, session_intelligence,
+                 information_board, moomoo_client, news_fetcher, sensitivity,
+                 session_intelligence,
                  rules as rules_lib, settings_store, today_inputs,
                  trade_summary, trading_context, ui)
 
@@ -417,9 +419,9 @@ else:
     st.caption("データ源: Yahoo Finance"
                + (f"(moomooフォールバック: {reason})" if reason else ""))
 
-tab_today, tab_chart, tab_news, tab_tape, tab_flow, tab_derivatives = st.tabs([
+tab_today, tab_chart, tab_news, tab_board, tab_tape, tab_flow, tab_derivatives = st.tabs([
     "🧭 今日の判断", "📊 チャート・指標", "📰 ニュース・ネットの反応",
-    "🔬 板・歩み値", "🏦 需給・IV", "🌐 先物・PERP",
+    "📋 情報掲示板", "🔬 板・歩み値", "🏦 需給・IV", "🌐 先物・PERP",
 ])
 
 # ----------------------------------------------------------- 売買情報サマリー
@@ -1837,6 +1839,95 @@ with tab_news:
                         unsafe_allow_html=True)
                     body = p["body"]
                     st.write(md_escape(body[:300] + ("…" if len(body) > 300 else "")))
+
+
+# -------------------------------------------------------------- 情報掲示板
+# 既にこのページで取得・計算した値だけを共通形式へ投影する。追加のK線取得は行わない。
+stock_board_alerts = []
+for alert in active_ticker_alerts:
+    try:
+        checked = (alerts_lib.check(alert, alert_context)
+                   if decision_context is not None else
+                   {"triggered": False, "actual": "—",
+                    "reason": "確定日足が不足しています"})
+    except Exception as exc:
+        checked = {"triggered": False, "actual": "—", "reason": str(exc)}
+    stock_board_alerts.append({
+        "alert": alert,
+        "result": {**checked, "checked_at": alert_checked_at},
+    })
+
+# ニュースタブの選択状態に左右されないYahooの一覧を使う。これはキャッシュ済みの
+# 読み取り専用ニュース取得であり、moomooの過去K線枠には触れない。
+try:
+    stock_board_news = (news if news_src == "Yahoo Finance"
+                        else news_fetcher.fetch_news(ticker))
+except Exception:
+    stock_board_news = []
+
+if event_payload is not None:
+    stock_board_events = event_payload
+else:
+    try:
+        stock_board_events = event_intelligence.build_event_intelligence(
+            ticker, hist, info, analyst, [], stock_board_news,
+            fetched_at=pd.Timestamp.now(tz="UTC"), horizon_days=120)
+        stock_board_events["events"] = [
+            event_intelligence.localize_event_for_display(event)
+            for event in stock_board_events.get("events") or []
+        ]
+    except Exception as exc:
+        stock_board_events = {
+            "status": "unavailable", "events": [], "warnings": [str(exc)]}
+
+stock_board_snapshot = dict(snapshot or {})
+if not stock_board_snapshot.get("price"):
+    completed = None if decision_context is None else decision_context["df"]
+    completed_price = (float(completed["Close"].iloc[-1])
+                       if completed is not None and not completed.empty else None)
+    completed_previous = (float(completed["Close"].iloc[-2])
+                          if completed is not None and len(completed) > 1 else None)
+    stock_board_snapshot.update({
+        "price": completed_price,
+        "previous_close": completed_previous,
+        "source": "Yahoo Finance（直近確定日足）",
+        "update_time": (completed.index[-1]
+                        if completed is not None and not completed.empty else None),
+        "is_realtime": False,
+    })
+if (stock_board_snapshot.get("price") is not None
+        and stock_board_snapshot.get("previous_close")):
+    stock_board_snapshot["change_pct"] = (
+        float(stock_board_snapshot["price"])
+        / float(stock_board_snapshot["previous_close"]) - 1
+    ) * 100
+
+stock_board_report = information_board.build_information_board({
+    "ticker": ticker,
+    "as_of": alert_checked_at,
+    "snapshot": stock_board_snapshot,
+    "entry_evaluation": {
+        **entry_evaluation,
+        "evaluated_at": alert_checked_at,
+        "source": f"保存ルール: {active_rule_name}（確定日足）",
+    },
+    "holding_evaluation": {
+        **holding_evaluation,
+        "evaluated_at": alert_checked_at,
+        "source": f"保存ルール: {active_rule_name}（確定日足）",
+    },
+    "levels": summary_levels,
+    "checked_alerts": stock_board_alerts,
+    "alert_checked_at": alert_checked_at,
+    "analyst": analyst,
+    "event_report": stock_board_events,
+    "news": stock_board_news,
+})
+
+with tab_board:
+    board_ui.render_information_board(
+        stock_board_report, show_heading=True,
+        key_prefix=f"stock_board_{ticker}")
 
 
 
