@@ -5,8 +5,8 @@ import html
 import pandas as pd
 import streamlit as st
 
-from lib import (charts, data_fetcher, indicators, levels, moomoo_client,
-                 news_fetcher, sensitivity, settings_store, ui)
+from lib import (charts, data_fetcher, gap, indicators, intraday, levels,
+                 moomoo_client, news_fetcher, sensitivity, settings_store, ui)
 
 # 表示ラベル → (取得期間, 表示日数)。SMA200を期間の先頭から描くため長めに取得する。
 PERIODS = {
@@ -56,6 +56,8 @@ CHART_PRESETS = {
         "overlays": ["指数移動平均線(EMA)", "VWAP(日中)",
                      "ボリンジャーバンド"],
         "oscillators": ["出来高", "MACD"],
+        # デイトレは寄り前・引け後の値動きが判断材料になるので既定でオン
+        "extended_hours": True,
     },
     "スイング": {
         "interval": "日足", "chart_type": "ローソク足",
@@ -211,8 +213,9 @@ else:
     st.caption("データ源: Yahoo Finance"
                + (f"(moomooフォールバック: {reason})" if reason else ""))
 
-tab_chart, tab_news, tab_tape, tab_flow = st.tabs(
-    ["📊 チャート・指標", "📰 ニュース・ネットの反応", "🔬 板・歩み値", "🏦 需給・IV"])
+tab_chart, tab_day, tab_news, tab_tape, tab_flow = st.tabs(
+    ["📊 チャート・指標", "🌅 当日・寄付", "📰 ニュース・ネットの反応",
+     "🔬 板・歩み値", "🏦 需給・IV"])
 
 # ---------------------------------------------------------------- タブ1
 with tab_chart:
@@ -344,6 +347,14 @@ with tab_chart:
                     "期間スライダー", value=bool(_saved_adv.get("range_slider", False)))
                 compact_sessions = st.toggle(
                     "休場時間を詰める", value=bool(_saved_adv.get("compact_sessions", True)))
+                extended_hours = st.toggle(
+                    "時間外も表示(プレ・アフター)",
+                    value=bool(_saved_adv.get("extended_hours",
+                                              preset_cfg.get("extended_hours", False))),
+                    key=f"extended_{chart_preset}",
+                    help="分足のとき、プレマーケット(04:00〜)とアフターマーケット"
+                         "(〜20:00 ET)のローソク足も表示します。"
+                         "時間外は薄い背景色で区別されます。")
                 log_scale = st.toggle(
                     "対数スケール(価格軸)", value=bool(_saved_adv.get("log_scale", False)))
                 _heights = {360: "低い", 430: "標準", 520: "やや高い",
@@ -392,6 +403,7 @@ with tab_chart:
         "events": show_events, "current_price_line": current_price_line,
         "grid": show_grid, "range_selector": range_selector,
         "range_slider": range_slider, "compact_sessions": compact_sessions,
+        "extended_hours": extended_hours,
         "log_scale": log_scale, "height": chart_height,
         "multi_timeframe": multi_timeframe,
         "show_order_book": show_order_book, "benchmarks": benches,
@@ -412,14 +424,17 @@ with tab_chart:
     elif interval != "1d":
         chart_period = "10y" if interval == "1wk" else "max"
 
+    # 時間外のバーが返るのは分足だけ。日足以上では指定しても意味がない。
+    show_extended = bool(extended_hours) and interval in INTRADAY_LIMITS
     try:
         chart_hist, chart_meta = data_fetcher.fetch_chart_history(
-            ticker, chart_period, interval)
+            ticker, chart_period, interval, show_extended)
     except data_fetcher.FetchError:
         chart_hist, chart_meta = pd.DataFrame(), {"source": "取得失敗"}
     if chart_hist.empty:
         st.warning("この足の間隔のデータを取得できなかったため、日足で表示しています。")
         interval = "1d"
+        show_extended = False
         try:
             chart_hist, chart_meta = data_fetcher.fetch_chart_history(
                 ticker, fetch_period, interval)
@@ -478,6 +493,7 @@ with tab_chart:
         "current_price_line": current_price_line,
         "signals": show_signals,
         "compact_sessions": compact_sessions,
+        "extended_hours": show_extended,
         "interaction": interaction,
         "current_price": snapshot.get("price"),
     }
@@ -697,10 +713,27 @@ with tab_chart:
     if not sens_rows:
         st.info("感応度を評価するためのデータが不足しています。")
     else:
-        st.dataframe(pd.DataFrame(sens_rows), hide_index=True)
+        sens_view = pd.DataFrame([{k: v for k, v in row.items()
+                                   if not k.startswith("_")}
+                                  for row in sens_rows])
+        st.dataframe(sens_view, hide_index=True, width="stretch")
         st.caption("決算・FOMCは実際のイベント日直後の変動を平常時(日次変動の中央値)と"
                    "比較した実測値。マクロ要因は過去2年の日次リターンの相関/ベータ。"
-                   "★が多いほどそのイベント・要因に反応しやすい銘柄です。")
+                   "★が多いほど反応しやすく、「方向」は過去に上下どちらへ振れたかの"
+                   "実績です(5回以上かつ65%以上のときだけ方向を出します)。")
+        biased = [r for r in sens_rows
+                  if r.get("_detail", {}).get("event")
+                  and r["_detail"].get("biased")]
+        if biased:
+            lines = []
+            for r in biased:
+                d = r["_detail"]
+                lines.append(f"- **{r['イベント・要因']}**: {d['direction_label']}"
+                             f"・平均 {d['avg_signed']:+.1f}%"
+                             f"(過去{d['n']}回)")
+            st.markdown("**過去に方向の偏りが出ているイベント**\n" + "\n".join(lines))
+            st.caption("⚠️ 過去の偏りであって、次回もそうなるという意味ではありません。"
+                       "回数が少ないほど偶然の偏りが出やすい点にご注意ください。")
 
     st.subheader("業績推移(過去4年)")
     try:
@@ -717,7 +750,198 @@ with tab_chart:
         with col_eps:
             st.plotly_chart(charts.eps_chart(fin))
 
-# ---------------------------------------------------------------- タブ2
+# ------------------------------------------------------- タブ2: 当日・寄付
+with tab_day:
+    TONE_ICON = {"up": "🟢", "down": "🔴", "flat": "⚪"}
+    TONE_CHIP = {"up": "green", "down": "red", "flat": "gray"}
+
+    try:
+        day_hist, _day_meta = data_fetcher.fetch_chart_history(
+            ticker, "5d", "5m", True)
+    except data_fetcher.FetchError:
+        day_hist = pd.DataFrame()
+
+    prev_daily_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
+
+    # ------------------------------------------------------- 当日トレンド
+    st.subheader("⚡ 当日のトレンド")
+    trend = intraday.analyze(day_hist, prev_daily_close) if not day_hist.empty else None
+    if not trend:
+        st.info("当日の分足データを取得できませんでした。"
+                "市場が開いていない時間帯や、分足が提供されない銘柄では表示されません。")
+    else:
+        if trend.get("stale"):
+            st.caption("※ 新しい取引日のバーがまだ少ないため、直前の取引日を表示しています。")
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("当日トレンド",
+                  f"{TONE_ICON[trend['tone']]} {trend['short']}",
+                  f"{trend['score']:+.0f}点", delta_color="off", border=True)
+        t2.metric("寄付からの変化", f"{trend['from_open_pct']:+.2f}%",
+                  f"寄付 ${trend['regular_open']:,.2f}", delta_color="off",
+                  border=True)
+        t3.metric("VWAP", f"${trend['vwap']:,.2f}",
+                  f"乖離 {trend['vwap_dev']:+.2f}%",
+                  delta_color="normal" if trend["vwap_dev"] >= 0 else "inverse",
+                  border=True)
+        t4.metric("当日の高安",
+                  f"${trend['day_low']:,.2f}〜${trend['day_high']:,.2f}",
+                  border=True)
+        st.markdown(f"**{trend['advice']}**")
+
+        st.markdown("**判定の内訳**")
+        st.dataframe(pd.DataFrame([{
+            "観点": p["name"],
+            "点数": f"{p['score']:+.1f} / ±{p['max']}",
+            "実測値": p["value"],
+            "見方": p["note"],
+        } for p in trend["parts"]]), hide_index=True, width="stretch")
+        st.caption("5つの観点を足し合わせた −100〜+100 のスコアです。"
+                   "いま何が起きているかの要約であって、"
+                   "この先の値動きの確率ではありません。")
+
+        orb = trend.get("opening_range")
+        if orb and orb["complete"]:
+            st.markdown(
+                f"**オープニングレンジ(寄り{orb['minutes']}分)**: "
+                f"\\${orb['low']:,.2f} 〜 \\${orb['high']:,.2f}　"
+                + ("🟢 上抜け済み" if orb["broke_up"] and not orb["broke_down"]
+                   else "🔴 下抜け済み" if orb["broke_down"] and not orb["broke_up"]
+                   else "🟡 上下とも抜けた(ダマシに注意)" if orb["broke_up"]
+                   else "⚪ レンジ内"))
+
+        if trend.get("sessions"):
+            st.markdown("**セッション別の値動き**")
+            st.dataframe(pd.DataFrame([{
+                "セッション": s["label"],
+                "始値": f"${s['open']:,.2f}",
+                "終値": f"${s['close']:,.2f}",
+                "高安": f"${s['low']:,.2f}〜${s['high']:,.2f}",
+                "変化率": f"{s['change_pct']:+.2f}%",
+                "出来高": f"{s['volume']:,.0f}",
+                "本数": s["bars"],
+            } for s in trend["sessions"]]), hide_index=True, width="stretch")
+            st.caption("変化率は1つ前のセッションの終値からの変化です"
+                       "(最初のセッションだけ前日の立会終値が基準)。")
+
+    st.divider()
+
+    # ----------------------------------------------------------- 寄付予想
+    st.subheader("🌅 寄付の見通し")
+    gap_daily = hist if not hist.empty else pd.DataFrame()
+    table = gap.gap_table(gap_daily)
+    if table.empty:
+        st.info("ギャップ統計を出すための日足データが足りません。")
+    else:
+        ref = gap.extended_reference(day_hist, prev_daily_close)
+        manual = None
+        cols = st.columns([1.4, 1, 1.6])
+        with cols[0]:
+            if ref:
+                st.markdown(
+                    f"**{ref['label']}の最終値**: \\${ref['price']:,.2f}　"
+                    f"({ref['bars']}本 / 高安 "
+                    f"\\${ref['low']:,.2f}〜\\${ref['high']:,.2f})")
+            else:
+                st.caption("時間外のバーが無いため、想定ギャップを手入力して"
+                           "過去実績を引けます。")
+        with cols[1]:
+            manual = st.number_input(
+                "想定ギャップ(%)",
+                value=float(round(ref["gap_pct"], 2)) if ref and ref["gap_pct"]
+                else 0.0,
+                min_value=-25.0, max_value=25.0, step=0.1, format="%.2f",
+                help="時間外の値から自動入力されます。手で変えて試算もできます。")
+
+        gap_now = float(manual)
+        cond = gap.conditional(table, gap_now)
+        proj = gap.projected_open(prev_daily_close, gap_now, cond)
+        base = gap.baseline_for(gap_now)
+
+        if proj:
+            g1, g2, g3 = st.columns(3)
+            g1.metric("前日終値", f"${proj['prev_close']:,.2f}", border=True)
+            g2.metric("想定の寄付値", f"${proj['open_price']:,.2f}",
+                      f"{gap_now:+.2f}%({proj['gap_amount']:+,.2f})",
+                      delta_color="normal" if gap_now >= 0 else "inverse",
+                      border=True)
+            if "close_low" in proj:
+                g3.metric("過去実績の引け値レンジ",
+                          f"${proj['close_low']:,.2f}〜${proj['close_high']:,.2f}",
+                          f"中央 ${proj['close_typical']:,.2f}",
+                          delta_color="off", border=True)
+            else:
+                g3.metric("過去実績の引け値レンジ", "—", border=True)
+
+        v = gap.verdict(cond, gap_now)
+        if v and cond:
+            # follow/fadeは「ギャップと同じ方向か」なので、上窓か下窓かで
+            # 実際に上を向くかが変わる。色はその向きに合わせる。
+            if v["tone"] == "neutral":
+                v_icon = "⚪"
+            else:
+                v_icon = "🟢" if (v["tone"] == "follow") == (gap_now > 0) else "🔴"
+            st.markdown(f"### {v_icon} {v['headline']}")
+            st.markdown(f"{v['fill_note']}")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("窓埋めした割合", f"{cond['fill_rate']:.0f}%", border=True)
+            m2.metric("ギャップ方向に伸びた", f"{cond['follow_rate']:.0f}%", border=True)
+            m3.metric("寄り後リターンの中央値", f"{cond['otc_median']:+.2f}%",
+                      f"平均 {cond['otc_mean']:+.2f}%", delta_color="off",
+                      border=True)
+            m4.metric("参照した過去の回数", f"{cond['n']}回", border=True)
+
+            if cond.get("widened_to_side"):
+                st.warning("近いギャップ幅の事例が少なかったため、"
+                           "同じ方向のギャップすべてを参照しています。"
+                           "今回の大きさとは条件が違う点にご注意ください。", icon="⚠️")
+            elif cond.get("width"):
+                st.caption(f"※ {gap_now:+.2f}% の ±{cond['width']}% 以内の"
+                           f"過去のギャップ {cond['n']}件を集計しています。")
+
+            if base:
+                st.markdown("**市場平均との比較**")
+                st.dataframe(pd.DataFrame([
+                    {"項目": "窓埋めした割合",
+                     "この銘柄": f"{cond['fill_rate']:.0f}%",
+                     "市場平均": f"{base['fill']:.0f}%"},
+                    {"項目": "ギャップ方向に伸びた",
+                     "この銘柄": f"{cond['follow_rate']:.0f}%",
+                     "市場平均": f"{base['follow']:.0f}%"},
+                    {"項目": "寄り後リターンの平均",
+                     "この銘柄": f"{cond['otc_mean']:+.2f}%",
+                     "市場平均": f"{base['otc']:+.2f}%"},
+                ]), hide_index=True, width="stretch")
+                st.caption(f"市場平均は「{base['label']}」区分の実測値"
+                           f"({base['n']:,}件)。{gap.BASELINE_NOTE}")
+        else:
+            st.info("この銘柄には、今回と近いギャップの過去事例が足りません。")
+
+        with st.expander("この銘柄のギャップ実績(区分ごと)"):
+            buckets = gap.bucket_summary(table)
+            if buckets:
+                st.dataframe(pd.DataFrame([{
+                    "ギャップ区分": b["label"],
+                    "回数": b["n"],
+                    "窓埋め": f"{b['fill_rate']:.0f}%",
+                    "順行": f"{b['follow_rate']:.0f}%",
+                    "逆行(寄り天/寄り底)": f"{b['fade_rate']:.0f}%",
+                    "寄り後の平均": f"{b['otc_mean']:+.2f}%",
+                    "当日レンジ": f"{b['range_mean']:.2f}%",
+                } for b in buckets]), hide_index=True, width="stretch")
+            ov = gap.overall(table)
+            if ov:
+                st.caption(
+                    f"過去{ov['n']}営業日: ギャップの平均絶対値 {ov['mean_abs']:.2f}%・"
+                    f"上窓 {ov['up_rate']:.0f}%・"
+                    f"±0.3%未満(ほぼ窓なし)が {ov['quiet_rate']:.0f}%。"
+                    f"5〜95パーセンタイルは {ov['p05']:+.2f}%〜{ov['p95']:+.2f}%。")
+
+        st.caption("⚠️ ここに出る数字はすべて **過去の頻度** です。"
+                   "「窓埋め60%」は過去にそうなった割合であって、"
+                   "次回60%の確率で埋まるという意味ではありません。"
+                   "決算やニュースがある日は、過去の分布があてになりません。")
+
+# ---------------------------------------------------------------- タブ3
 with tab_news:
     analyst = data_fetcher.fetch_analyst(ticker)
     if analyst["targets"] or analyst["ratings"] or analyst["earnings_date"]:
