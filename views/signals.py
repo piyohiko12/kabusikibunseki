@@ -9,9 +9,8 @@ import math
 import pandas as pd
 import streamlit as st
 
-from lib import (alerts as alerts_lib, data_fetcher, indicators, levels,
-                 rule_backtest, rules as rules_lib, signal_context,
-                 watchlist_store)
+from lib import (alerts as alerts_lib, data_fetcher, rule_backtest,
+                 rules as rules_lib, trading_context, watchlist_store)
 
 
 VERDICT_STYLE = {
@@ -43,13 +42,7 @@ REFRESH_CHOICES = {
     "3分ごと": 180,
     "5分ごと": 300,
 }
-SAFETY_DEFAULTS = {
-    "min_history": 220,
-    "max_stale_business_days": 5,
-    "min_median_dollar_volume": 5_000_000.0,
-    "max_spread_pct": 0.50,
-    "earnings_blackout_days": 2,
-}
+SAFETY_DEFAULTS = trading_context.SAFETY_DEFAULTS
 
 
 def _query_ticker(default: str = "AAPL") -> str:
@@ -75,15 +68,6 @@ def _context(ticker: str, allow_new_quota: bool = True,
         return None
 
     market_meta = data_fetcher.fetch_market_state(ticker)
-    completed, bar_meta = signal_context.completed_daily_bars(
-        history, source_meta.get("code") or ticker,
-        market_meta.get("market_state"))
-    if completed.empty:
-        return None
-
-    frame = indicators.add_indicators(completed)
-    display = indicators.slice_display(frame, 182)
-    found_levels = levels.find_levels(display)
     snapshot = data_fetcher.fetch_realtime_snapshot(ticker)
 
     earnings_date = None
@@ -93,45 +77,21 @@ def _context(ticker: str, allow_new_quota: bool = True,
         except Exception:
             earnings_date = None
 
-    price = snapshot.get("price")
-    previous_close = snapshot.get("previous_close")
-    if price is None:
-        price = float(frame["Close"].iloc[-1])
-    if previous_close is None:
-        previous_close = (float(frame["Close"].iloc[-2])
-                          if len(frame) > 1 else float(price))
-    return {
-        "df": frame,
-        "levels": found_levels,
-        "source_meta": source_meta,
-        "market_meta": market_meta,
-        "bar_meta": bar_meta,
-        "snapshot": snapshot,
-        "earnings_date": earnings_date,
-        "price": float(price),
-        "previous_close": float(previous_close),
-    }
+    return trading_context.prepare_from_history(
+        history,
+        source_meta=source_meta,
+        market_meta=market_meta,
+        snapshot=snapshot,
+        earnings_date=earnings_date,
+    )
 
 
 def _safety(rule: dict) -> dict:
-    saved = rule.get("safety") if isinstance(rule, dict) else None
-    return {**SAFETY_DEFAULTS, **(saved if isinstance(saved, dict) else {})}
+    return trading_context.safety_config(rule)
 
 
 def _external_gates(ctx: dict, rule: dict) -> list[dict]:
-    cfg = _safety(rule)
-    return signal_context.build_external_gates(
-        ctx["df"],
-        code=ctx["source_meta"].get("code") or "US.UNKNOWN",
-        bar_meta=ctx["bar_meta"],
-        snapshot=ctx["snapshot"],
-        earnings_date=ctx.get("earnings_date"),
-        min_history=int(cfg["min_history"]),
-        max_stale_business_days=int(cfg["max_stale_business_days"]),
-        min_median_dollar_volume=float(cfg["min_median_dollar_volume"]),
-        max_spread_pct=float(cfg["max_spread_pct"]),
-        earnings_blackout_days=int(cfg["earnings_blackout_days"]),
-    )
+    return trading_context.external_gates(ctx, rule)
 
 
 def _with_latest_snapshot(ctx: dict, ticker: str) -> dict:

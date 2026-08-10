@@ -6,10 +6,11 @@ import re
 import pandas as pd
 import streamlit as st
 
-from lib import (charts, daily_decision, data_fetcher, derivatives_context,
+from lib import (alerts as alerts_lib, charts, daily_decision, data_fetcher, derivatives_context,
                  event_intelligence, indicators, level_review, levels,
                  moomoo_client, news_fetcher, sensitivity, session_intelligence,
-                 settings_store, today_inputs, ui)
+                 rules as rules_lib, settings_store, today_inputs,
+                 trade_summary, trading_context, ui)
 
 # 表示ラベル → (取得期間, 表示日数)。SMA200を期間の先頭から描くため長めに取得する。
 PERIODS = {
@@ -119,6 +120,64 @@ EVENT_SOURCE_LABELS_JA = {
     "Yahoo Finance": "Yahoo Finance",
     "SEC EDGAR": "米国証券取引委員会（SEC）",
 }
+
+TRADE_VERDICT_VIEW = {
+    "BUY": ("🟢", "買い候補", "green"),
+    "NEUTRAL": ("⚪", "新規エントリー見送り", "gray"),
+    "WAIT": ("🟠", "判定待機", "orange"),
+    "RISK_EXIT": ("🔴", "リスク退出候補", "red"),
+    "TAKE_PROFIT": ("🔵", "利益確定候補", "blue"),
+    "HOLD": ("⚪", "保有継続", "gray"),
+}
+
+TRADE_REGIME_LABELS = {
+    "UPTREND": "上昇トレンド",
+    "DOWNTREND": "下降トレンド",
+    "RANGE": "レンジ",
+    "HIGH_VOL": "高ボラティリティ",
+}
+
+SUMMARY_SESSION_LABELS = {
+    "premarket": "プレマーケット",
+    "regular": "立会時間",
+    "afterhours": "アフター",
+    "overnight": "夜間・24h",
+    "closed": "セッション外",
+    "unknown": "取引可否不明",
+}
+
+
+def verdict_score_text(result: dict, side_key: str) -> str:
+    """売買判定の点数を、合格点と混同しない短い表示へ整える。"""
+    side = result.get(side_key) or {}
+    score, total, threshold = side.get("score"), side.get("total"), side.get("threshold")
+    if score is None or total in (None, 0) or threshold is None:
+        return "点数を確認できません"
+    return f"{score:g} / {total:g}点（合格 {threshold:g}点）"
+
+
+def price_plan_delta(item: dict, entry_price) -> str:
+    """確定終値基準の価格計画を、現在値とは混ぜずに差分表示する。"""
+    price = item.get("price") if isinstance(item, dict) else None
+    try:
+        price, entry_price = float(price), float(entry_price)
+    except (TypeError, ValueError):
+        return "算出できず"
+    if entry_price <= 0:
+        return "算出できず"
+    return f"判定価格比 {(price / entry_price - 1) * 100:+.2f}%"
+
+
+def level_summary_text(item: dict) -> str:
+    """支持抵抗の帯と現在地を、中心値・現在値と混同せず表示する。"""
+    if not isinstance(item, dict) or not item.get("available"):
+        return "—"
+    stars = item.get("stars") or ""
+    if item.get("state") == "ゾーン内":
+        return (f"\\${item['zone_low']:,.2f}〜\\${item['zone_high']:,.2f} "
+                f"（帯の中で攻防中） {stars}")
+    return (f"\\${item['edge_price']:,.2f} "
+            f"({item['distance_pct']:+.2f}%) {stars}")
 
 
 def event_source_label_ja(source) -> str:
@@ -363,20 +422,377 @@ tab_today, tab_chart, tab_news, tab_tape, tab_flow, tab_derivatives = st.tabs([
     "🔬 板・歩み値", "🏦 需給・IV", "🌐 先物・PERP",
 ])
 
+# ----------------------------------------------------------- 売買情報サマリー
+# 既に取得したhistを再利用する。ここから過去K線APIを追加では呼ばない。
+eligibility = today_inputs.overnight_eligibility(snapshot)
+market_state = data_fetcher.fetch_market_state(ticker)
+session_state = session_intelligence.detect_current_session(
+    market_state=market_state.get("market_state"),
+    overnight_eligible=eligibility,
+)
+# 決算日だけはsignals画面と同じ6時間キャッシュを使う。moomoo履歴枠は使わない。
+try:
+    summary_analyst = data_fetcher.fetch_analyst(ticker)
+except Exception:
+    summary_analyst = {}
+earnings_date = summary_analyst.get("earnings_date")
+
+decision_context = trading_context.prepare_from_history(
+    hist,
+    source_meta=_base_meta,
+    market_meta=market_state,
+    snapshot=snapshot,
+    earnings_date=earnings_date,
+)
+rule_store = rules_lib.load()
+active_rule_name = rule_store["active"]
+active_rule = rule_store["rules"][active_rule_name]
+rule_warnings = rules_lib.validate(active_rule)
+
+if decision_context is None:
+    external_gates = []
+    entry_evaluation = {
+        "verdict": "WAIT", "summary": "確定日足を準備できないため判定を待機します",
+        "position_mode": "entry", "regime": None, "risk_plan": {},
+    }
+    holding_evaluation = {
+        "verdict": "WAIT", "summary": "確定日足を準備できないため判定を待機します",
+        "position_mode": "holding", "regime": None, "risk_plan": {},
+    }
+    decision_levels = []
+    summary_levels = []
+else:
+    external_gates = trading_context.external_gates(decision_context, active_rule)
+    entry_evaluation = rules_lib.evaluate(
+        decision_context["df"], active_rule, decision_context["levels"],
+        position_mode="entry", external_gates=external_gates)
+    holding_evaluation = rules_lib.evaluate(
+        decision_context["df"], active_rule, decision_context["levels"],
+        position_mode="holding", external_gates=external_gates)
+    decision_levels = list(decision_context["levels"])
+    minimum_strength = int(
+        (active_rule.get("risk") or {}).get("min_level_strength", 2))
+    summary_levels = [
+        row for row in decision_levels
+        if int(row.get("strength", row.get("base_strength", 0)) or 0)
+        >= minimum_strength
+    ]
+
+fallback_daily_bar = (None if decision_context is None
+                      else decision_context["df"].iloc[-1])
+session_rows = today_inputs.session_prices(snapshot, fallback_daily_bar)
+session_changes = session_intelligence.compute_session_changes(
+    session_rows, previous_close=prev)
+trend = daily_decision.intraday_trend(snapshot, fallback_daily_bar)
+
+target_labels = {
+    "regular": "次の立会寄付き", "premarket": "次のプレ開始",
+    "afterhours": "次のアフター開始", "overnight": "次の夜間開始",
+}
+summary_box = tab_today.container(border=True)
+with summary_box:
+    summary_title, summary_target, summary_action = st.columns([2.4, 1.4, 1.2])
+    with summary_title:
+        st.markdown("### 🎯 売買情報サマリー")
+        last_bar = (decision_context or {}).get("bar_meta", {}).get("last_bar")
+        chips = [
+            ui.chip(f"使用ルール: {active_rule_name}", "violet"),
+            ui.chip(f"判定足: {last_bar or '取得不能'}", "gray"),
+        ]
+        st.markdown(" ".join(chips), unsafe_allow_html=True)
+    with summary_target:
+        target_session = st.selectbox(
+            "寄付き診断の対象", list(target_labels),
+            format_func=lambda key: target_labels[key],
+            key=f"today_target_{ticker}")
+    with summary_action:
+        st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+        load_today = st.button(
+            "寄付き・イベントを更新", type="primary", width="stretch",
+            key=f"load_today_intelligence_{ticker}_{target_session}",
+            help="Yahooデータとニュースを必要時だけ取得します。moomoo過去K線枠は使いません。",
+        )
+
+result_store = st.session_state.setdefault("today_intelligence_results", {})
+result_key = (ticker, target_session)
+if load_today:
+    try:
+        with summary_box:
+            with st.spinner("市場・寄付き・イベント影響を整理中..."):
+                event_report = event_intelligence.fetch_event_intelligence(
+                    ticker, include_news=True, horizon_days=120)
+                market_features = fetch_opening_market_features()
+                features = today_inputs.opening_features(
+                    None if decision_context is None else decision_context["df"],
+                    snapshot, market_features, event_report)
+                session_report = session_intelligence.analyze_session_intelligence(
+                    market_state=market_state.get("market_state"),
+                    overnight_eligible=eligibility,
+                    session_prices=session_rows,
+                    previous_close=prev,
+                    target_session=target_session,
+                    features=features,
+                )
+        result_store[result_key] = {
+            "loaded_at": pd.Timestamp.now(tz="UTC"),
+            "session": session_report, "events": event_report,
+        }
+        while len(result_store) > 8:
+            result_store.pop(next(iter(result_store)))
+    except Exception as exc:
+        with summary_box:
+            st.warning(f"寄付き・イベント診断を取得できませんでした: {exc}")
+
+result = result_store.get(result_key)
+result_expired = False
+if result:
+    loaded_at = pd.to_datetime(result.get("loaded_at"), utc=True, errors="coerce")
+    if (pd.isna(loaded_at)
+            or pd.Timestamp.now(tz="UTC") - loaded_at > pd.Timedelta(minutes=15)):
+        result_store.pop(result_key, None)
+        result = None
+        result_expired = True
+
+event_payload = None
+if result:
+    event_payload = dict(result["events"])
+    event_payload["events"] = [
+        event_intelligence.localize_event_for_display(event)
+        for event in result["events"].get("events") or []
+    ]
+
+summary_common = {
+    "current_price": price_now,
+    "current_price_source": (snapshot.get("source") or _base_meta.get("source")),
+    "current_price_as_of": (snapshot.get("update_time") or _base_meta.get("fetched_at")),
+    "snapshot": snapshot,
+    "history": None if decision_context is None else decision_context["df"],
+    "levels": summary_levels,
+    "trend": trend,
+    "session": {
+        "current_session": session_state,
+        "session_changes": session_changes,
+    },
+}
+if event_payload is not None:
+    summary_common["event"] = event_payload
+
+entry_summary = trade_summary.build_trade_summary({
+    **summary_common, "position_mode": "entry",
+    "rule_evaluation": entry_evaluation,
+})
+holding_summary = trade_summary.build_trade_summary({
+    **summary_common, "position_mode": "holding",
+    "rule_evaluation": holding_evaluation,
+})
+
+# 保存済みアラートを、追加取得なしで現在の画面データに対してだけ照合する。
+active_ticker_alerts = [
+    alert for alert in alerts_lib.load()
+    if alert.get("enabled") and str(alert.get("ticker") or "").upper() == ticker
+]
+triggered_alerts = []
+unavailable_alerts = []
+alert_check_errors = 0
+if decision_context is not None:
+    alert_context = {
+        "df": decision_context["df"],
+        "levels": decision_context["levels"],
+        "price": price_now,
+        "previous_close": prev,
+        "entry_verdict": entry_evaluation.get("verdict"),
+        "holding_verdict": holding_evaluation.get("verdict"),
+    }
+    for alert in active_ticker_alerts:
+        try:
+            checked_alert = alerts_lib.check(alert, alert_context)
+        except Exception:
+            alert_check_errors += 1
+            continue
+        if checked_alert.get("reason"):
+            unavailable_alerts.append((alert, checked_alert))
+        elif checked_alert.get("triggered"):
+            triggered_alerts.append((alert, checked_alert))
+else:
+    alert_check_errors = len(active_ticker_alerts)
+alert_checked_at = pd.Timestamp.now(tz="America/New_York")
+
+with summary_box:
+    entry_col, holding_col = st.columns(2)
+    for column, heading, result_summary, evaluation in (
+        (entry_col, "未保有なら", entry_summary, entry_evaluation),
+        (holding_col, "ロング保有中なら", holding_summary, holding_evaluation),
+    ):
+        with column.container(border=True):
+            code = result_summary["verdict"]["code"]
+            icon, label, color = TRADE_VERDICT_VIEW.get(
+                code, ("🟠", "判定待機", "orange"))
+            blocking_actions = [
+                action for action in result_summary.get("action_priorities", [])
+                if action.get("blocking")]
+            if code == "BUY" and blocking_actions:
+                label, color = "買い候補（実行保留）", "orange"
+            st.caption(heading)
+            st.markdown(
+                ui.chip(f"{icon} {label}", color), unsafe_allow_html=True)
+            st.write(result_summary["verdict"]["reason"])
+            if heading == "未保有なら":
+                st.caption("買い判定: " + verdict_score_text(evaluation, "buy"))
+            else:
+                st.caption(
+                    "リスク退出: " + verdict_score_text(evaluation, "risk_exit")
+                    + " ／ 利益確定: " + verdict_score_text(evaluation, "take_profit"))
+            if blocking_actions:
+                st.warning("要確認: " + " ／ ".join(
+                    action["label_ja"] for action in blocking_actions[:2]))
+
+    context_columns = st.columns(4)
+    context_columns[0].metric(
+        "参考現在値" if snapshot.get("source") == "moomoo OpenAPI" else "直近確認値",
+        f"${price_now:,.2f}", f"前日終値比 {change_pct:+.2f}%",
+        delta_color="off", border=True)
+    context_columns[1].metric(
+        "現在セッション",
+        SUMMARY_SESSION_LABELS.get(
+            entry_summary["session"]["code"], entry_summary["session"]["label_ja"]),
+        "取引可" if entry_summary["session"]["tradable"] is True
+        else "取引時間外" if entry_summary["session"]["tradable"] is False
+        else "取引可否を確認", delta_color="off", border=True)
+    trend_is_realtime = entry_summary["trend"].get("data_quality") == "realtime"
+    context_columns[2].metric(
+        "当日の方向" if trend_is_realtime else "直近確定足の方向",
+        entry_summary["trend"]["label_ja"],
+        ("リアルタイム観測不足" if entry_summary["trend"]["strength"] is None
+         else f"観測一致度 {entry_summary['trend']['strength']:.0f}%")
+        + ("" if trend_is_realtime else "・確定日足ベース"),
+        delta_color="off", border=True)
+    context_columns[3].metric(
+        "日足レジーム",
+        TRADE_REGIME_LABELS.get(entry_evaluation.get("regime"), "判定不能"),
+        "売買ルールの前提", delta_color="off", border=True)
+
+    plan = entry_summary
+    plan_entry = plan["entry"].get("price")
+    plan_columns = st.columns(4)
+    plan_columns[0].metric(
+        "判定価格（確定終値）",
+        "—" if plan_entry is None else f"${plan_entry:,.2f}",
+        "リアルタイム値とは別", delta_color="off", border=True)
+    plan_columns[1].metric(
+        "参考ストップ",
+        "—" if plan["stop"].get("price") is None else f"${plan['stop']['price']:,.2f}",
+        price_plan_delta(plan["stop"], plan_entry), delta_color="off", border=True)
+    plan_columns[2].metric(
+        "参考目標",
+        "—" if plan["target"].get("price") is None else f"${plan['target']['price']:,.2f}",
+        price_plan_delta(plan["target"], plan_entry), delta_color="off", border=True)
+    plan_columns[3].metric(
+        "リスク : リワード", plan["rr"]["label_ja"],
+        "ATR・支持抵抗から算出", delta_color="off", border=True)
+
+    support_item, resistance_item = plan["support"], plan["resistance"]
+    support_text = level_summary_text(support_item)
+    resistance_text = level_summary_text(resistance_item)
+    st.markdown(
+        f"**支持帯** {support_text}　←　**参考現在値 \\${price_now:,.2f}**　→　"
+        f"**抵抗帯** {resistance_text}")
+
+    required_gates = [gate for gate in entry_evaluation.get("gates", [])
+                      if gate.get("required")]
+    passed_gates = [gate for gate in required_gates if gate.get("passed") is True]
+    blocked_gates = [gate for gate in required_gates if gate.get("passed") is False]
+    unknown_gates = [gate for gate in entry_evaluation.get("gates", [])
+                     if gate.get("passed") is None]
+    if blocked_gates:
+        st.warning("新規買いの必須ゲート未成立: " + " ／ ".join(
+            f"{gate['label']}（{gate.get('reason') or '要確認'}）"
+            for gate in blocked_gates))
+    elif required_gates:
+        st.success(
+            f"新規買いの必須ゲート {len(passed_gates)} / {len(required_gates)} 成立")
+    if unknown_gates:
+        st.caption("⚠ 取得不能・警告のみ: " + "、".join(
+            str(gate.get("label")) for gate in unknown_gates))
+    st.caption("保有中はリスク退出・利益確定の成立を新規買いゲートより優先して表示します。")
+
+    if active_ticker_alerts:
+        unavailable_count = len(unavailable_alerts) + alert_check_errors
+        not_triggered_count = max(
+            len(active_ticker_alerts) - len(triggered_alerts) - unavailable_count, 0)
+        alert_line = (
+            f"🔔 この銘柄のアラート: 有効 {len(active_ticker_alerts)}件 ／ "
+            f"現在成立 {len(triggered_alerts)}件 ／ 未成立 {not_triggered_count}件 ／ "
+            f"判定不能 {unavailable_count}件 ／ "
+            f"確認 {alert_checked_at:%H:%M:%S} ET")
+        if triggered_alerts:
+            st.warning(alert_line + "\n\n" + " ／ ".join(
+                f"{alerts_lib.describe(alert)}（実測 {checked.get('actual', '—')}）"
+                for alert, checked in triggered_alerts[:3]))
+        elif unavailable_count:
+            st.warning(alert_line)
+        else:
+            st.info(alert_line)
+        if unavailable_count:
+            reasons = [
+                f"{alerts_lib.describe(alert)}（{checked.get('reason') or 'データ不足'}）"
+                for alert, checked in unavailable_alerts[:2]
+            ]
+            if alert_check_errors:
+                reasons.append(f"{alert_check_errors}件は保存値を評価できませんでした")
+            st.caption("⚠ 判定不能: " + " ／ ".join(reasons))
+    else:
+        st.caption("🔔 この銘柄の有効アラートはありません。"
+                   "必要なら下の詳細画面から追加できます。")
+    st.caption("アラートはこの画面の更新時点だけを照合し、アプリを閉じている間は監視しません。")
+
+    event_risk = entry_summary["event_risk"]
+    if event_risk["available"] and event_risk.get("event_name"):
+        days = event_risk.get("days_until")
+        day_text = "日程差不明" if days is None else "本日" if days == 0 else f"{days}日後"
+        st.info(
+            f"📅 次の予定: {event_risk['event_name']} "
+            f"{event_risk['impact_stars_text']}（{day_text}）・"
+            f"{event_risk.get('session') or '発表時間未定'}")
+        if event_risk.get("warnings"):
+            st.caption("⚠ 一部取得できないイベント情報があります: " + " ／ ".join(
+                localize_event_warning(item) for item in event_risk["warnings"]))
+    elif result is not None and event_risk.get("report_status") in {
+            "partial", "unavailable"}:
+        st.warning("📅 " + event_risk["reason"] + "。予定なしとは判定しません。")
+    elif result_expired:
+        st.warning("📅 前回のイベント診断は15分を超えたため失効しました。再更新してください。")
+    elif result is None and earnings_date:
+        st.info(f"📅 次回決算予定: {str(earnings_date)[:10]}。"
+                "影響度★と他イベントは「寄付き・イベントを更新」で確認できます。")
+    elif result is None:
+        st.warning("イベント情報は未確認です。「寄付き・イベントを更新」で確認してください。")
+    else:
+        st.info("診断期間内に今後のイベントを確認できませんでした。")
+
+    if result:
+        opening = result["session"]["next_open_diagnosis"]
+        opening_labels = {"up": "上向き", "down": "下向き", "neutral": "方向拮抗",
+                          "unknown": "入力不足"}
+        probability = opening.get("probability_up")
+        st.caption(
+            f"次回開始の参考方向: {opening_labels.get(opening.get('direction'), '—')}"
+            + ("" if probability is None else f"（上向き参考確率 {probability * 100:.0f}%・未校正）")
+            + f" ／ データ品質 {opening['data_quality']['score'] * 100:.0f}%"
+            + f" ／ 最終更新 {fmt_utc_time(result.get('loaded_at'))}")
+
+    if rule_warnings:
+        st.warning("使用ルールの設定確認: " + " ／ ".join(rule_warnings))
+    st.caption(
+        "このまとめは既存の確定日足ルールを整理した参考情報です。"
+        "現在値・イベント・当日方向は売買スコアへ自動加点せず、注文や空売りは実行しません。")
+    st.link_button("詳しい判定基準・内訳・株価アラートを開く",
+                   f"/signals?ticker={ticker}")
+
 # ---------------------------------------------------------------- 今日の判断
 with tab_today:
     st.caption("現在セッション → 当日の方向 → 支持抵抗 → 次回寄付き → イベントの順に"
                "確認します。ここでの数値は説明可能な参考診断で、注文や利益を保証しません。")
 
-    eligibility = today_inputs.overnight_eligibility(snapshot)
-    market_state = data_fetcher.fetch_market_state(ticker)
-    session_state = session_intelligence.detect_current_session(
-        market_state=market_state.get("market_state"),
-        overnight_eligible=eligibility,
-    )
-    session_rows = today_inputs.session_prices(snapshot, hist.iloc[-1])
-    session_changes = session_intelligence.compute_session_changes(
-        session_rows, previous_close=prev)
     session_labels = {
         "premarket": "プレ", "regular": "立会", "afterhours": "アフター",
         "overnight": "夜間・24h",
@@ -420,10 +836,7 @@ with tab_today:
                    "対象可否はmoomooの銘柄詳細でも確認してください。")
 
     st.markdown("#### 当日の方向と重要価格帯")
-    trend = daily_decision.intraday_trend(snapshot, hist.iloc[-1])
-    level_frame = with_ind.tail(252)
-    today_levels = levels.find_levels(level_frame)
-    nearby = daily_decision.nearest_levels(today_levels, price_now, min_strength=3)
+    nearby = daily_decision.nearest_levels(decision_levels, price_now, min_strength=3)
     support, resistance = nearby["support"], nearby["resistance"]
     t1, t2, t3, t4 = st.columns(4)
     t1.metric("当日の方向", trend["label"],
@@ -439,9 +852,10 @@ with tab_today:
               "データ不足" if resistance is None else f"現在値から {resistance['distance_pct']:+.2f}%",
               delta_color="off", border=True)
     rr = nearby.get("reward_risk")
-    t4.metric("支持帯までの下方余地 : 抵抗帯までの上方余地",
+    t4.metric("支持・抵抗の単純な上下距離比",
               "—" if rr is None else f"1 : {rr:.2f}",
-              "両側の強い帯が必要", delta_color="off", border=True)
+              "ストップ未反映・売買計画のR:Rとは別",
+              delta_color="off", border=True)
 
     check_df = pd.DataFrame([{
         "観測": row["label"],
@@ -457,54 +871,6 @@ with tab_today:
                "★3以上だけを抜粋し、反発保証ではなく損益幅の確認に使います。")
 
     st.markdown("#### 次回寄付き・セッション開始の方向診断")
-    target_labels = {
-        "regular": "次の立会寄付き", "premarket": "次のプレ開始",
-        "afterhours": "次のアフター開始", "overnight": "次の夜間開始",
-    }
-    target_session = st.selectbox(
-        "予想する開始時点", list(target_labels),
-        format_func=lambda key: target_labels[key], key=f"today_target_{ticker}")
-    load_today = st.button(
-        "寄付き・イベント診断を読み込む", type="primary",
-        key=f"load_today_intelligence_{ticker}_{target_session}",
-        help="必要なYahooデータとニュースをこの操作時だけ取得します。moomoo過去K線枠は使いません。",
-    )
-
-    result_store = st.session_state.setdefault("today_intelligence_results", {})
-    result_key = (ticker, target_session)
-    if load_today:
-        try:
-            with st.spinner("市場・寄付き・イベント影響を整理中..."):
-                event_report = event_intelligence.fetch_event_intelligence(
-                    ticker, include_news=True, horizon_days=120)
-                market_features = fetch_opening_market_features()
-                features = today_inputs.opening_features(
-                    hist, snapshot, market_features, event_report)
-                session_report = session_intelligence.analyze_session_intelligence(
-                    market_state=market_state.get("market_state"),
-                    overnight_eligible=eligibility,
-                    session_prices=session_rows,
-                    previous_close=prev,
-                    target_session=target_session,
-                    features=features,
-                )
-            result_store[result_key] = {
-                "loaded_at": pd.Timestamp.now(tz="UTC"),
-                "session": session_report, "events": event_report,
-            }
-            while len(result_store) > 8:
-                result_store.pop(next(iter(result_store)))
-        except Exception as exc:
-            st.warning(f"寄付き・イベント診断を取得できませんでした: {exc}")
-
-    result = result_store.get(result_key)
-    if result:
-        loaded_at = pd.to_datetime(result.get("loaded_at"), utc=True, errors="coerce")
-        if (pd.isna(loaded_at)
-                or pd.Timestamp.now(tz="UTC") - loaded_at > pd.Timedelta(minutes=15)):
-            result_store.pop(result_key, None)
-            result = None
-
     if result:
         diagnosis = result["session"]["next_open_diagnosis"]
         direction_labels = {
@@ -555,10 +921,7 @@ with tab_today:
         st.caption("★は株価が動く方向ではなく、**影響を受けやすい大きさ**です。"
                    "過去の実測が十分なら平常時との比較を優先し、不足時はイベント種類別の"
                    "目安を表示します。")
-        localized_events = [
-            event_intelligence.localize_event_for_display(event)
-            for event in event_report.get("events") or []
-        ]
+        localized_events = event_payload["events"]
         scope_column, sort_column = st.columns([2.2, 1.2])
         with scope_column:
             event_scope = st.segmented_control(
@@ -714,10 +1077,8 @@ with tab_today:
         for warning in event_report.get("warnings") or []:
             st.warning(localize_event_warning(warning))
     else:
-        st.info("ボタンを押すと、市場の直近5分足・イベント日程・ニュースを必要時だけ"
+        st.info("上のサマリーで更新すると、市場の直近5分足・イベント日程・ニュースを必要時だけ"
                 "読み込みます。データが不足・古い場合は確率を表示しません。")
-
-    st.link_button("🎯 詳細な売買判定・アラートへ", f"/signals?ticker={ticker}")
 
 # ---------------------------------------------------------------- チャート・指標
 with tab_chart:
