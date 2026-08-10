@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 
 from lib import indicators
 from lib import levels as levels_mod
+from lib import sessions
 
 UP = "#00a86b"        # 上昇(status: good)
 DOWN = "#ef5350"      # 下降(status: critical)
@@ -59,6 +60,7 @@ DEFAULT_OPTS = {
     "current_price_line": True,
     "signals": False,
     "compact_sessions": True,
+    "extended_hours": False,
     "interaction": "クロスヘア",
     "current_price": None,
 }
@@ -341,6 +343,39 @@ def _add_signal_markers(fig, df):
             ), row=1, col=1)
 
 
+def _shade_sessions(fig, df: pd.DataFrame, rows: int) -> None:
+    """時間外セッションの区間に薄い背景を敷き、立会と一目で区別できるようにする。
+
+    連続する同一セッションのバーをひとまとめにして矩形を1つ描く。
+    バー単位で描くと図形が数百個になり描画が重くなるため。
+    """
+    if df is None or df.empty:
+        return
+    labels = sessions.classify(df.index).to_numpy()
+    index = df.index
+    start = 0
+    labelled = set()
+    for i in range(1, len(labels) + 1):
+        if i < len(labels) and labels[i] == labels[start]:
+            continue
+        name = labels[start]
+        if name in sessions.SESSION_BG:
+            # 端のバーの幅ぶん外側に広げて、隣の区間と隙間ができないようにする
+            x0 = index[start]
+            x1 = index[i] if i < len(labels) else index[i - 1]
+            fig.add_vrect(x0=x0, x1=x1, fillcolor=sessions.SESSION_BG[name],
+                          line_width=0, layer="below", row="all", col=1)
+            # 凡例代わりのラベルは価格パネルに1セッション1回だけ置く
+            if name not in labelled:
+                fig.add_annotation(
+                    x=x0, y=1, xref="x", yref="y domain",
+                    text=sessions.SESSION_SHORT[name], showarrow=False,
+                    xanchor="left", yanchor="top",
+                    font=dict(size=9, color=MUTED), row=1, col=1)
+                labelled.add(name)
+        start = i
+
+
 def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.Figure:
     """メインチャート(価格+選択したオーバーレイ・サブチャート)。"""
     o = {**DEFAULT_OPTS, **(opts or {})}
@@ -450,12 +485,10 @@ def price_chart(df: pd.DataFrame, ticker: str, opts: dict | None = None) -> go.F
         _add_oscillator(fig, df, name, row=2 + i, opts=o)
 
     if o["compact_sessions"]:
-        if o["interval"] in {"1d", "1wk"}:
-            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-        elif o["interval"] in INTRADAY_INTERVALS:
-            # 週末と場外時間(米国株の通常セッション9:30〜16:00 ET)を除去
-            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]),
-                                          dict(bounds=[16, 9.5], pattern="hour")])
+        fig.update_xaxes(rangebreaks=sessions.rangebreaks(
+            o["interval"], bool(o.get("extended_hours"))))
+    if o.get("extended_hours") and o["interval"] in INTRADAY_INTERVALS:
+        _shade_sessions(fig, df, rows)
     if o["log_scale"]:
         fig.update_yaxes(type="log", row=1, col=1)
 

@@ -17,10 +17,16 @@ class FetchError(Exception):
 
 
 @st.cache_data(ttl=900, show_spinner="株価データを取得中...")
-def fetch_history(ticker: str, period: str, interval: str = "1d") -> pd.DataFrame:
-    """株価履歴を取得する(日足/週足/月足)。無効なティッカーの場合は空のDataFrame。"""
+def fetch_history(ticker: str, period: str, interval: str = "1d",
+                  prepost: bool = False) -> pd.DataFrame:
+    """株価履歴を取得する。無効なティッカーの場合は空のDataFrame。
+
+    prepost=True で分足にプレ・アフターマーケットのバーを含める
+    (日足以上では効かない)。夜間取引の値はYahooからは取得できない。
+    """
     try:
-        df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+        df = yf.Ticker(ticker).history(period=period, interval=interval,
+                                       auto_adjust=True, prepost=prepost)
     except Exception as e:
         raise FetchError(str(e)) from e
     if df is None or df.empty:
@@ -58,6 +64,43 @@ def fetch_intraday_batch(tickers: tuple[str, ...], period: str = "1d",
         if not all(c in sub.columns for c in cols):
             continue
         df = sub[cols].dropna(subset=["Close"])
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        if not df.empty:
+            out[t] = df
+    return out
+
+
+@st.cache_data(ttl=900, show_spinner="複数銘柄の日足を取得中...")
+def fetch_daily_batch(tickers: tuple[str, ...],
+                      period: str = "1y") -> dict[str, pd.DataFrame]:
+    """複数銘柄の日足をまとめて取得する。
+
+    セクタースキャンのように数十銘柄を見るときは、1銘柄ずつ取ると
+    レート制限に当たるのでまとめて1リクエストにする。
+    取得できなかった銘柄はキーごと含めない。
+    """
+    if not tickers:
+        return {}
+    try:
+        raw = yf.download(list(tickers), period=period, interval="1d",
+                          group_by="ticker", auto_adjust=True, progress=False,
+                          threads=True)
+    except Exception as e:
+        raise FetchError(str(e)) from e
+    if raw is None or raw.empty:
+        return {}
+
+    out: dict[str, pd.DataFrame] = {}
+    for t in tickers:
+        try:
+            sub = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+        except KeyError:
+            continue
+        if not isinstance(sub, pd.DataFrame) or sub.empty:
+            continue
+        if "Close" not in sub.columns:
+            continue
+        df = sub.dropna(subset=["Close"])
         df = df[~df.index.duplicated(keep="last")].sort_index()
         if not df.empty:
             out[t] = df
@@ -116,28 +159,29 @@ def fetch_realtime_snapshot(ticker: str) -> dict:
 
 
 @st.cache_data(ttl=120, show_spinner="チャートデータを取得中...")
-def fetch_chart_history(ticker: str, period: str,
-                        interval: str = "1d") -> tuple[pd.DataFrame, dict]:
+def fetch_chart_history(ticker: str, period: str, interval: str = "1d",
+                        prepost: bool = False) -> tuple[pd.DataFrame, dict]:
     """チャート用OHLCVを取得し、取得元メタデータも返す。
 
     既定ではYahoo Financeを使う。moomooの履歴K線は口座ごとのクォータを
     消費するため、設定で明示的にオンにしたときだけ優先する。
+    prepost=Trueなら分足に時間外(プレ・アフター)のバーを含める。
     """
     fallback_reason = None
     if not moomoo_fetcher.history_enabled():
         # クォータを消費しないよう、moomooには問い合わせない。
-        return fetch_history(ticker, period, interval), {
+        return fetch_history(ticker, period, interval, prepost), {
             "source": "Yahoo Finance", "code": ticker, "fallback_reason": None,
         }
     try:
-        moomoo = moomoo_fetcher.fetch_history(ticker, period, interval)
+        moomoo = moomoo_fetcher.fetch_history(ticker, period, interval, prepost)
     except moomoo_fetcher.MoomooError as exc:
         moomoo = pd.DataFrame()
         fallback_reason = str(exc)
 
     if not moomoo.empty:
         try:
-            yahoo = fetch_history(ticker, period, interval)
+            yahoo = fetch_history(ticker, period, interval, prepost)
         except FetchError:
             yahoo = pd.DataFrame()
         enriched = _merge_corporate_actions(moomoo, yahoo, interval)
@@ -147,7 +191,7 @@ def fetch_chart_history(ticker: str, period: str,
             "fallback_reason": None,
         }
 
-    yahoo = fetch_history(ticker, period, interval)
+    yahoo = fetch_history(ticker, period, interval, prepost)
     return yahoo, {
         "source": "Yahoo Finance",
         "code": ticker,

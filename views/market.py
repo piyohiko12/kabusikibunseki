@@ -3,8 +3,8 @@
 import pandas as pd
 import streamlit as st
 
-from lib import (charts, data_fetcher, market_mood, moomoo_client, ui,
-                 watchlist_store)
+from lib import (charts, data_fetcher, intraday, market_mood, moomoo_client,
+                 ui, watchlist_store)
 
 UP_COLOR = "#0ca30c"
 DOWN_COLOR = "#d03b3b"
@@ -43,6 +43,59 @@ def _pct_color(v):
 
 
 st.title("🌐 市場概況")
+
+# ------------------------------------------------------------ 当日のトレンド
+# センチメント(逆張り向けの中期指標)より前に、まず「今日どっちに動いているか」。
+st.subheader("⚡ 今日の市場トレンド")
+
+TREND_ICON = {"up": "🟢", "down": "🔴", "flat": "⚪"}
+TREND_INDICES = [("S&P500", "SPY"), ("NASDAQ100", "QQQ"), ("小型株", "IWM")]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _intraday_indices() -> tuple[dict, dict]:
+    frames, prevs = {}, {}
+    for name, sym in TREND_INDICES:
+        try:
+            frame = data_fetcher.fetch_history(sym, "5d", "5m", prepost=True)
+            daily = data_fetcher.fetch_history(sym, "1mo", "1d")
+        except data_fetcher.FetchError:
+            continue
+        if frame is None or frame.empty:
+            continue
+        frames[name] = frame
+        if daily is not None and len(daily) > 1:
+            prevs[name] = float(daily["Close"].iloc[-2])
+    return frames, prevs
+
+
+_frames, _prevs = _intraday_indices()
+market_now = intraday.market_trend(_frames, _prevs) if _frames else None
+if not market_now:
+    st.info("当日の分足を取得できませんでした(市場が閉じている時間帯や、"
+            "データ提供が無い場合に表示されます)。")
+else:
+    mt1, mt2 = st.columns([1, 2])
+    mt1.metric("市場全体の向き",
+               f"{TREND_ICON[market_now['tone']]} {market_now['short']}",
+               f"{market_now['score']:+.0f}点", delta_color="off", border=True)
+    with mt2:
+        st.markdown(f"**{market_now['advice']}**")
+        st.caption(f"3指数のうち {market_now['agreement']} が同じ向き。"
+                   + ("全部そろっています。" if market_now["aligned"]
+                      else "向きが割れているので、指数間の食い違いに注意。"))
+    st.dataframe(pd.DataFrame([{
+        "指数": m["name"],
+        "向き": f"{TREND_ICON[m['tone']]} {m['short']}",
+        "スコア": f"{m['score']:+.0f}",
+        "寄付から": f"{m['from_open_pct']:+.2f}%",
+        "VWAP乖離": f"{m['vwap_dev']:+.2f}%",
+    } for m in market_now["members"]]), hide_index=True, width="stretch")
+    st.caption("VWAP・EMA・オープニングレンジ・高安の推移・出来高の偏りを"
+               "合成した −100〜+100 のスコアです。いま何が起きているかの要約であり、"
+               "この先の値動きの確率ではありません。")
+
+st.divider()
 
 # ---------------------------------------------------------------- センチメント
 st.subheader("🌡️ 市場センチメント・買い場判定")

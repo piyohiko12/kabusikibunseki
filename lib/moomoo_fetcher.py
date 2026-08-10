@@ -162,16 +162,24 @@ def _normalise_history(data: pd.DataFrame) -> pd.DataFrame:
     return out[~out.index.duplicated(keep="last")].sort_index()
 
 
-def fetch_history(ticker: str, period: str, interval: str = "1d") -> pd.DataFrame:
-    """moomooの前方復権済みローソク足を取得する。"""
+def fetch_history(ticker: str, period: str, interval: str = "1d",
+                  prepost: bool = False) -> pd.DataFrame:
+    """moomooの前方復権済みローソク足を取得する。
+
+    prepost=Trueなら米国株の分足に時間外セッションを含める(Session.ALL)。
+    """
     if interval not in INTERVAL_MAP:
         raise MoomooError(f"未対応の足種です: {interval}")
     if not history_enabled():
         raise MoomooError(HISTORY_DISABLED_MESSAGE)
     code = normalize_code(ticker)
     ktype = getattr(KLType, INTERVAL_MAP[interval])
-    session = (Session.RTH if code.startswith("US.") and interval in
-               {"1m", "5m", "15m", "1h"} else Session.NONE)
+    if code.startswith("US.") and interval in {"1m", "5m", "15m", "1h"}:
+        # Session.ALL は古いSDKに無いことがあるのでgetattrで退避する。
+        session = (getattr(Session, "ALL", Session.RTH) if prepost
+                   else Session.RTH)
+    else:
+        session = Session.NONE
     start = _period_start(period)
     end = pd.Timestamp.now().strftime("%Y-%m-%d")
     try:

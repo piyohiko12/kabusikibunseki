@@ -56,16 +56,52 @@ def _stars_from_corr(corr: float) -> int:
 
 
 def _event_moves(hist: pd.DataFrame, dates: list[str]) -> list[float]:
-    """各イベント日直後の日次変動率(%、絶対値)。イベント当日と翌営業日の大きい方。"""
-    ret = hist["Close"].pct_change().abs() * 100
+    """各イベント日直後の日次変動率(%、符号つき)。
+
+    イベント当日と翌営業日のうち、値動きの大きかったほうを符号つきで返す。
+    絶対値ではなく符号を残すことで、上下どちらに振れやすいかも測れる。
+    """
+    ret = hist["Close"].pct_change() * 100
     ret = pd.Series(ret.values, index=_naive_daily(hist.index))
     moves = []
     for d in dates:
         ts = pd.Timestamp(d)
         after = ret.loc[ret.index >= ts]
         if len(after) >= 2 and (after.index[0] - ts).days <= 5:
-            moves.append(float(max(after.iloc[0], after.iloc[1])))
+            pair = [float(after.iloc[0]), float(after.iloc[1])]
+            moves.append(max(pair, key=abs))
     return moves
+
+
+def _direction(moves: list[float]) -> dict:
+    """イベント後の値動きに上下の偏りがあるかを判定する。
+
+    n が小さいと偏りは簡単に出るので、二項分布の目安として
+    「偏りと呼ぶには 65%以上 かつ 5回以上」を条件にする。
+    """
+    n = len(moves)
+    ups = sum(1 for m in moves if m > 0)
+    up_rate = ups / n * 100 if n else 0.0
+    avg_signed = sum(moves) / n if n else 0.0
+    up_moves = [m for m in moves if m > 0]
+    down_moves = [m for m in moves if m < 0]
+    biased = n >= 5 and (up_rate >= 65 or up_rate <= 35)
+    if not biased:
+        label, tone = "上下どちらとも言えない", "flat"
+    elif up_rate >= 65:
+        label, tone = f"上に振れやすい({up_rate:.0f}%)", "up"
+    else:
+        label, tone = f"下に振れやすい({100 - up_rate:.0f}%)", "down"
+    return {
+        "n": n,
+        "up_rate": up_rate,
+        "avg_signed": avg_signed,
+        "avg_up": sum(up_moves) / len(up_moves) if up_moves else 0.0,
+        "avg_down": sum(down_moves) / len(down_moves) if down_moves else 0.0,
+        "biased": biased,
+        "direction_label": label,
+        "direction_tone": tone,
+    }
 
 
 def _event_row(name: str, hist: pd.DataFrame, dates: list[str],
@@ -73,13 +109,17 @@ def _event_row(name: str, hist: pd.DataFrame, dates: list[str],
     moves = _event_moves(hist, dates)
     if len(moves) < 3:
         return None
-    avg = sum(moves) / len(moves)
-    ratio = avg / base_move if base_move else 0
+    avg_abs = sum(abs(m) for m in moves) / len(moves)
+    ratio = avg_abs / base_move if base_move else 0
+    d = _direction(moves)
     return {
         "イベント・要因": name,
         "感応度": "★" * _stars_from_ratio(ratio),
-        "実測値": f"平均±{avg:.1f}%(平常時の{ratio:.1f}倍)",
+        "実測値": f"平均±{avg_abs:.1f}%(平常時の{ratio:.1f}倍)",
+        "方向": d["direction_label"],
+        "上昇時/下落時": f"+{d['avg_up']:.1f}% / {d['avg_down']:.1f}%",
         "解説": f"{note}(過去{len(moves)}回)",
+        "_detail": {**d, "avg_abs": avg_abs, "ratio": ratio, "event": True},
     }
 
 
@@ -104,11 +144,25 @@ def _factor_row(name: str, symbol: str, stock_ret: pd.Series,
         beta = float(pair.cov().iloc[0, 1]) / var if var else 0.0
         value = f"β {beta:.2f} / 相関 {corr:+.2f}"
     note = notes[2] if abs(corr) < 0.15 else (notes[0] if corr > 0 else notes[1])
+    # マクロ要因は「その要因が1%動いたとき、この銘柄が平均何%動いたか」を
+    # 方向として示す。相関が弱いときは方向を出さない。
+    slope = float(pair.cov().iloc[0, 1] / pair.iloc[:, 1].var()) \
+        if pair.iloc[:, 1].var() else 0.0
+    if abs(corr) < 0.15:
+        direction = "連動は弱い"
+    elif corr > 0:
+        direction = f"同方向(要因+1%で {slope * 1:+.2f}%)"
+    else:
+        direction = f"逆方向(要因+1%で {slope * 1:+.2f}%)"
     return {
         "イベント・要因": name,
         "感応度": "★" * _stars_from_corr(corr),
         "実測値": value,
+        "方向": direction,
+        "上昇時/下落時": "—",
         "解説": note,
+        "_detail": {"corr": corr, "slope": slope, "n": int(len(pair)),
+                    "event": False},
     }
 
 
