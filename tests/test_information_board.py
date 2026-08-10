@@ -219,6 +219,36 @@ class BoardBuildTests(unittest.TestCase):
         self.assertEqual(holding["data"]["verdict"], "RISK_EXIT")
         self.assertEqual(holding["importance"], "critical")
 
+    def test_invalid_buy_risk_plan_is_marked_for_visual_execution_hold(self):
+        payload = complete_input()
+        payload["entry_evaluation"]["risk_plan"] = {"valid": False}
+        result = information_board.build_information_board(payload)
+        entry = next(item for item in result["items"]
+                     if item["kind"] == "entry_verdict")
+        self.assertEqual(entry["data"]["verdict"], "BUY")
+        self.assertTrue(entry["data"]["blocked"])
+
+    def test_explicit_visual_hold_is_preserved_without_changing_verdict(self):
+        payload = complete_input()
+        payload["entry_evaluation"]["visual_blocked"] = True
+        result = information_board.build_information_board(payload)
+        entry = next(item for item in result["items"]
+                     if item["kind"] == "entry_verdict")
+        self.assertEqual(entry["data"]["verdict"], "BUY")
+        self.assertTrue(entry["data"]["blocked"])
+
+    def test_mode_verdict_mismatch_is_omitted_with_warning(self):
+        result = information_board.build_information_board({
+            "ticker": "AAPL",
+            "entry_evaluation": {"verdict": "RISK_EXIT"},
+            "holding_evaluation": {"verdict": "BUY"},
+        })
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["counts"]["warnings"], 2)
+        self.assertTrue(all(
+            "組み合わせが不正" in warning for warning in result["warnings"]
+        ))
+
     def test_unavailable_alert_is_not_mislabeled_as_not_triggered(self):
         result = information_board.build_information_board(complete_input())
         alerts = [item for item in result["items"] if item["category"] == "alert"]

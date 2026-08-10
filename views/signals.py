@@ -10,17 +10,10 @@ import pandas as pd
 import streamlit as st
 
 from lib import (alerts as alerts_lib, data_fetcher, rule_backtest,
-                 rules as rules_lib, trading_context, watchlist_store)
+                 rules as rules_lib, trade_visuals, trading_context,
+                 watchlist_store)
 
 
-VERDICT_STYLE = {
-    "BUY": ("🟢", "買い候補", "success"),
-    "TAKE_PROFIT": ("🔵", "利益確定候補", "info"),
-    "RISK_EXIT": ("🔴", "リスク退出候補", "error"),
-    "HOLD": ("⚪", "保有継続", "info"),
-    "WAIT": ("🟠", "判定待機", "warning"),
-    "NEUTRAL": ("⚪", "新規エントリー見送り", "info"),
-}
 REGIME_LABELS = {
     "UPTREND": "上昇トレンド",
     "DOWNTREND": "下降トレンド",
@@ -33,8 +26,8 @@ SIDE_SPECS = (
     ("risk_exit", "🔴 リスク退出条件"),
 )
 POSITION_MODES = {
-    "新規ロングを検討": "entry",
-    "ロング保有中": "holding",
+    "未保有（新規買いを判定）": "entry",
+    "ロング保有中（売却・継続を判定）": "holding",
 }
 REFRESH_CHOICES = {
     "自動更新しない": 0,
@@ -128,11 +121,17 @@ def _number(value) -> float | None:
     return None if math.isnan(number) else number
 
 
-def _verdict_banner(result: dict, ticker: str, rule_name: str):
-    verdict = result["verdict"]
-    icon, label, kind = VERDICT_STYLE.get(verdict, ("⚪", verdict, "info"))
-    body = f"### {icon} {ticker}: {label}"
-    getattr(st, kind)(body)
+def _verdict_banner(result: dict, ticker: str, rule_name: str,
+                    position_mode: str):
+    visual = trade_visuals.evaluation_visual(
+        result, position_mode=position_mode)
+    situation = "未保有" if position_mode == "entry" else "ロング保有中"
+    body = (
+        f"### {visual['icon']} {ticker}｜{situation} → "
+        f"{visual['action_label_ja']}\n\n"
+        f"**{visual['title_ja']}**\n\n{visual['description_ja']}"
+    )
+    getattr(st, visual["severity"])(body)
     st.caption(
         f"ルール「{rule_name}」・{REGIME_LABELS.get(result.get('regime'), result.get('regime'))}。"
         f"{result.get('summary', '')} この画面は注文を出しません。"
@@ -233,9 +232,10 @@ def _risk_plan(plan: dict):
                f"目標根拠: {plan.get('target_source')}。発注価格ではありません。")
 
 
-def _verdict_label(verdict: str) -> str:
-    icon, label, _ = VERDICT_STYLE.get(verdict, ("⚪", verdict, "info"))
-    return f"{icon} {label}"
+def _verdict_label(evaluation: dict, position_mode: str = "entry") -> str:
+    visual = trade_visuals.evaluation_visual(
+        evaluation, position_mode=position_mode)
+    return f"{visual['icon']} {visual['action_label_ja']}"
 
 
 st.title("🎯 売買判定・検証・アラート")
@@ -256,7 +256,7 @@ with tab_judge:
     active = c_rule.selectbox(
         "使うルール", rule_names,
         index=rule_names.index(store["active"]) if store["active"] in rule_names else 0)
-    position_label = c_position.selectbox("判定する状況", list(POSITION_MODES))
+    position_label = c_position.selectbox("現在の保有状況", list(POSITION_MODES))
     position_mode = POSITION_MODES[position_label]
     if active != store["active"]:
         rules_lib.save(store["rules"], active)
@@ -275,7 +275,7 @@ with tab_judge:
             result = rules_lib.evaluate(
                 ctx["df"], rule, ctx["levels"], position_mode=position_mode,
                 external_gates=gates)
-            _verdict_banner(result, ticker, active)
+            _verdict_banner(result, ticker, active, position_mode)
             _data_source_panel(ctx)
 
             confirmed = float(ctx["df"]["Close"].iloc[-1])
@@ -331,7 +331,7 @@ with tab_judge:
                         external_gates=_external_gates(item, rule))
                     rows.append({
                         "銘柄": symbol,
-                        "判定": _verdict_label(evaluated["verdict"]),
+                        "判定": _verdict_label(evaluated),
                         "スコア": evaluated["buy"]["score"],
                         "確定終値": float(item["df"]["Close"].iloc[-1]),
                         "取得元": item["source_meta"].get("source"),
@@ -672,8 +672,9 @@ with tab_alerts:
                     state, actual = "データなし", "—"
                 else:
                     checked = alerts_lib.check(alert, context)
-                    state = "成立" if checked["triggered"] else "監視中"
-                    actual = checked["actual"]
+                    state = ("判定不能" if checked.get("reason")
+                             else "成立" if checked["triggered"] else "監視中")
+                    actual = alerts_lib.format_actual(alert, checked["actual"])
                     if checked["triggered"]:
                         fired.append((alert, actual))
                 rows.append({

@@ -12,7 +12,7 @@ from lib import (alerts as alerts_lib, board_ui, charts, daily_decision, data_fe
                  information_board, moomoo_client, news_fetcher, sensitivity,
                  session_intelligence,
                  rules as rules_lib, settings_store, today_inputs,
-                 trade_summary, trading_context, ui)
+                 trade_summary, trade_visuals, trading_context, ui)
 
 # 表示ラベル → (取得期間, 表示日数)。SMA200を期間の先頭から描くため長めに取得する。
 PERIODS = {
@@ -121,15 +121,6 @@ EVENT_SOURCE_LABELS_JA = {
     "Yahoo Finance corporate actions": "Yahoo Finance 企業アクション",
     "Yahoo Finance": "Yahoo Finance",
     "SEC EDGAR": "米国証券取引委員会（SEC）",
-}
-
-TRADE_VERDICT_VIEW = {
-    "BUY": ("🟢", "買い候補", "green"),
-    "NEUTRAL": ("⚪", "新規エントリー見送り", "gray"),
-    "WAIT": ("🟠", "判定待機", "orange"),
-    "RISK_EXIT": ("🔴", "リスク退出候補", "red"),
-    "TAKE_PROFIT": ("🔵", "利益確定候補", "blue"),
-    "HOLD": ("⚪", "保有継続", "gray"),
 }
 
 TRADE_REGIME_LABELS = {
@@ -621,23 +612,26 @@ alert_checked_at = pd.Timestamp.now(tz="America/New_York")
 
 with summary_box:
     entry_col, holding_col = st.columns(2)
-    for column, heading, result_summary, evaluation in (
-        (entry_col, "未保有なら", entry_summary, entry_evaluation),
-        (holding_col, "ロング保有中なら", holding_summary, holding_evaluation),
+    for column, heading, position_mode, result_summary, evaluation in (
+        (entry_col, "未保有なら", "entry", entry_summary, entry_evaluation),
+        (holding_col, "ロング保有中なら", "holding", holding_summary, holding_evaluation),
     ):
         with column.container(border=True):
             code = result_summary["verdict"]["code"]
-            icon, label, color = TRADE_VERDICT_VIEW.get(
-                code, ("🟠", "判定待機", "orange"))
             blocking_actions = [
                 action for action in result_summary.get("action_priorities", [])
                 if action.get("blocking")]
-            if code == "BUY" and blocking_actions:
-                label, color = "買い候補（実行保留）", "orange"
-            st.caption(heading)
-            st.markdown(
-                ui.chip(f"{icon} {label}", color), unsafe_allow_html=True)
-            st.write(result_summary["verdict"]["reason"])
+            visual = trade_visuals.evaluation_visual({
+                "verdict": code,
+                "risk_plan": evaluation.get("risk_plan"),
+                "visual_blocked": bool(blocking_actions),
+            }, position_mode=position_mode)
+            st.markdown(f"**{heading}**")
+            getattr(st, visual["severity"])(
+                f"### {visual['icon']} {visual['action_label_ja']}\n\n"
+                f"**{visual['title_ja']}**\n\n{visual['description_ja']}"
+            )
+            st.caption("判定理由: " + str(result_summary["verdict"]["reason"]))
             if heading == "未保有なら":
                 st.caption("買い判定: " + verdict_score_text(evaluation, "buy"))
             else:
@@ -1910,6 +1904,10 @@ stock_board_report = information_board.build_information_board({
         **entry_evaluation,
         "evaluated_at": alert_checked_at,
         "source": f"保存ルール: {active_rule_name}（確定日足）",
+        "visual_blocked": any(
+            action.get("blocking")
+            for action in entry_summary.get("action_priorities", [])
+        ),
     },
     "holding_evaluation": {
         **holding_evaluation,

@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 
-from lib import ui
+from lib import trade_visuals, ui
 
 
 CATEGORY_COLORS = {
@@ -98,6 +98,51 @@ def _filter_items(items: list[dict], categories: list[str],
     return output
 
 
+def _trade_overview_rows(items: list[dict]) -> list[dict]:
+    """掲示板項目から、正規のentry/holding判定だけを状況順に取り出す。"""
+    selected = {}
+    for item in items:
+        if item.get("category") != "trade":
+            continue
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        mode = data.get("position_mode")
+        if mode not in {"entry", "holding"}:
+            continue
+        expected_kind = f"{mode}_verdict"
+        if item.get("kind") != expected_kind or mode in selected:
+            continue
+        visual = trade_visuals.evaluation_visual(data, position_mode=mode)
+        selected[mode] = {
+            "mode": mode,
+            "heading_ja": "未保有なら" if mode == "entry" else "ロング保有中なら",
+            "visual": visual,
+            "summary_ja": item.get("summary_ja"),
+        }
+    return [selected[mode] for mode in ("entry", "holding") if mode in selected]
+
+
+def _render_trade_overview(items: list[dict]) -> None:
+    rows = _trade_overview_rows(items)
+    if not rows:
+        return
+    st.markdown("### 🎯 売買判定の要点")
+    st.caption("保有状況によって行動が異なるため、未保有時とロング保有中を分けています。")
+    columns = st.columns(len(rows))
+    for column, row in zip(columns, rows):
+        visual = row["visual"]
+        with column:
+            st.markdown(f"**{row['heading_ja']}**")
+            getattr(st, visual["severity"])(
+                f"### {visual['icon']} {visual['action_label_ja']}\n\n"
+                f"**{visual['title_ja']}**\n\n{visual['description_ja']}"
+            )
+            if row.get("summary_ja"):
+                st.caption("判定根拠: " + str(row["summary_ja"]))
+    if any(row["visual"]["is_sell"] for row in rows):
+        st.caption("🔎 「売却候補」は保有株の手仕舞いです。新規空売りの判定ではありません。")
+    st.divider()
+
+
 def render_information_board(report: dict, *, show_heading: bool = True,
                              key_prefix: str = "information_board") -> None:
     """正規化済みreportを、投稿機能のない一覧として描画する。"""
@@ -115,6 +160,9 @@ def render_information_board(report: dict, *, show_heading: bool = True,
         with st.expander(f"⚠️ 取得・整理上の注意 {len(warnings)}件"):
             for warning in warnings:
                 st.warning(warning)
+
+    # フィルターに関係なく、最重要の売買判定を常に上部へ固定表示する。
+    _render_trade_overview(items)
 
     high_items = [item for item in items
                   if item.get("importance") in {"critical", "high"}]

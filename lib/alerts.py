@@ -40,6 +40,16 @@ KINDS = {
                   "needs_value": False},
 }
 
+RULE_ACTUAL_LABELS = {
+    "BUY": "新規買い候補（BUY）",
+    "NEUTRAL": "新規買い見送り（NEUTRAL）",
+    "WAIT": "判定待機（WAIT）",
+    "RISK_EXIT": "保有株の売却候補・リスク退出（RISK_EXIT）",
+    "TAKE_PROFIT": "保有株の売却候補・利益確定（TAKE_PROFIT）",
+    "HOLD": "保有継続（HOLD）",
+    "SELL": "保有株の手仕舞い・旧形式（SELL）",
+}
+
 
 def new_alert(ticker: str, kind: str, value: float | None = None,
               note: str = "") -> dict:
@@ -162,6 +172,14 @@ def describe(alert: dict) -> str:
     val = alert.get("value")
     shown = f"{unit}{val:,.2f}" if unit == "$" else f"{val:,.2f}{unit}"
     return f"{alert['ticker']}: {label} {shown}"
+
+
+def format_actual(alert: dict, actual: object) -> str:
+    """アラートの実測値を、空売りと誤認しない日本語表示へ変換する。"""
+    text = "—" if actual is None or actual == "" else str(actual)
+    if str(alert.get("kind") or "").startswith("rule_"):
+        return RULE_ACTUAL_LABELS.get(text.upper(), text)
+    return text
 
 
 # --------------------------------------------------------------- 永続化

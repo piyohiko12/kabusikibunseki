@@ -508,7 +508,19 @@ def _build_rule_item(
     if verdict not in _VERDICT_LABELS:
         warnings.append(f"{label}判定コードを確認できないため表示しませんでした。")
         return None
+    valid_verdicts = (
+        {"BUY", "NEUTRAL", "WAIT"} if mode == "entry"
+        else {"RISK_EXIT", "TAKE_PROFIT", "HOLD", "WAIT"}
+    )
+    if verdict not in valid_verdicts:
+        warnings.append(
+            f"{label}判定と判定コードの組み合わせが不正なため表示しませんでした。")
+        return None
     score_data, score_parts = _score_data(evaluation, mode)
+    risk_plan = _mapping(evaluation.get("risk_plan"))
+    blocked = bool(evaluation.get("visual_blocked") is True)
+    if verdict == "BUY" and risk_plan.get("valid") is False:
+        blocked = True
     supplied_summary = _one_line(evaluation.get("summary"), 1_000)
     parts = ([supplied_summary] if supplied_summary else []) + score_parts
     occurred_at = (
@@ -529,6 +541,7 @@ def _build_rule_item(
             "position_mode": mode,
             "verdict": verdict,
             "verdict_label_ja": _VERDICT_LABELS[verdict],
+            "blocked": blocked,
             **score_data,
         },
         "identity_key": f"trade|{ticker or ''}|{mode}|{_timestamp(occurred_at) or ''}",

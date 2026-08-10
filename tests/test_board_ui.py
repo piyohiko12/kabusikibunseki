@@ -38,6 +38,52 @@ class InformationBoardUiTests(unittest.TestCase):
         items.sort(key=lambda item: board_ui._item_sort_key(item, "importance"))
         self.assertEqual([item["id"] for item in items], ["a", "b"])
 
+    def test_trade_overview_keeps_entry_and_holding_actions_visible(self):
+        items = [
+            {
+                "category": "trade", "kind": "holding_verdict",
+                "summary_ja": "損失管理条件が成立",
+                "data": {"position_mode": "holding", "verdict": "RISK_EXIT"},
+            },
+            {
+                "category": "trade", "kind": "entry_verdict",
+                "summary_ja": "買い条件が成立",
+                "data": {"position_mode": "entry", "verdict": "BUY"},
+            },
+        ]
+        rows = board_ui._trade_overview_rows(items)
+        self.assertEqual([row["mode"] for row in rows], ["entry", "holding"])
+        self.assertEqual(rows[0]["heading_ja"], "未保有なら")
+        self.assertIn("買い", rows[0]["visual"]["action_label_ja"])
+        self.assertEqual(rows[1]["heading_ja"], "ロング保有中なら")
+        self.assertIn("売却", rows[1]["visual"]["action_label_ja"])
+        self.assertIn("新規の空売り", rows[1]["visual"]["description_ja"])
+
+    def test_trade_overview_ignores_trade_words_in_news_or_analyst_items(self):
+        items = [
+            {
+                "category": "news", "kind": "entry_verdict",
+                "data": {"position_mode": "entry", "verdict": "BUY"},
+            },
+            {
+                "category": "analyst", "kind": "holding_verdict",
+                "data": {"position_mode": "holding", "verdict": "RISK_EXIT"},
+            },
+        ]
+        self.assertEqual(board_ui._trade_overview_rows(items), [])
+
+    def test_trade_overview_safely_rejects_mode_verdict_mismatch(self):
+        rows = board_ui._trade_overview_rows([{
+            "category": "trade", "kind": "entry_verdict",
+            "data": {"position_mode": "entry", "verdict": "RISK_EXIT"},
+        }])
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["visual"]["available"])
+        self.assertEqual(
+            rows[0]["visual"]["action_label_ja"],
+            "【判定不能】売買せず待機",
+        )
+
     def test_ui_has_no_posting_storage_or_market_api(self):
         source = inspect.getsource(board_ui)
         for forbidden in (

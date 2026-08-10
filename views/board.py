@@ -138,6 +138,10 @@ with st.spinner(f"{ticker}の情報を整理中..."):
         **entry_evaluation,
         "evaluated_at": board_checked_at,
         "source": f"保存ルール: {active_rule_name}（確定日足）",
+        "visual_blocked": (
+            entry_evaluation.get("verdict") == "BUY"
+            and (entry_evaluation.get("risk_plan") or {}).get("valid") is False
+        ),
     }
     board_holding_evaluation = {
         **holding_evaluation,
