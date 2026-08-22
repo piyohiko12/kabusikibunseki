@@ -21,13 +21,13 @@ REGIME_LABELS = {
     "HIGH_VOL": "高ボラティリティ",
 }
 SIDE_SPECS = (
-    ("buy", "🟢 新規ロング条件"),
-    ("take_profit", "🔵 利益確定条件"),
-    ("risk_exit", "🔴 リスク退出条件"),
+    ("buy", "🟢 買う条件"),
+    ("take_profit", "🔵 利益を確定して売る条件"),
+    ("risk_exit", "🔴 損失を抑えて売る条件"),
 )
 POSITION_MODES = {
-    "未保有（新規買いを判定）": "entry",
-    "ロング保有中（売却・継続を判定）": "holding",
+    "株を持っていない（買うかを確認）": "entry",
+    "株を持っている（売るか・持つかを確認）": "holding",
 }
 REFRESH_CHOICES = {
     "自動更新しない": 0,
@@ -125,17 +125,20 @@ def _verdict_banner(result: dict, ticker: str, rule_name: str,
                     position_mode: str):
     visual = trade_visuals.evaluation_visual(
         result, position_mode=position_mode)
-    situation = "未保有" if position_mode == "entry" else "ロング保有中"
+    situation = ("株を持っていない場合" if position_mode == "entry"
+                 else "株を持っている場合")
     body = (
         f"### {visual['icon']} {ticker}｜{situation} → "
         f"{visual['action_label_ja']}\n\n"
-        f"**{visual['title_ja']}**\n\n{visual['description_ja']}"
+        f"{visual['description_ja']}"
     )
     getattr(st, visual["severity"])(body)
-    st.caption(
-        f"ルール「{rule_name}」・{REGIME_LABELS.get(result.get('regime'), result.get('regime'))}。"
-        f"{result.get('summary', '')} この画面は注文を出しません。"
-    )
+    with st.expander("判定の理由を見る"):
+        st.write(result.get("summary") or "詳しい理由を確認できませんでした。")
+        st.caption(
+            f"使用ルール: {rule_name} ／ 相場の状態: "
+            f"{REGIME_LABELS.get(result.get('regime'), result.get('regime'))}。"
+            "この画面から注文は出ません。")
 
 
 def _data_source_panel(ctx: dict):
@@ -164,7 +167,7 @@ def _data_source_panel(ctx: dict):
 
 
 def _gate_table(gates: list[dict]):
-    st.markdown("#### 判定前の安全ゲート")
+    st.markdown("#### 売買前の確認項目")
     rows = []
     for gate in gates:
         passed = gate.get("passed")
@@ -216,20 +219,22 @@ def _side_table(side: dict, title: str):
 
 
 def _risk_plan(plan: dict):
-    st.markdown("#### ATR・支持抵抗による参考リスク計画")
+    st.markdown("#### 損切り・利益確定価格の目安")
     if not plan.get("valid"):
-        st.warning("ATRまたは支持抵抗が不足し、参考価格を計算できません。")
+        st.warning("値動きまたは支持・抵抗の情報が足りず、参考価格を計算できません。")
         return
     entry, stop, target = plan["entry"], plan["stop"], plan["target"]
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("判定終値", f"{entry:,.2f}", border=True)
-    c2.metric("参考ストップ", f"{stop:,.2f}",
+    c1.metric("判定に使った株価", f"{entry:,.2f}", border=True)
+    c2.metric("損切りの目安", f"{stop:,.2f}",
               f"{(stop / entry - 1) * 100:.2f}%", delta_color="inverse", border=True)
-    c3.metric("参考目標", f"{target:,.2f}",
+    c3.metric("利益確定の目安", f"{target:,.2f}",
               f"+{(target / entry - 1) * 100:.2f}%", border=True)
-    c4.metric("R:R", f"{plan['rr']:.2f}倍", border=True)
-    st.caption(f"ストップ根拠: {plan.get('stop_source')} / "
-               f"目標根拠: {plan.get('target_source')}。発注価格ではありません。")
+    c4.metric("想定損失と利益の比率", f"{plan['rr']:.2f}倍", border=True)
+    with st.expander("計算方法を見る"):
+        st.caption(f"損切りの根拠: {plan.get('stop_source')} / "
+                   f"利益確定の根拠: {plan.get('target_source')}。"
+                   "値動きの大きさ（ATR）と支持・抵抗を使った参考値で、発注価格ではありません。")
 
 
 def _verdict_label(evaluation: dict, position_mode: str = "entry") -> str:
@@ -239,8 +244,8 @@ def _verdict_label(evaluation: dict, position_mode: str = "entry") -> str:
 
 
 st.title("🎯 売買判定・検証・アラート")
-st.caption("確定日足と必須ゲートを使い、新規ロングと保有中の退出を分けて判定します。"
-           "**空売り判定や注文実行は行いません。**")
+st.caption("確定した日足を使い、「新しく買う」と「保有株を売る・持ち続ける」を"
+           "分けて確認します。**空売りの判定や注文は行いません。**")
 
 store = rules_lib.load()
 rule_names = list(store["rules"])
@@ -276,12 +281,13 @@ with tab_judge:
                 ctx["df"], rule, ctx["levels"], position_mode=position_mode,
                 external_gates=gates)
             _verdict_banner(result, ticker, active, position_mode)
-            _data_source_panel(ctx)
+            with st.expander("使ったデータの詳細を見る"):
+                _data_source_panel(ctx)
 
             confirmed = float(ctx["df"]["Close"].iloc[-1])
             previous = float(ctx["df"]["Close"].iloc[-2]) if len(ctx["df"]) > 1 else confirmed
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("判定価格（確定終値）", f"{confirmed:,.2f}",
+            c1.metric("判定に使った株価", f"{confirmed:,.2f}",
                       f"{(confirmed / previous - 1) * 100:+.2f}%", border=True)
             is_realtime = (ctx["snapshot"].get("source") == "moomoo OpenAPI"
                            and ctx["snapshot"].get("price") is not None)
@@ -289,41 +295,42 @@ with tab_judge:
                       f"{ctx['price']:,.2f}",
                       f"{(ctx['price'] / ctx['previous_close'] - 1) * 100:+.2f}%"
                       if ctx["previous_close"] else None, border=True)
-            c3.metric("相場レジーム", REGIME_LABELS.get(result["regime"], result["regime"]),
+            c3.metric("相場の状態", REGIME_LABELS.get(result["regime"], result["regime"]),
                       border=True)
             if position_mode == "entry":
-                shown_side, score_label = result["buy"], "新規買いスコア"
+                shown_side, score_label = result["buy"], "買う条件の点数"
             elif result["verdict"] == "TAKE_PROFIT":
-                shown_side, score_label = result["take_profit"], "利益確定スコア"
+                shown_side, score_label = result["take_profit"], "利益を確定する条件の点数"
             else:
-                shown_side, score_label = result["risk_exit"], "リスク退出スコア"
+                shown_side, score_label = result["risk_exit"], "損失を抑えて売る条件の点数"
             c4.metric(score_label, f"{_score(shown_side['score'])} / {_score(shown_side['total'])}",
                       f"合格 {_score(shown_side['threshold'])}点", delta_color="off", border=True)
 
-            _gate_table(result["gates"])
-            if position_mode == "entry":
-                _side_table(result["buy"], "🟢 新規ロング")
-            else:
-                col_exit, col_profit = st.columns(2)
-                with col_exit:
-                    _side_table(result["risk_exit"], "🔴 リスク退出（優先）")
-                with col_profit:
-                    _side_table(result["take_profit"], "🔵 利益確定")
+            with st.expander("判定条件の内訳を見る"):
+                _gate_table(result["gates"])
+                if position_mode == "entry":
+                    _side_table(result["buy"], "🟢 買う条件")
+                else:
+                    col_exit, col_profit = st.columns(2)
+                    with col_exit:
+                        _side_table(result["risk_exit"], "🔴 損失を抑えて売る条件（優先）")
+                    with col_profit:
+                        _side_table(result["take_profit"], "🔵 利益を確定して売る条件")
             _risk_plan(result["risk_plan"])
 
             st.divider()
-            st.markdown("#### ウォッチリストを一括判定")
-            st.caption("一括判定は、未取得銘柄のmoomoo過去K線枠を新しく消費しません。"
+            st.markdown("#### ウォッチリストの買い候補をまとめて確認")
+            st.caption("まとめて確認しても、未取得銘柄のmoomoo過去K線枠は新しく消費しません。"
                        "キャッシュまたはYahoo Financeを使います。")
             watchlist = watchlist_store.load()
             if not watchlist:
                 st.caption("ウォッチリストが空です。「市場概況」ページで登録できます。")
-            elif st.button("新規ロング候補を一括判定", key="judge_watchlist"):
+            elif st.button("買い候補をまとめて確認", key="judge_watchlist"):
                 rows = []
                 for symbol in watchlist:
                     item = _context(symbol, allow_new_quota=False, include_events=True)
                     if item is None:
-                        rows.append({"銘柄": symbol, "判定": "取得失敗", "スコア": None,
+                        rows.append({"銘柄": symbol, "判定": "取得失敗", "買う条件の点数": None,
                                      "確定終値": None, "取得元": None})
                         continue
                     evaluated = rules_lib.evaluate(
@@ -332,7 +339,7 @@ with tab_judge:
                     rows.append({
                         "銘柄": symbol,
                         "判定": _verdict_label(evaluated),
-                        "スコア": evaluated["buy"]["score"],
+                        "買う条件の点数": evaluated["buy"]["score"],
                         "確定終値": float(item["df"]["Close"].iloc[-1]),
                         "取得元": item["source_meta"].get("source"),
                     })
@@ -341,8 +348,8 @@ with tab_judge:
 
 # ====================================================== 判定基準の設定タブ
 with tab_rules:
-    st.caption("必須条件、相場レジーム、相関グループ上限、安全ゲート、ATRリスク幅を"
-               "詳細に設定できます。既定値は暫定仮説で、検証結果による確認が必要です。")
+    st.caption("買う・売る条件を詳しく設定できます。専門項目には従来の名称も併記しています。"
+               "既定値は暫定的な目安なので、時系列検証で確認してください。")
     c_select, c_new = st.columns([2, 1])
     edit_name = c_select.selectbox("編集するルール", rule_names, key="edit_rule")
     with c_new.popover("➕ 新規作成", use_container_width=True):
@@ -369,9 +376,9 @@ with tab_rules:
         "buy": {}, "take_profit": {}, "risk_exit": {},
     }
 
-    st.markdown("#### 1. 相場状態と安全ゲート")
+    st.markdown("#### 1. 相場の状態と売買前の確認項目")
     edited["allowed_regimes"] = st.multiselect(
-        "新規ロングを許可する相場レジーム",
+        "買い判定を使う相場の状態",
         list(rules_lib.REGIMES),
         default=[item for item in original.get("allowed_regimes", [])
                  if item in rules_lib.REGIMES],
@@ -406,20 +413,20 @@ with tab_rules:
             int((original.get("group_caps") or {}).get(group, 25)), 5,
             key=f"cap_{edit_name}_{group}"))
 
-    st.markdown("#### 3. ATRリスク設定")
+    st.markdown("#### 3. 損切り・利益確定の幅（ATR）")
     saved_risk = original.get("risk") or {}
     r1, r2, r3, r4 = st.columns(4)
     edited["risk"] = {
         "support_buffer_atr": float(r1.number_input(
-            "支持帯の外側(ATR)", 0.0, 5.0,
+            "支持帯の外側へ置く幅（ATR）", 0.0, 5.0,
             float(saved_risk.get("support_buffer_atr", 0.5)), 0.1,
             key=f"support_buffer_{edit_name}")),
         "fallback_stop_atr": float(r2.number_input(
-            "代替ストップ(ATR)", 0.1, 10.0,
+            "支持帯がない時の損切り幅（ATR）", 0.1, 10.0,
             float(saved_risk.get("fallback_stop_atr", 1.5)), 0.1,
             key=f"stop_atr_{edit_name}")),
         "fallback_target_atr": float(r3.number_input(
-            "代替目標(ATR)", 0.1, 20.0,
+            "抵抗帯がない時の利益確定幅（ATR）", 0.1, 20.0,
             float(saved_risk.get("fallback_target_atr", 2.0)), 0.1,
             key=f"target_atr_{edit_name}")),
         "min_level_strength": int(r4.number_input(
@@ -660,6 +667,11 @@ with tab_alerts:
                     item["df"], active_rule, item["levels"], position_mode="holding",
                     external_gates=gates)
                 item["entry_verdict"] = entry["verdict"]
+                item["entry_blocked"] = (
+                    entry.get("verdict") == "BUY"
+                    and not trade_visuals.evaluation_visual(
+                        entry, position_mode="entry")["is_actionable"]
+                )
                 item["holding_verdict"] = holding["verdict"]
                 contexts[symbol] = item
 
@@ -714,5 +726,5 @@ with tab_alerts:
                 st.rerun()
 
 st.divider()
-st.caption("判定、参考ストップ、検証、アラートはいずれも参考情報です。"
+st.caption("判定、損切りの目安、検証、アラートはいずれも参考情報です。"
            "既定条件も利益を保証せず、売買の実行は行いません。")

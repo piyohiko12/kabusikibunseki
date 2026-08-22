@@ -53,11 +53,11 @@ class InformationBoardUiTests(unittest.TestCase):
         ]
         rows = board_ui._trade_overview_rows(items)
         self.assertEqual([row["mode"] for row in rows], ["entry", "holding"])
-        self.assertEqual(rows[0]["heading_ja"], "未保有なら")
+        self.assertEqual(rows[0]["heading_ja"], "株を持っていない場合")
         self.assertIn("買い", rows[0]["visual"]["action_label_ja"])
-        self.assertEqual(rows[1]["heading_ja"], "ロング保有中なら")
-        self.assertIn("売却", rows[1]["visual"]["action_label_ja"])
-        self.assertIn("新規の空売り", rows[1]["visual"]["description_ja"])
+        self.assertEqual(rows[1]["heading_ja"], "株を持っている場合")
+        self.assertIn("保有株を売る", rows[1]["visual"]["action_label_ja"])
+        self.assertIn("新しい空売り", rows[1]["visual"]["description_ja"])
 
     def test_trade_overview_ignores_trade_words_in_news_or_analyst_items(self):
         items = [
@@ -81,8 +81,15 @@ class InformationBoardUiTests(unittest.TestCase):
         self.assertFalse(rows[0]["visual"]["available"])
         self.assertEqual(
             rows[0]["visual"]["action_label_ja"],
-            "【判定不能】売買せず待機",
+            "判断できません",
         )
+
+    def test_trade_cards_are_not_duplicated_in_the_general_list(self):
+        source = inspect.getsource(board_ui.render_information_board)
+        self.assertIn('item.get("category") != "trade"', source)
+        self.assertIn("売買の目安以外に表示できる情報はありません", source)
+        self.assertNotIn("visual['title_ja']", inspect.getsource(
+            board_ui._render_trade_overview))
 
     def test_ui_has_no_posting_storage_or_market_api(self):
         source = inspect.getsource(board_ui)
@@ -97,6 +104,9 @@ class InformationBoardUiTests(unittest.TestCase):
         page = (Path(__file__).resolve().parents[1] / "views" / "board.py").read_text(
             encoding="utf-8")
         self.assertIn('fetch_history(ticker, "2y", "1d")', page)
+        self.assertIn("trade_summary.build_trade_summary", page)
+        self.assertIn('action.get("blocking") is True', page)
+        self.assertIn('"entry_blocked": board_entry_blocked', page)
         for forbidden in (
             "fetch_chart_history", "alerts_lib.save", "alerts_lib.new_alert",
             "settings_store.save", "place_order", "sqlite3",

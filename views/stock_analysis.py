@@ -10,6 +10,7 @@ from lib import (alerts as alerts_lib, board_ui, charts, daily_decision, data_fe
                  derivatives_context,
                  event_intelligence, indicators, level_review, levels,
                  information_board, moomoo_client, news_fetcher, sensitivity,
+                 realtime_signal,
                  session_intelligence,
                  rules as rules_lib, settings_store, today_inputs,
                  trade_summary, trade_visuals, trading_context, ui)
@@ -75,6 +76,144 @@ CHART_PRESETS = {
         "oscillators": ["出来高", "RSI"],
     },
 }
+
+REALTIME_REFRESH_SECONDS = (5, 10, 30)
+REALTIME_POSITION_MODES = {
+    "これから買う": "entry",
+    "すでに保有中": "holding",
+}
+
+
+def fetch_realtime_klines_for_ui(ticker: str, session_code: str) -> dict:
+    """表示中の1銘柄とSPYの当日足を取得する薄いUIアダプター。
+
+    OpenAPI層の公開名や返却形式に関する知識をここだけに閉じ込める。失敗を
+    Yahooデータで埋めず、呼び出し側が安全に「判定不能」と表示できる形で返す。
+    """
+    loader = getattr(data_fetcher, "fetch_current_klines", None)
+    if not callable(loader):
+        return {
+            "bars": pd.DataFrame(), "benchmark_bars": pd.DataFrame(),
+            "meta": {"available": False, "uses_history_quota": False},
+            "error": "リアルタイム足の取得機能を準備中です",
+        }
+    # 画面の正式名とOpenAPIアダプターの短い引数名の差をここだけで吸収する。
+    api_session = {
+        "premarket": "pre",
+        "afterhours": "after",
+    }.get(str(session_code or "").strip().lower(), session_code)
+    try:
+        payload = loader((ticker,), num=120, session=api_session)
+    except Exception as exc:
+        return {
+            "bars": pd.DataFrame(), "benchmark_bars": pd.DataFrame(),
+            "meta": {"available": False, "uses_history_quota": False},
+            "error": f"リアルタイム足を取得できませんでした（{type(exc).__name__}）",
+        }
+    if not isinstance(payload, dict):
+        payload = {}
+    frames = payload.get("frames") if isinstance(payload.get("frames"), dict) else {}
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+
+    def frame_for(symbol: str) -> pd.DataFrame:
+        expected = symbol.strip().upper()
+        for key, value in frames.items():
+            normalized = str(key or "").strip().upper().split(".", 1)[-1]
+            if normalized == expected and isinstance(value, pd.DataFrame):
+                return value
+        return pd.DataFrame()
+
+    bars = frame_for(ticker)
+    benchmark = frame_for("SPY")
+    error = None
+    expected_session = str(api_session or "").strip().lower()
+    received_session = str(meta.get("session") or "").strip().lower()
+    source = str(meta.get("source") or "")
+    if meta.get("uses_history_quota") is not False:
+        error = "過去K線枠を使う取得結果はリアルタイム判定に使用しません"
+    elif (meta.get("available") is not True
+          or meta.get("partial") is not False):
+        details = meta.get("errors")
+        error = "対象銘柄とSPYのリアルタイム足を完全には受信できません"
+        if details:
+            error += f"（{details}）"
+    elif not received_session or received_session != expected_session:
+        error = "現在の取引セッションに対応する1分足か確認できません"
+    elif "moomoo" not in source.lower():
+        error = "moomooのリアルタイム1分足か確認できません"
+    elif bars.empty or benchmark.empty:
+        error = "対象銘柄またはSPYのセッション別1分足が不足しています"
+    return {
+        "bars": bars, "benchmark_bars": benchmark,
+        "meta": meta, "error": error,
+    }
+
+
+def realtime_action_visual(result: dict) -> dict:
+    """エンジンの状態を、色だけに頼らない初心者向け表示へそろえる。"""
+    action = result.get("action") if isinstance(result.get("action"), dict) else {}
+    state = str(result.get("state") or result.get("status") or "DATA_WAIT").upper()
+    defaults = {
+        "BUY_READY": ("🟢", "買いを検討", "success"),
+        "BUY_SETUP": ("🟡", "買い条件あり・今は待つ", "warning"),
+        "RISK_EXIT": ("🔴", "保有株を売る候補（損失を抑える）", "error"),
+        "TAKE_PROFIT": ("🔵", "保有株を売る候補（利益を確定）", "info"),
+        "HOLD": ("🟢", "保有を続けて監視", "info"),
+        "NEUTRAL": ("⚪", "今は売買しない", "info"),
+        "WAIT": ("🟡", "今は待つ", "warning"),
+        "DATA_WAIT": ("⚫", "判断できない", "warning"),
+    }
+    icon, label, severity = defaults.get(state, defaults["DATA_WAIT"])
+    description = (action.get("description_ja")
+                   or result.get("reason_ja")
+                   or "必要な情報がそろうまで売買せずに待ちます。")
+    nonactionable_exit = (
+        state in {"RISK_EXIT", "TAKE_PROFIT"}
+        and result.get("actionable") is not True
+    )
+    if nonactionable_exit:
+        icon, label, severity = (
+            "🟡", "価格目安に到達（今は取引できません）", "warning")
+        blocked = next((
+            row for row in result.get("gates") or []
+            if isinstance(row, dict)
+            and row.get("key") in {"session", "suspension", "quote_freshness"}
+            and row.get("passed") is not True
+        ), None)
+        if blocked:
+            description = (
+                f"{blocked.get('reason_ja') or '取引可否を確認できません'}。"
+                f"{description}")
+    if not nonactionable_exit:
+        tone = str(action.get("tone") or "").lower()
+        severity = {
+            "positive": "success", "success": "success", "buy": "success",
+            "negative": "error", "danger": "error", "error": "error",
+            "warning": "warning", "caution": "warning", "info": "info",
+            "neutral": "info",
+        }.get(tone, severity)
+    return {
+        "icon": icon,
+        # 主見出しは内部の専門語より、固定した初心者向けの行動語を優先する。
+        "label_ja": label,
+        "description_ja": description,
+        "severity": severity,
+    }
+
+
+def realtime_gate_summary(gates) -> tuple[str, list[str]]:
+    """安全ゲートを短い件数と、利用者が直せる未確認理由へまとめる。"""
+    rows = [row for row in (gates or []) if isinstance(row, dict)]
+    passed = [row for row in rows if row.get("passed") is True]
+    blocked = [row for row in rows if row.get("passed") is not True]
+    reasons = []
+    for row in blocked:
+        label = row.get("label_ja") or row.get("label") or "安全項目"
+        detail = row.get("reason_ja") or row.get("reason") or "確認が必要です"
+        reasons.append(f"{label}: {detail}")
+    if not rows:
+        return "安全情報を確認できません", ["売買前の安全情報がありません"]
+    return f"{len(passed)} / {len(rows)}項目を確認", reasons
 
 
 def md_escape(text: str) -> str:
@@ -289,6 +428,307 @@ def fetch_opening_market_features() -> dict:
     return result
 
 
+def render_realtime_timing_card(ticker: str) -> None:
+    """日足履歴と独立して、現在1分足の売買タイミングカードを描画する。"""
+    # 明示的にONにした間だけ現在1分足を購読し、このカードだけを部分更新する。
+    realtime_monitor_key = f"realtime_monitor_{ticker}"
+    realtime_mode_key = f"realtime_position_mode_{ticker}"
+    realtime_interval_key = f"realtime_refresh_seconds_{ticker}"
+    if realtime_monitor_key not in st.session_state:
+        st.session_state[realtime_monitor_key] = False
+    if realtime_interval_key not in st.session_state:
+        st.session_state[realtime_interval_key] = 5
+
+    with st.container(border=True):
+        st.markdown("### ⚡ リアルタイム売買タイミング")
+        st.caption(
+            "確定1分足の短期条件、今の値動き、売買前の安全確認を順番に見ます。"
+            "短い値動きだけで売買を決めません。")
+        realtime_controls = st.columns([1.45, 1, 1.25])
+        with realtime_controls[0]:
+            realtime_mode_label = st.radio(
+                "現在の状況",
+                list(REALTIME_POSITION_MODES),
+                horizontal=True,
+                key=realtime_mode_key,
+            )
+        with realtime_controls[1]:
+            realtime_refresh_seconds = st.selectbox(
+                "更新間隔",
+                REALTIME_REFRESH_SECONDS,
+                format_func=lambda seconds: f"{seconds}秒ごと",
+                key=realtime_interval_key,
+                help="表示中の銘柄だけを部分更新します。",
+            )
+        with realtime_controls[2]:
+            st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+            realtime_monitoring = st.toggle(
+                "リアルタイム監視（ONで開始 / OFFで停止）",
+                key=realtime_monitor_key,
+                help="既定はOFFです。ONの間だけmoomooの当日足と最新価格を確認します。",
+            )
+            st.caption("⏸ 監視中" if realtime_monitoring else "▶ 停止中")
+
+        realtime_mode = REALTIME_POSITION_MODES.get(realtime_mode_label, "entry")
+        holding_entry_value = holding_stop_value = holding_target_value = None
+        if realtime_mode == "holding":
+            st.info("ここでの『売却候補』は、すでに保有している株の売却だけを意味します。"
+                    "新しい空売りではありません。")
+            holding_entry_key = f"realtime_holding_entry_{ticker}"
+            holding_stop_key = f"realtime_holding_stop_{ticker}"
+            holding_target_key = f"realtime_holding_target_{ticker}"
+            for key in (holding_entry_key, holding_stop_key, holding_target_key):
+                if key not in st.session_state:
+                    st.session_state[key] = 0.0
+            holding_inputs = st.columns(3)
+            holding_entry_value = holding_inputs[0].number_input(
+                "取得価格（任意）", min_value=0.0, step=0.50,
+                key=holding_entry_key,
+                help="0のままでも監視できます。価格関係の確認にだけ使います。") or None
+            holding_stop_value = holding_inputs[1].number_input(
+                "監視する損切り価格", min_value=0.0, step=0.50,
+                key=holding_stop_key,
+                help="未設定は0。損失を抑える売却候補を出すには入力してください。") or None
+            holding_target_value = holding_inputs[2].number_input(
+                "監視する利益確定価格", min_value=0.0, step=0.50,
+                key=holding_target_key,
+                help="未設定は0。利益確定の売却候補を出すには入力してください。") or None
+            st.caption("入力値はこのブラウザー内の判定だけに使い、注文や口座情報には接続しません。")
+
+        realtime_memories = st.session_state.setdefault("realtime_signal_memories", {})
+        if not realtime_monitoring:
+            # 停止後の古い連続成立を、再開時に引き継がない。
+            for memory_key in list(realtime_memories):
+                if (isinstance(memory_key, tuple) and memory_key
+                        and memory_key[0] == ticker):
+                    realtime_memories.pop(memory_key, None)
+            active_identity = st.session_state.get("realtime_signal_active_identity")
+            if (isinstance(active_identity, tuple) and active_identity
+                    and active_identity[0] == ticker):
+                st.session_state.pop("realtime_signal_active_identity", None)
+
+        @st.fragment(run_every=(realtime_refresh_seconds
+                                if realtime_monitoring else None))
+        def render_realtime_timing_panel():
+            """最新データの取得・判定・表示を、このカード内だけで更新する。"""
+            if not realtime_monitoring:
+                st.info("監視は停止中です。必要なときに上の『リアルタイム監視』をONにしてください。")
+                st.caption("停止中はリアルタイム足を取得せず、連続成立回数もリセットします。")
+                return
+
+            def reset_ticker_memory() -> None:
+                for key in list(realtime_memories):
+                    if isinstance(key, tuple) and key and key[0] == ticker:
+                        realtime_memories.pop(key, None)
+
+            now_utc = pd.Timestamp.now(tz="UTC")
+            try:
+                live_snapshot = data_fetcher.fetch_realtime_snapshot(ticker)
+            except Exception as exc:
+                reset_ticker_memory()
+                st.warning(f"### ⚫ 判断できない\n\n最新価格を受信できませんでした（{type(exc).__name__}）。")
+                return
+
+            if live_snapshot.get("source") != "moomoo OpenAPI":
+                reset_ticker_memory()
+                st.warning("### ⚫ 判断できない\n\nmoomooの最新価格を確認できません。"
+                           "Yahoo Financeの代替値はリアルタイム判定に使用しません。")
+                reason = live_snapshot.get("fallback_reason")
+                if reason:
+                    st.caption(f"取得状態: {reason}")
+                return
+
+            live_eligibility = today_inputs.overnight_eligibility(live_snapshot)
+            try:
+                live_market_state = data_fetcher.fetch_market_state(ticker)
+            except Exception:
+                live_market_state = {}
+            live_session = session_intelligence.detect_current_session(
+                now=now_utc,
+                market_state=live_market_state.get("market_state"),
+                overnight_eligible=live_eligibility,
+            )
+            calendar_session = session_intelligence.detect_current_session(
+                now=now_utc,
+                market_state=None,
+                overnight_eligible=live_eligibility,
+            )
+            live_session = {
+                **live_session,
+                "calendar_session": calendar_session.get("session"),
+                "calendar_reason": calendar_session.get("reason"),
+            }
+            live_session_code = str(live_session.get("session") or "unknown")
+            identity = (ticker, realtime_mode, live_session_code)
+            previous_identity = st.session_state.get("realtime_signal_active_identity")
+            if previous_identity != identity:
+                # 銘柄・保有状況・セッションが変わったら確認回数をゼロから始める。
+                realtime_memories.pop(identity, None)
+                st.session_state["realtime_signal_active_identity"] = identity
+
+            if live_session_code not in session_intelligence.SESSION_NAMES:
+                realtime_memories.pop(identity, None)
+                label = SUMMARY_SESSION_LABELS.get(live_session_code, "取引可否を確認")
+                st.warning(f"### ⚫ 判断できない\n\n現在は{label}です。取引可能なセッションで再確認してください。")
+                st.caption(f"判定時刻: {fmt_et_jst(live_session.get('as_of'))}")
+                return
+
+            # 買い・保有中のどちらも、現在セッションの確定1分足とSPYを同じ条件で使う。
+            # 日足や別カードの購入プランは、このリアルタイム判定へ渡さない。
+            live_klines = fetch_realtime_klines_for_ui(ticker, live_session_code)
+            live_meta = live_klines.get("meta") or {}
+            live_source = str(live_meta.get("source") or "")
+            if live_klines.get("error"):
+                realtime_memories.pop(identity, None)
+                st.warning(f"### ⚫ 判断できない\n\n{live_klines['error']}。売買せずに待ちます。")
+                return
+            if "moomoo" not in live_source.lower():
+                realtime_memories.pop(identity, None)
+                st.warning("### ⚫ 判断できない\n\nmoomoo以外の代替足は、"
+                           "リアルタイム売買タイミングに使用しません。")
+                return
+
+            decision_quotes = (live_meta.get("decision_quotes")
+                               if isinstance(live_meta.get("decision_quotes"), dict)
+                               else {})
+            decision_quote = (decision_quotes.get(ticker)
+                              or decision_quotes.get(str(ticker).upper()) or {})
+            live_decision_snapshot = data_fetcher.build_session_snapshot(
+                live_snapshot, decision_quote, live_session_code)
+            if live_decision_snapshot.get("decision_ready") is not True:
+                realtime_memories.pop(identity, None)
+                st.warning("### ⚫ 判断できない\n\n現在の取引時間に対応した価格・気配・"
+                           "1分足時刻を照合できません。推測せず待ちます。")
+                decision_errors = live_decision_snapshot.get("decision_errors") or []
+                if decision_errors:
+                    st.caption("確認状態: " + " ／ ".join(
+                        str(item) for item in decision_errors[:2]))
+                return
+
+            position = None
+            if realtime_mode == "holding":
+                position = {
+                    "held": True,
+                    "entry_price": holding_entry_value,
+                    "stop": holding_stop_value,
+                    "target": holding_target_value,
+                    "source": "利用者が入力した保有株の監視価格",
+                }
+
+            try:
+                realtime_result = realtime_signal.evaluate_realtime_signal(
+                    ticker,
+                    live_klines["bars"],
+                    benchmark_bars=live_klines.get("benchmark_bars"),
+                    snapshot=live_decision_snapshot,
+                    session=live_session,
+                    now=now_utc,
+                    position=position,
+                    previous_memory=realtime_memories.get(identity),
+                    config={
+                        "actionable_sessions": (
+                            "regular", "premarket", "afterhours", "overnight"),
+                    },
+                )
+            except Exception as exc:
+                realtime_memories.pop(identity, None)
+                st.warning(f"### ⚫ 判断できない\n\nリアルタイム判定を更新できませんでした"
+                           f"（{type(exc).__name__}）。売買せずに待ちます。")
+                return
+            if not isinstance(realtime_result, dict):
+                realtime_memories.pop(identity, None)
+                st.warning("### ⚫ 判断できない\n\n判定結果を確認できません。売買せずに待ちます。")
+                return
+
+            memory = realtime_result.get("memory")
+            if isinstance(memory, dict):
+                # エンジンはsignal_bar_timeをmemoryへ保持し、同じ確定足を連続確認へ加えない。
+                realtime_memories[identity] = memory
+            else:
+                realtime_memories.pop(identity, None)
+
+            st.markdown("**① 確定1分足の短期条件**")
+            components = (realtime_result.get("components")
+                          if isinstance(realtime_result.get("components"), dict)
+                          else {})
+            technical = (components.get("technical")
+                         if isinstance(components.get("technical"), dict) else {})
+            score = realtime_result.get("score")
+            score_text = "確認できません" if score is None else f"{float(score):.0f} / 100点"
+            required_text = ("必須条件を確認済み" if technical.get("required_passed") is True
+                             else "必須条件に未確認または未成立があります")
+            st.caption(
+                f"確定した現在セッションの1分足: {score_text} ／ {required_text}。"
+                "形成途中の足、日足、購入プランの判定は混ぜません。")
+
+            st.markdown("**② 今のタイミング**")
+            visual = realtime_action_visual(realtime_result)
+            getattr(st, visual["severity"])(
+                f"### {visual['icon']} {visual['label_ja']}\n\n"
+                f"{visual['description_ja']}")
+            confirmation = (realtime_result.get("confirmation")
+                            if isinstance(realtime_result.get("confirmation"), dict)
+                            else {})
+            confirmed_count = (confirmation.get("streak")
+                               if confirmation.get("streak") is not None
+                               else confirmation.get("count"))
+            required_count = (confirmation.get("required")
+                              if confirmation.get("required") is not None
+                              else confirmation.get("required_count"))
+            if (realtime_mode == "entry" and confirmed_count is not None
+                    and required_count is not None):
+                st.caption(
+                    f"確定したリアルタイム足で連続確認 {confirmed_count} / {required_count}回。"
+                    "同じ足を何度更新しても確認回数には加えません。")
+
+            st.markdown("**③ 売買前の安全確認**")
+            gate_text, gate_reasons = realtime_gate_summary(
+                realtime_result.get("gates"))
+            if gate_reasons:
+                st.warning("🛡️ " + gate_text + "。" + " ／ ".join(gate_reasons[:2]))
+            else:
+                st.success("🛡️ " + gate_text)
+
+            checks = [row for row in realtime_result.get("checks") or []
+                      if isinstance(row, dict)]
+            with st.expander("リアルタイム判定の根拠を見る"):
+                if not checks:
+                    st.caption("短期の判定根拠を確認できませんでした。")
+                for check in checks:
+                    passed = check.get("passed")
+                    status = str(check.get("status") or "").lower()
+                    icon = ("✅" if passed is True or status in {"passed", "up", "buy"}
+                            else "❌" if passed is False or status in {"failed", "down", "sell"}
+                            else "—")
+                    label = check.get("label_ja") or check.get("label") or "確認項目"
+                    detail = (check.get("actual_ja") or check.get("actual")
+                              or check.get("reason_ja") or check.get("reason") or "—")
+                    st.caption(f"{icon} {label}: {detail}")
+
+            source_label = live_meta.get("source") or "moomoo OpenAPI 当日足"
+            fetched_at = live_meta.get("fetched_at") or now_utc
+            session_label = SUMMARY_SESSION_LABELS.get(
+                live_session_code, live_session_code)
+            st.caption(
+                f"{session_label} ｜ {source_label} ｜ 判定更新 {fmt_utc_time(fetched_at)} ｜ "
+                f"{realtime_refresh_seconds}秒ごとに確認")
+            if live_session_code != "regular":
+                st.caption("プレ・アフター・夜間も取引対象です。"
+                           "そのセッションの1分足・気配値・データ品質を確認できない場合は判断を保留します。")
+
+        render_realtime_timing_panel()
+        st.caption(
+            "このカードは判定表示だけで、注文APIを呼びません。"
+            "現在足・snapshotだけを使うため、このリアルタイム機能による"
+            "moomoo過去K線枠の追加使用は0です。"
+            "『買いを検討』は値上がりや利益の保証ではなく、1分足や気配値は短時間で反転します。"
+            "監視を止めると取得更新は止まりますが、再利用のため購読枠が保持される場合があります。")
+        st.caption(
+            "※ 同じページの日足・チャートは別機能です。サイドバーで"
+            "『過去K線もmoomooを使用』を有効にした場合は、そちらが別途"
+            "過去K線枠を使うことがあります。")
+
+
 st.title("📈 銘柄分析")
 
 _settings = settings_store.load()
@@ -329,19 +769,25 @@ if len(_recent) > 1:
     links = " ".join(f"[{t}](/?ticker={t})" for t in _recent[1:])
     st.caption(f"最近見た銘柄: {links}")
 
+# 現在1分足の監視は日足履歴と独立している。履歴取得が失敗しても、このカードは
+# すでに描画・起動済みのため利用を続けられる。
+render_realtime_timing_card(ticker)
+
 fetch_period, display_days = PERIODS[period_label]
 
 try:
     hist, _base_meta = data_fetcher.fetch_chart_history(
         ticker, fetch_period, "1d", allow_new_quota=True)
 except data_fetcher.FetchError:
-    st.error("データの取得中にエラーが発生しました。ネットワーク接続を確認し、"
-             "しばらく時間をおいてから再試行してください。")
+    st.error("日足データを取得できませんでした。ネットワーク接続を確認し、"
+             "しばらく時間をおいてから再試行してください。"
+             "上のリアルタイム売買タイミングは、moomooの現在データがあれば利用できます。")
     st.stop()
 
 if hist.empty:
     st.error(f"ティッカー「{ticker}」のデータを取得できませんでした。"
-             "ティッカーシンボルが正しいか確認してください(例: AAPL, MSFT, GOOGL)。")
+             "ティッカーシンボルが正しいか確認してください(例: AAPL, MSFT, GOOGL)。"
+             "上のリアルタイム売買タイミングは、moomooの現在データがあれば利用できます。")
     st.stop()
 
 try:
@@ -486,13 +932,9 @@ summary_box = tab_today.container(border=True)
 with summary_box:
     summary_title, summary_target, summary_action = st.columns([2.4, 1.4, 1.2])
     with summary_title:
-        st.markdown("### 🎯 売買情報サマリー")
+        st.markdown("### 🛒 購入プラン")
         last_bar = (decision_context or {}).get("bar_meta", {}).get("last_bar")
-        chips = [
-            ui.chip(f"使用ルール: {active_rule_name}", "violet"),
-            ui.chip(f"判定足: {last_bar or '取得不能'}", "gray"),
-        ]
-        st.markdown(" ".join(chips), unsafe_allow_html=True)
+        st.caption("買う・待つ・見送るを、価格と許容損失まで含めて確認します。")
     with summary_target:
         target_session = st.selectbox(
             "寄付き診断の対象", list(target_labels),
@@ -594,6 +1036,10 @@ if decision_context is not None:
         "price": price_now,
         "previous_close": prev,
         "entry_verdict": entry_evaluation.get("verdict"),
+        "entry_blocked": any(
+            action.get("blocking") is True
+            for action in entry_summary.get("action_priorities", [])
+        ),
         "holding_verdict": holding_evaluation.get("verdict"),
     }
     for alert in active_ticker_alerts:
@@ -610,106 +1056,245 @@ else:
     alert_check_errors = len(active_ticker_alerts)
 alert_checked_at = pd.Timestamp.now(tz="America/New_York")
 
-with summary_box:
-    entry_col, holding_col = st.columns(2)
-    for column, heading, position_mode, result_summary, evaluation in (
-        (entry_col, "未保有なら", "entry", entry_summary, entry_evaluation),
-        (holding_col, "ロング保有中なら", "holding", holding_summary, holding_evaluation),
-    ):
-        with column.container(border=True):
-            code = result_summary["verdict"]["code"]
-            blocking_actions = [
-                action for action in result_summary.get("action_priorities", [])
-                if action.get("blocking")]
-            visual = trade_visuals.evaluation_visual({
-                "verdict": code,
-                "risk_plan": evaluation.get("risk_plan"),
-                "visual_blocked": bool(blocking_actions),
-            }, position_mode=position_mode)
-            st.markdown(f"**{heading}**")
-            getattr(st, visual["severity"])(
-                f"### {visual['icon']} {visual['action_label_ja']}\n\n"
-                f"**{visual['title_ja']}**\n\n{visual['description_ja']}"
-            )
-            st.caption("判定理由: " + str(result_summary["verdict"]["reason"]))
-            if heading == "未保有なら":
-                st.caption("買い判定: " + verdict_score_text(evaluation, "buy"))
-            else:
-                st.caption(
-                    "リスク退出: " + verdict_score_text(evaluation, "risk_exit")
-                    + " ／ 利益確定: " + verdict_score_text(evaluation, "take_profit"))
-            if blocking_actions:
-                st.warning("要確認: " + " ／ ".join(
-                    action["label_ja"] for action in blocking_actions[:2]))
+# 購入プランは取得済みの確定日足・snapshot・イベントだけで計算する。
+# 予算と許容損失はこのブラウザーセッション内だけに保持し、注文には使用しない。
+purchase_budget_key = f"purchase_budget_{ticker}"
+purchase_loss_key = f"purchase_loss_limit_{ticker}"
+if purchase_budget_key not in st.session_state:
+    st.session_state[purchase_budget_key] = 1_000.0
+if purchase_loss_key not in st.session_state:
+    st.session_state[purchase_loss_key] = 100.0
+purchase_safety = trading_context.safety_config(active_rule)
+purchase_plan = trade_summary.build_purchase_plan(
+    {
+        **summary_common,
+        "position_mode": "entry",
+        "rule_evaluation": entry_evaluation,
+        "snapshot": snapshot,
+    },
+    max_loss=st.session_state[purchase_loss_key],
+    max_investment=st.session_state[purchase_budget_key],
+    max_spread_pct=purchase_safety.get("max_spread_pct"),
+    now=pd.Timestamp.now(tz="UTC"),
+)
 
-    context_columns = st.columns(4)
-    context_columns[0].metric(
-        "参考現在値" if snapshot.get("source") == "moomoo OpenAPI" else "直近確認値",
-        f"${price_now:,.2f}", f"前日終値比 {change_pct:+.2f}%",
+with summary_box:
+    st.markdown("#### 1. 今、購入を検討できるか")
+    daily_signal = purchase_plan.get("daily_signal") or {}
+    daily_icon = ("✅" if daily_signal.get("is_buy_candidate") else
+                  "⏳" if daily_signal.get("verdict") == "WAIT" else "—")
+    st.caption(
+        f"確定日足の分析: {daily_icon} "
+        f"{daily_signal.get('label_ja') or '確認できません'}。"
+        "これは『現在の価格ですぐ買える』という意味ではありません。")
+
+    purchase_status = purchase_plan.get("status")
+    purchase_icon = ("🟢" if purchase_status == "READY" else
+                     "⚪" if purchase_status == "NOT_CANDIDATE" else "🟠")
+    purchase_message = (
+        f"### {purchase_icon} {purchase_plan['label_ja']}\n\n"
+        f"{purchase_plan['description_ja']}"
+    )
+    if purchase_status == "READY":
+        st.success(purchase_message)
+    elif purchase_status == "NOT_CANDIDATE":
+        st.info(purchase_message)
+    else:
+        st.warning(purchase_message)
+
+    wait_reasons = purchase_plan.get("wait_reasons") or []
+    if wait_reasons:
+        for reason in wait_reasons[:2]:
+            st.markdown(f"- **{reason['label_ja']}** — {reason['detail_ja']}")
+        if len(wait_reasons) > 2:
+            st.caption(f"ほか {len(wait_reasons) - 2}件は「購入を中止する条件」で確認できます。")
+
+    st.markdown("#### 2. 買う価格・損切り・利益確定")
+    quote = purchase_plan.get("quote") or {}
+    buy_zone = purchase_plan.get("buy_zone") or {}
+    risk = purchase_plan.get("risk") or {}
+    ask_price = quote.get("ask")
+    buy_limit = buy_zone.get("high")
+    ask_delta = (
+        "気配値を取得できず" if ask_price is None
+        else "上限を算出できず" if buy_limit is None
+        else "上限内" if ask_price <= buy_limit
+        else "上限を超過"
+    )
+    price_columns = st.columns(4)
+    price_columns[0].metric(
+        "現在の売り気配（Ask）",
+        "—" if ask_price is None else f"${ask_price:,.2f}",
+        ask_delta,
         delta_color="off", border=True)
-    context_columns[1].metric(
-        "現在セッション",
-        SUMMARY_SESSION_LABELS.get(
-            entry_summary["session"]["code"], entry_summary["session"]["label_ja"]),
-        "取引可" if entry_summary["session"]["tradable"] is True
-        else "取引時間外" if entry_summary["session"]["tradable"] is False
-        else "取引可否を確認", delta_color="off", border=True)
-    trend_is_realtime = entry_summary["trend"].get("data_quality") == "realtime"
-    context_columns[2].metric(
-        "当日の方向" if trend_is_realtime else "直近確定足の方向",
-        entry_summary["trend"]["label_ja"],
-        ("リアルタイム観測不足" if entry_summary["trend"]["strength"] is None
-         else f"観測一致度 {entry_summary['trend']['strength']:.0f}%")
-        + ("" if trend_is_realtime else "・確定日足ベース"),
+    price_columns[1].metric(
+        "買う価格の上限",
+        "—" if buy_limit is None else f"${buy_limit:,.2f}",
+        "必要な損失・利益比から逆算", delta_color="off", border=True)
+    price_columns[2].metric(
+        "損切りの目安",
+        "—" if risk.get("stop") is None else f"${risk['stop']:,.2f}",
+        "約定価格の保証ではありません", delta_color="off", border=True)
+    price_columns[3].metric(
+        "利益確定の目安",
+        "—" if risk.get("target") is None else f"${risk['target']:,.2f}",
+        "目標であり保証ではありません", delta_color="off", border=True)
+    st.caption("Ask（売り気配）は、購入時に相手が提示している参考価格です。")
+
+    chase = purchase_plan.get("chase_warning") or {}
+    if ask_price is not None and buy_limit is not None:
+        gap = ask_price - buy_limit
+        if gap > 0:
+            st.warning(f"売り気配（Ask）は上限より ${gap:,.2f} 高いため、追いかけず待ちます。")
+        else:
+            st.caption(f"売り気配（Ask）は上限まで ${abs(gap):,.2f} の範囲内です。")
+    below_reference = next(
+        (item for item in purchase_plan.get("cautions") or []
+         if item.get("code") == "below_reference"),
+        None,
+    )
+    if below_reference:
+        st.warning(
+            f"{below_reference.get('label_ja', '判定時より下落しています')}。"
+            f"{below_reference.get('detail_ja', '下落が続いていないかチャートを再確認してください。')}"
+        )
+    if chase.get("current_rr") is not None and chase.get("minimum_rr") is not None:
+        st.caption(
+            f"現在の売り気配（Ask）での利益÷損失: {chase['current_rr']:.2f}倍 ／ "
+            f"利用中ルールの最低基準: {chase['minimum_rr']:.2f}倍")
+
+    st.markdown("#### 3. 購入株数の上限を計算")
+    input_budget, input_loss = st.columns(2)
+    input_budget.number_input(
+        "この銘柄に使える金額の上限（ドル）",
+        min_value=1.0, step=100.0, key=purchase_budget_key,
+        help="この画面だけで使う計算値です。口座残高や注文には接続しません。")
+    input_loss.number_input(
+        "この1回で許容する損失（ドル）",
+        min_value=1.0, step=10.0, key=purchase_loss_key,
+        help="損切り目安まで通常どおり約定した場合の損失上限です。")
+
+    position = purchase_plan.get("position_size") or {}
+    shares = position.get("shares") if position.get("available") else None
+    planned_price = position.get("purchase_price")
+    expected_profit = position.get("estimated_target_profit")
+    if expected_profit is None and None not in (shares, planned_price, risk.get("target")):
+        expected_profit = max(float(shares) * (float(risk["target"]) - float(planned_price)), 0.0)
+    size_columns = st.columns(4)
+    size_columns[0].metric(
+        "上限株数（推奨ではない）",
+        "—" if shares is None else f"{shares:,}株",
+        position.get("limiting_factor") or position.get("reason_ja") or "計算不能",
         delta_color="off", border=True)
-    context_columns[3].metric(
-        "日足レジーム",
-        TRADE_REGIME_LABELS.get(entry_evaluation.get("regime"), "判定不能"),
-        "売買ルールの前提", delta_color="off", border=True)
+    size_columns[1].metric(
+        "使用額の目安",
+        "—" if position.get("estimated_cost") is None
+        else f"${position['estimated_cost']:,.2f}",
+        "買う価格の上限で計算", delta_color="off", border=True)
+    size_columns[2].metric(
+        "通常時の想定損失",
+        "—" if position.get("estimated_max_loss") is None
+        else f"${position['estimated_max_loss']:,.2f}",
+        "価格飛び・滑りは未反映", delta_color="off", border=True)
+    size_columns[3].metric(
+        "目標到達時の想定利益",
+        "—" if expected_profit is None else f"${expected_profit:,.2f}",
+        "手数料・税・為替は未反映", delta_color="off", border=True)
+    if position.get("available") and not position.get("can_buy_one_share"):
+        st.warning("1株でも購入予算または許容損失を超えるため、計算上の上限は0株です。")
+    st.caption(
+        "上限株数は推奨株数ではありません。損切り注文の価格は約定を保証せず、"
+        "相場急変・価格飛び・滑りによって実際の損失が計算値を超えることがあります。")
+
+    if entry_summary["session"].get("code") in {"premarket", "afterhours", "overnight"}:
+        st.warning("立会時間外は価格差と値動きが大きくなりやすいため、成行へ切り替えず、"
+                   "買う価格の上限と注文条件を証券会社の画面で再確認してください。")
 
     plan = entry_summary
     plan_entry = plan["entry"].get("price")
-    plan_columns = st.columns(4)
-    plan_columns[0].metric(
-        "判定価格（確定終値）",
-        "—" if plan_entry is None else f"${plan_entry:,.2f}",
-        "リアルタイム値とは別", delta_color="off", border=True)
-    plan_columns[1].metric(
-        "参考ストップ",
-        "—" if plan["stop"].get("price") is None else f"${plan['stop']['price']:,.2f}",
-        price_plan_delta(plan["stop"], plan_entry), delta_color="off", border=True)
-    plan_columns[2].metric(
-        "参考目標",
-        "—" if plan["target"].get("price") is None else f"${plan['target']['price']:,.2f}",
-        price_plan_delta(plan["target"], plan_entry), delta_color="off", border=True)
-    plan_columns[3].metric(
-        "リスク : リワード", plan["rr"]["label_ja"],
-        "ATR・支持抵抗から算出", delta_color="off", border=True)
-
     support_item, resistance_item = plan["support"], plan["resistance"]
     support_text = level_summary_text(support_item)
     resistance_text = level_summary_text(resistance_item)
-    st.markdown(
-        f"**支持帯** {support_text}　←　**参考現在値 \\${price_now:,.2f}**　→　"
-        f"**抵抗帯** {resistance_text}")
-
     required_gates = [gate for gate in entry_evaluation.get("gates", [])
                       if gate.get("required")]
     passed_gates = [gate for gate in required_gates if gate.get("passed") is True]
     blocked_gates = [gate for gate in required_gates if gate.get("passed") is False]
     unknown_gates = [gate for gate in entry_evaluation.get("gates", [])
                      if gate.get("passed") is None]
-    if blocked_gates:
-        st.warning("新規買いの必須ゲート未成立: " + " ／ ".join(
-            f"{gate['label']}（{gate.get('reason') or '要確認'}）"
-            for gate in blocked_gates))
-    elif required_gates:
-        st.success(
-            f"新規買いの必須ゲート {len(passed_gates)} / {len(required_gates)} 成立")
-    if unknown_gates:
-        st.caption("⚠ 取得不能・警告のみ: " + "、".join(
-            str(gate.get("label")) for gate in unknown_gates))
-    st.caption("保有中はリスク退出・利益確定の成立を新規買いゲートより優先して表示します。")
+
+    with st.expander("購入を中止する条件"):
+        st.markdown(
+            "- 買い判定が成立しなくなった\n"
+            "- 売り気配（Ask）が上限価格を超えた\n"
+            "- 気配値が古い、価格差が広い、または取引停止になった\n"
+            "- 損切り・利益確定の価格関係が崩れた\n"
+            "- 決算禁止期間または直近の高影響イベントに入った\n"
+            "- 購入株数の上限が0株になった")
+        if wait_reasons:
+            st.markdown("**現在該当している項目**")
+            for reason in wait_reasons:
+                st.markdown(f"- {reason['label_ja']}: {reason['detail_ja']}")
+        else:
+            st.success("現在、上記の中止条件は検出されていません。")
+
+    with st.expander("すでに株を持っている場合"):
+        holding_blocking = [
+            action for action in holding_summary.get("action_priorities", [])
+            if action.get("blocking")]
+        holding_visual = trade_visuals.evaluation_visual({
+            "verdict": holding_summary["verdict"]["code"],
+            "risk_plan": holding_evaluation.get("risk_plan"),
+            "visual_blocked": bool(holding_blocking),
+        }, position_mode="holding")
+        getattr(st, holding_visual["severity"])(
+            f"### {holding_visual['icon']} {holding_visual['action_label_ja']}\n\n"
+            f"{holding_visual['description_ja']}")
+        st.caption(
+            "損失を抑えて売る条件: "
+            + verdict_score_text(holding_evaluation, "risk_exit")
+            + " ／ 利益を確定して売る条件: "
+            + verdict_score_text(holding_evaluation, "take_profit"))
+
+    with st.expander("判定の理由・相場の状態・支持抵抗"):
+        st.write(str(entry_summary["verdict"]["reason"]))
+        st.caption("買う条件の点数: " + verdict_score_text(entry_evaluation, "buy"))
+        st.caption(
+            f"使用ルール: {active_rule_name} ／ 判定に使った確定日足: "
+            f"{last_bar or '取得不能'}")
+        detail_columns = st.columns(4)
+        detail_columns[0].metric(
+            "現在の取引時間",
+            SUMMARY_SESSION_LABELS.get(
+                entry_summary["session"]["code"], entry_summary["session"]["label_ja"]),
+            "取引可" if entry_summary["session"]["tradable"] is True
+            else "取引時間外" if entry_summary["session"]["tradable"] is False
+            else "取引可否を確認", delta_color="off", border=True)
+        detail_columns[1].metric(
+            "相場の状態（日足）",
+            TRADE_REGIME_LABELS.get(entry_evaluation.get("regime"), "判定不能"),
+            "売買ルールの前提", delta_color="off", border=True)
+        detail_columns[2].metric(
+            "判定に使った株価",
+            "—" if plan_entry is None else f"${plan_entry:,.2f}",
+            "確定終値・参考現在値とは別", delta_color="off", border=True)
+        detail_columns[3].metric(
+            "判定時の利益÷損失", plan["rr"]["label_ja"],
+            "現在のAskでは上で再計算", delta_color="off", border=True)
+        st.markdown(
+            f"**下値の目安（支持帯）** {support_text}　←　"
+            f"**参考現在値 \\${price_now:,.2f}**　→　"
+            f"**上値の目安（抵抗帯）** {resistance_text}")
+        st.caption("支持・抵抗は反発予測ではなく、価格幅を確認する参考情報です。")
+        if blocked_gates:
+            st.warning("確認できていない項目: " + " ／ ".join(
+                f"{gate['label']}（{gate.get('reason') or '要確認'}）"
+                for gate in blocked_gates))
+        elif required_gates:
+            st.success(
+                f"必要な項目 {len(passed_gates)} / {len(required_gates)} を確認済み")
+        if unknown_gates:
+            st.caption("⚠ 情報を取得できず確認が必要: " + "、".join(
+                str(gate.get("label")) for gate in unknown_gates))
 
     if active_ticker_alerts:
         unavailable_count = len(unavailable_alerts) + alert_check_errors
@@ -722,7 +1307,8 @@ with summary_box:
             f"確認 {alert_checked_at:%H:%M:%S} ET")
         if triggered_alerts:
             st.warning(alert_line + "\n\n" + " ／ ".join(
-                f"{alerts_lib.describe(alert)}（実測 {checked.get('actual', '—')}）"
+                f"{alerts_lib.describe(alert)}（実測 "
+                f"{alerts_lib.format_actual(alert, checked.get('actual', '—'))}）"
                 for alert, checked in triggered_alerts[:3]))
         elif unavailable_count:
             st.warning(alert_line)
@@ -1626,35 +2212,39 @@ with tab_chart:
                                        if lv["confluence"] else ""),
             } for lv in lv_list]), hide_index=True)
 
-        st.subheader("💡 参考指値(自動計算)")
-        sugg_risk = st.number_input(
-            "1トレードの許容損失額(ドル)", min_value=10.0, value=100.0, step=10.0,
-            help="損切りまで逆行した場合に失ってよい金額。推奨株数の計算に使います")
-        sugg = levels.suggest_limit_orders(chart_view, lv_list, sugg_risk)
-        if sugg:
-            s_table = pd.DataFrame([{
-                "シナリオ": s["scenario"],
-                "指値価格": s["price"],
-                "損切り目安": s["stop"],
-                "利確目安": s["target"],
-                "RR比": s["rr"],
-                "推奨株数": s["shares"],
-                "想定利益": s["est_profit"],
-            } for s in sugg])
-            styled_s = s_table.style.format({
-                "指値価格": "${:,.2f}",
-                "損切り目安": lambda v: "—" if pd.isna(v) else f"${v:,.2f}",
-                "利確目安": lambda v: "—" if pd.isna(v) else f"${v:,.2f}",
-                "RR比": lambda v: "—" if pd.isna(v) else f"1:{v:.1f}",
-                "推奨株数": lambda v: "—" if pd.isna(v) else f"{v:,.0f}株",
-                "想定利益": lambda v: "—" if pd.isna(v) else f"${v:,.0f}",
-            }).map(lambda v: "color: #006300" if "買い" in str(v)
-                   else ("color: #d03b3b" if "売り" in str(v) else ""),
-                   subset=["シナリオ"])
-            st.dataframe(styled_s, hide_index=True)
-            st.caption("⚠️ 買い指値=サポートゾーン上端、損切り=ゾーン下端−0.5ATR、"
-                       "利確=直近抵抗ゾーン下端。推奨株数=許容損失額÷1株あたりの損切り幅。"
-                       "機械算出の参考値であり投資助言ではありません。")
+        with st.expander("上級者向け: 支持抵抗からの参考シナリオ"):
+            st.caption(
+                "上部の購入プランとは別の、選択中チャートを使った参考計算です。"
+                "支持帯に来ただけで買う判断には使いません。")
+            sugg_risk = st.number_input(
+                "1回で許容する損失額(ドル)", min_value=10.0, value=100.0, step=10.0,
+                help="損切りまで通常どおり約定した場合の損失額で株数上限を計算します")
+            sugg = levels.suggest_limit_orders(chart_view, lv_list, sugg_risk)
+            if sugg:
+                s_table = pd.DataFrame([{
+                    "シナリオ": s["scenario"],
+                    "指値価格": s["price"],
+                    "損切り目安": s["stop"],
+                    "利確目安": s["target"],
+                    "利益÷損失": s["rr"],
+                    "株数上限": s["shares"],
+                    "想定利益": s["est_profit"],
+                } for s in sugg])
+                styled_s = s_table.style.format({
+                    "指値価格": "${:,.2f}",
+                    "損切り目安": lambda v: "—" if pd.isna(v) else f"${v:,.2f}",
+                    "利確目安": lambda v: "—" if pd.isna(v) else f"${v:,.2f}",
+                    "利益÷損失": lambda v: "—" if pd.isna(v) else f"{v:.1f}倍",
+                    "株数上限": lambda v: "—" if pd.isna(v) else f"{v:,.0f}株",
+                    "想定利益": lambda v: "—" if pd.isna(v) else f"${v:,.0f}",
+                }).map(lambda v: "color: #006300" if "買い" in str(v)
+                       else ("color: #d03b3b" if "売り" in str(v) else ""),
+                       subset=["シナリオ"])
+                st.dataframe(styled_s, hide_index=True)
+                st.caption(
+                    "買い指値=サポート帯上端、損切り=帯下端−0.5ATR、"
+                    "利確=直近抵抗帯下端。株数は上限であり推奨ではありません。"
+                    "価格飛び・滑り・手数料・税・為替は未反映です。")
 
         piv = levels.pivot_points(chart_view)
         if piv:

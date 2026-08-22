@@ -30,24 +30,25 @@ KINDS = {
                         "needs_value": True},
     "rule_buy": {"label": "売買ルールが買い判定になる", "unit": "",
                  "needs_value": False},
-    "rule_take_profit": {"label": "保有ルールが利益確定判定になる", "unit": "",
+    "rule_take_profit": {"label": "保有株を利益確定のため売る判定になる", "unit": "",
                          "needs_value": False},
-    "rule_risk_exit": {"label": "保有ルールがリスク退出判定になる", "unit": "",
+    "rule_risk_exit": {"label": "保有株を損失抑制のため売る判定になる", "unit": "",
                        "needs_value": False},
     # 旧保存データとの互換用。SELLを空売り開始とは解釈せず、いずれかの
     # ロング手仕舞い判定で成立させる。
-    "rule_sell": {"label": "保有ルールが手仕舞い判定になる（旧形式）", "unit": "",
+    "rule_sell": {"label": "保有株を売る判定になる（以前の設定）", "unit": "",
                   "needs_value": False},
 }
 
 RULE_ACTUAL_LABELS = {
-    "BUY": "新規買い候補（BUY）",
-    "NEUTRAL": "新規買い見送り（NEUTRAL）",
-    "WAIT": "判定待機（WAIT）",
-    "RISK_EXIT": "保有株の売却候補・リスク退出（RISK_EXIT）",
-    "TAKE_PROFIT": "保有株の売却候補・利益確定（TAKE_PROFIT）",
-    "HOLD": "保有継続（HOLD）",
-    "SELL": "保有株の手仕舞い・旧形式（SELL）",
+    "BUY": "買い候補",
+    "BUY_BLOCKED": "買い条件あり・今は待つ",
+    "NEUTRAL": "今は買わない",
+    "WAIT": "判断を保留",
+    "RISK_EXIT": "保有株を売る候補（損失を抑える）",
+    "TAKE_PROFIT": "保有株を売る候補（利益を確定する）",
+    "HOLD": "そのまま保有",
+    "SELL": "保有株を売る候補（以前の設定）",
 }
 
 
@@ -157,7 +158,9 @@ def check(alert: dict, ctx: dict) -> dict:
             hit = verdict == "RISK_EXIT"
         else:
             hit = verdict in {"SELL", "TAKE_PROFIT", "RISK_EXIT"}
-        return out(hit, verdict)
+        shown_verdict = ("BUY_BLOCKED" if kind == "rule_buy" and hit
+                         and ctx.get("entry_blocked") is True else verdict)
+        return out(hit, shown_verdict)
 
     return out(False, "—", f"未知のアラート種別: {kind}")
 

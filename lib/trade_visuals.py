@@ -1,7 +1,7 @@
-"""売買判定コードを、画面向けの一貫した視覚表現へ変換する。
+"""売買判定コードを、初心者にも読める一貫した表示へ変換する。
 
 このモジュールは既存の判定結果を表示用に投影するだけで、判定、通信、保存、
-注文は行わない。``売り候補`` は保有株の手仕舞いだけを意味し、新規の空売りを
+注文は行わない。``売る候補`` は保有株の売却だけを意味し、新規の空売りを
 表さない。
 """
 
@@ -14,10 +14,10 @@ from typing import Any
 _VISUALS: dict[str, dict[str, Any]] = {
     "BUY": {
         "icon": "➕",
-        "action_label_ja": "【買い】新規買い候補",
-        "context_label_ja": "新規エントリー",
-        "title_ja": "買い条件が成立",
-        "description_ja": "買い条件が成立しています。取引条件とリスクを確認してください。",
+        "action_label_ja": "買い候補",
+        "context_label_ja": "株を持っていない場合",
+        "title_ja": "買いの条件がそろっています",
+        "description_ja": "買い条件がそろっています。買う価格と損切りの目安を確認してください。",
         "severity": "success",
         "color": "green",
         "is_buy": True,
@@ -26,10 +26,10 @@ _VISUALS: dict[str, dict[str, Any]] = {
     },
     "NEUTRAL": {
         "icon": "—",
-        "action_label_ja": "【見送り】今は買わない",
-        "context_label_ja": "新規エントリー",
-        "title_ja": "今回は見送り",
-        "description_ja": "買い条件が成立していないため、今回は見送ります。売りや空売りを示す判定ではありません。",
+        "action_label_ja": "今は買わない",
+        "context_label_ja": "株を持っていない場合",
+        "title_ja": "今回は見送ります",
+        "description_ja": "買い条件が足りないため、今は新しく買いません。保有株を売る合図ではありません。",
         "severity": "info",
         "color": "gray",
         "is_buy": False,
@@ -38,10 +38,10 @@ _VISUALS: dict[str, dict[str, Any]] = {
     },
     "WAIT": {
         "icon": "⏳",
-        "action_label_ja": "【保留】売買せず待機",
-        "context_label_ja": "新規エントリー",
-        "title_ja": "条件確認まで待機",
-        "description_ja": "条件または必要なデータを確認できるまで、売買せず待機します。",
+        "action_label_ja": "判断を待つ",
+        "context_label_ja": "株を持っていない場合",
+        "title_ja": "まだ売買しません",
+        "description_ja": "必要な情報がそろうまで、売買の判断を保留します。",
         "severity": "warning",
         "color": "orange",
         "is_buy": False,
@@ -50,10 +50,10 @@ _VISUALS: dict[str, dict[str, Any]] = {
     },
     "RISK_EXIT": {
         "icon": "⚠️",
-        "action_label_ja": "【売却】保有株の売却候補（リスク退出）",
-        "context_label_ja": "保有中",
-        "title_ja": "リスク退出を検討",
-        "description_ja": "保有株の手仕舞いを検討する売り候補です。新規の空売りを示す判定ではありません。",
+        "action_label_ja": "保有株を売る候補（損失を抑える）",
+        "context_label_ja": "株を持っている場合",
+        "title_ja": "損失を抑えるため売却を検討",
+        "description_ja": "損失が広がるのを抑えるため、保有株の売却や縮小を検討します。新しい空売りではありません。",
         "severity": "error",
         "color": "red",
         "is_buy": False,
@@ -62,10 +62,10 @@ _VISUALS: dict[str, dict[str, Any]] = {
     },
     "TAKE_PROFIT": {
         "icon": "✅",
-        "action_label_ja": "【売却】保有株の売却候補（利益確定）",
-        "context_label_ja": "保有中",
-        "title_ja": "利益確定を検討",
-        "description_ja": "保有株の利益確定を検討する売り候補です。新規の空売りを示す判定ではありません。",
+        "action_label_ja": "保有株を売る候補（利益を確定）",
+        "context_label_ja": "株を持っている場合",
+        "title_ja": "利益を確定するため売却を検討",
+        "description_ja": "利益を確定するため、保有株の一部または全部の売却を検討します。新しい空売りではありません。",
         "severity": "info",
         "color": "blue",
         "is_buy": False,
@@ -74,10 +74,10 @@ _VISUALS: dict[str, dict[str, Any]] = {
     },
     "HOLD": {
         "icon": "●",
-        "action_label_ja": "【継続】保有継続",
-        "context_label_ja": "保有中",
-        "title_ja": "保有を継続",
-        "description_ja": "保有株は継続保有の判定です。新規の買い・売りや空売りを示す判定ではありません。",
+        "action_label_ja": "そのまま保有",
+        "context_label_ja": "株を持っている場合",
+        "title_ja": "保有を続けます",
+        "description_ja": "売る条件は成立していないため、そのまま保有する判定です。追加で買う合図ではありません。",
         "severity": "info",
         "color": "gray",
         "is_buy": False,
@@ -88,10 +88,10 @@ _VISUALS: dict[str, dict[str, Any]] = {
 
 _UNKNOWN = {
     "icon": "？",
-    "action_label_ja": "【判定不能】売買せず待機",
+    "action_label_ja": "判断できません",
     "context_label_ja": "判定不明",
-    "title_ja": "判定不能のため待機",
-    "description_ja": "対応する売買判定を確認できないため、売買せず待機します。",
+    "title_ja": "判定できません",
+    "description_ja": "判定を確認できないため、売買せずに待ちます。",
     "severity": "warning",
     "color": "orange",
     "is_buy": False,
@@ -101,10 +101,10 @@ _UNKNOWN = {
 
 _BLOCKED_BUY = {
     "icon": "⏸️",
-    "action_label_ja": "【買い・実行保留】新規買い候補",
-    "context_label_ja": "新規エントリー",
-    "title_ja": "買い条件成立・実行保留",
-    "description_ja": "買い条件は成立していますが、確認が必要な条件があるため実行を保留します。",
+    "action_label_ja": "買い条件あり・今は待つ",
+    "context_label_ja": "株を持っていない場合",
+    "title_ja": "買いの条件は成立・実行は保留",
+    "description_ja": "買いの条件はそろっていますが、確認が必要です。今は買わずに待ちます。",
     "severity": "warning",
     "color": "orange",
     "is_buy": True,
@@ -166,7 +166,7 @@ def verdict_visual(
 
     context_label = source["context_label_ja"]
     if compatible and safe_code == "WAIT" and mode == "holding":
-        context_label = "保有中"
+        context_label = "株を持っている場合"
     result = {
         "code": safe_code,
         **source,

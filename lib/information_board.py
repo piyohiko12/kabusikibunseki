@@ -19,6 +19,8 @@ import socket
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from lib import trade_visuals
+
 
 SCHEMA_VERSION = 1
 
@@ -70,11 +72,11 @@ _CATEGORY_ORDER = {code: index for index, code in enumerate(CATEGORY_LABELS)}
 
 _VERDICT_LABELS = {
     "BUY": "買い条件成立",
-    "WAIT": "待機",
-    "NEUTRAL": "中立",
-    "RISK_EXIT": "リスク退出条件成立",
-    "TAKE_PROFIT": "利確条件成立",
-    "HOLD": "保有継続",
+    "WAIT": "判断を保留",
+    "NEUTRAL": "今は買わない",
+    "RISK_EXIT": "損失を抑えて売る条件が成立",
+    "TAKE_PROFIT": "利益を確定して売る条件が成立",
+    "HOLD": "そのまま保有",
 }
 
 _ALERT_LABELS = {
@@ -87,9 +89,9 @@ _ALERT_LABELS = {
     "near_support": "サポートに近づく",
     "near_resistance": "抵抗線に近づく",
     "rule_buy": "買い判定になる",
-    "rule_take_profit": "利益確定判定になる",
-    "rule_risk_exit": "リスク退出判定になる",
-    "rule_sell": "手仕舞い判定になる（旧形式）",
+    "rule_take_profit": "保有株を利益確定のため売る判定になる",
+    "rule_risk_exit": "保有株を損失抑制のため売る判定になる",
+    "rule_sell": "保有株を売る判定になる（以前の設定）",
 }
 
 _EVENT_STATUS_LABELS = {
@@ -713,6 +715,22 @@ def _alert_threshold(kind: str, value: float | None) -> str | None:
     return f"{value:g}"
 
 
+def _alert_actual_for_display(kind: str, value: Any) -> str | None:
+    """ルール系の内部コードを、掲示板向けの平易な表示へ変換する。"""
+    actual = _one_line(value, 300)
+    if not actual or not kind.startswith("rule_"):
+        return actual
+    code = actual.strip().upper()
+    if code == "SELL":
+        return "保有株を売る候補（以前の設定）"
+    if code == "BUY_BLOCKED":
+        return "買い条件あり・今は待つ"
+    mode = "entry" if kind == "rule_buy" else "holding"
+    visual = trade_visuals.verdict_visual(code, position_mode=mode)
+    return (visual["action_label_ja"] if visual["available"]
+            else "判定を確認できません")
+
+
 def _build_alert_items(
     checked_alerts: Any,
     ticker: str | None,
@@ -767,7 +785,7 @@ def _build_alert_items(
             continue
         value = _number(alert.get("value"))
         threshold = _alert_threshold(kind, value)
-        actual = _one_line(result.get("actual"), 300)
+        actual = _alert_actual_for_display(kind, result.get("actual"))
         note = _one_line(alert.get("note"), 500)
         summary_parts = []
         if threshold:

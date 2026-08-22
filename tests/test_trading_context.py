@@ -26,8 +26,11 @@ class TradingContextTests(unittest.TestCase):
         self.assertEqual(config["max_spread_pct"], 0.25)
         self.assertEqual(config["min_history"], 220)
 
+    @patch("lib.signal_context._market_now",
+           return_value=pd.Timestamp("2026-08-10 12:00", tz="America/New_York"))
     @patch("lib.trading_context.levels.find_levels", return_value=[{"price": 10}])
-    def test_prepare_uses_completed_two_year_history_without_network(self, find_levels):
+    def test_prepare_uses_completed_two_year_history_without_network(
+            self, find_levels, _market_now):
         context = trading_context.prepare_from_history(
             _history(),
             source_meta={"code": "US.AAPL"},

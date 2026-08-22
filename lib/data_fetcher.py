@@ -5,11 +5,13 @@
 OpenDや権限に問題がある場合はyfinanceへ自動フォールバックする。
 """
 
+import math
+
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-from lib import moomoo_client, moomoo_fetcher
+from lib import moomoo_client, moomoo_fetcher, session_intelligence
 
 
 class FetchError(Exception):
@@ -116,13 +118,235 @@ def fetch_realtime_snapshot(ticker: str) -> dict:
     """
     state = moomoo_client.status()
     if state["state"] != moomoo_client._State.OK:
-        return {"source": "Yahoo Finance", "fallback_reason": state["message"]}
+        return {"source": "Yahoo Finance", "session_quotes": {},
+                "fallback_reason": state["message"]}
     snap = moomoo_client.snapshot((ticker,)).get(ticker)
-    if not snap or not snap.get("price"):
-        return {"source": "Yahoo Finance",
+    session_quotes = (snap.get("session_quotes")
+                      if isinstance(snap, dict) else None)
+    has_session_price = bool(
+        isinstance(session_quotes, dict)
+        and any(isinstance(row, dict) and row.get("available")
+                for row in session_quotes.values()))
+    if not snap or (not snap.get("price") and not has_session_price):
+        return {"source": "Yahoo Finance", "session_quotes": {},
                 "fallback_reason": "moomooから最新価格を取得できませんでした"}
     return {**snap, "code": moomoo_client.to_code(ticker) or ticker,
             "source": "moomoo OpenAPI"}
+
+
+def _decision_number(value, *, positive: bool = False) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or (positive and number <= 0):
+        return None
+    return number
+
+
+def _decision_timestamp(value) -> pd.Timestamp | None:
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(stamp):
+        return None
+    try:
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize(
+                "America/New_York", ambiguous="NaT", nonexistent="NaT")
+        else:
+            stamp = stamp.tz_convert("America/New_York")
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(stamp) else stamp
+
+
+def _decision_session_name(value) -> str:
+    return {
+        "pre": "premarket", "premarket": "premarket",
+        "regular": "regular",
+        "after": "afterhours", "afterhours": "afterhours",
+        "overnight": "overnight",
+    }.get(str(value or "").strip().lower(), "unknown")
+
+
+def _timestamp_session(stamp: pd.Timestamp) -> str:
+    """NYSE定例日・短縮日を考慮した時刻セッション。"""
+    try:
+        detected = session_intelligence.detect_current_session(
+            stamp, overnight_eligible=True)
+    except (TypeError, ValueError, OverflowError):
+        return "closed"
+    return str(detected.get("session") or "closed")
+
+
+def build_session_snapshot(snapshot: dict | None, decision_quote: dict | None,
+                           session: str, *, max_alignment_seconds: float = 90.0,
+                           max_price_deviation_pct: float = 1.0,
+                           max_bbo_deviation_pct: float = 0.20) -> dict:
+    """engine向け気配を対象セッションへ安全に正規化する純粋関数。
+
+    時間外では、snapshot専用価格、K_1Mのセッション付きbar時刻、同一snapshot
+    recordのBid/Ask・更新時刻が整合した場合だけtop-level価格を公開する。不明点を
+    genericな立会価格で補完せず、失敗時は価格欄をNoneにして判定を止める。
+    """
+    raw = dict(snapshot or {})
+    quote = dict(decision_quote or {})
+    session_name = _decision_session_name(session)
+    errors: list[str] = []
+
+    result = {
+        **raw,
+        "raw_snapshot_price": raw.get("price"),
+        "raw_snapshot_bid": raw.get("bid"),
+        "raw_snapshot_ask": raw.get("ask"),
+        "raw_snapshot_update_time": raw.get("update_time"),
+        "decision_session": session_name,
+        "decision_ready": False,
+        "decision_errors": errors,
+        "decision_price_source": None,
+        "decision_bar_time": quote.get("bar_time") or quote.get("updated_at"),
+        "uses_daily_bars": False,
+    }
+
+    if str(raw.get("source") or "").strip().lower() != "moomoo openapi":
+        errors.append("moomoo OpenAPIのsnapshotではありません")
+    if session_name == "unknown":
+        errors.append("判定セッションを確認できません")
+
+    bid = _decision_number(raw.get("bid"), positive=True)
+    ask = _decision_number(raw.get("ask"), positive=True)
+    if bid is None or ask is None or ask < bid:
+        errors.append("対象セッションのBid/Askを確認できません")
+
+    session_quotes = (raw.get("session_quotes")
+                      if isinstance(raw.get("session_quotes"), dict) else {})
+    session_row = (session_quotes.get(session_name)
+                   if isinstance(session_quotes.get(session_name), dict) else {})
+    snapshot_stamp = _decision_timestamp(
+        raw.get("update_time_iso") or session_row.get("snapshot_updated_at")
+        or raw.get("update_time"))
+    price = None
+    price_source = None
+
+    if session_name == "regular":
+        price = _decision_number(raw.get("price"), positive=True)
+        price_source = "snapshot.last_price"
+        if price is None:
+            errors.append("立会の現在値を確認できません")
+        if snapshot_stamp is None or _timestamp_session(snapshot_stamp) != "regular":
+            errors.append("立会のsnapshot更新時刻を確認できません")
+    elif session_name in {"premarket", "afterhours", "overnight"}:
+        expected_price_field = {
+            "premarket": "pre_price", "afterhours": "after_price",
+            "overnight": "overnight_price",
+        }[session_name]
+        price = _decision_number(session_row.get("price"), positive=True)
+        price_source = f"snapshot.{session_row.get('price_field') or session_name}"
+        if (session_row.get("available") is not True or price is None
+                or session_row.get("price_field") != expected_price_field
+                or str(session_row.get("source") or "").strip().lower()
+                != "moomoo openapi snapshot"
+                or session_row.get("uses_daily_bars") is True):
+            errors.append("対象セッションの専用価格を確認できません")
+
+        bar_price = _decision_number(quote.get("price"), positive=True)
+        bar_stamp = _decision_timestamp(
+            quote.get("bar_time") or quote.get("updated_at"))
+        quote_session = _decision_session_name(quote.get("session"))
+        snapshot_symbol = str(raw.get("code") or "").strip().upper().split(".", 1)[-1]
+        quote_symbol = str(quote.get("symbol") or "").strip().upper().split(".", 1)[-1]
+        if (quote.get("available") is not True
+                or quote.get("timestamp_verified") is not True
+                or quote.get("timeframe") != "K_1M"
+                or "moomoo openapi" not in str(
+                    quote.get("source") or "").strip().lower()
+                or quote.get("uses_daily_bars") is True or bar_price is None
+                or bar_stamp is None or quote_session != session_name
+                or not snapshot_symbol or quote_symbol != snapshot_symbol
+                or _timestamp_session(bar_stamp) != session_name):
+            errors.append("対象セッションのK_1M価格・時刻を確認できません")
+        if snapshot_stamp is None or _timestamp_session(snapshot_stamp) != session_name:
+            errors.append("対象セッションのsnapshot更新時刻を確認できません")
+        if snapshot_stamp is not None and bar_stamp is not None:
+            alignment = abs(float((snapshot_stamp - bar_stamp).total_seconds()))
+            if alignment > max(0.0, float(max_alignment_seconds)):
+                errors.append("snapshotとK_1Mの更新時刻が離れています")
+        if price is not None and bar_price is not None:
+            deviation = abs(price / bar_price - 1.0) * 100.0
+            if deviation > max(0.0, float(max_price_deviation_pct)):
+                errors.append("snapshot専用価格とK_1M価格が一致しません")
+
+    if price is not None and bid is not None and ask is not None:
+        # K_1M終値との時間差許容とは分け、執行可能な最良気配(BBO)との乖離は
+        # 狭く制限する。古い時間外価格を1%幅で通さないためのfail-closed条件。
+        tolerance = max(0.0, float(max_bbo_deviation_pct)) / 100.0
+        if price < bid * (1.0 - tolerance) or price > ask * (1.0 + tolerance):
+            errors.append("対象セッション価格とBid/Askが整合しません")
+
+    if errors:
+        return {
+            **result, "price": None, "bid": None, "ask": None,
+            "update_time": None, "decision_price_source": price_source,
+        }
+    return {
+        **result, "price": price, "bid": bid, "ask": ask,
+        "update_time": snapshot_stamp.isoformat(),
+        "decision_ready": True, "decision_price_source": price_source,
+        "decision_errors": [],
+    }
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def _fetch_current_klines_cached(symbols: tuple[str, ...], num: int,
+                                 session: str) -> dict:
+    """同じリアルタイム1分足の重複取得を短時間だけまとめる。"""
+    return moomoo_client.current_klines(symbols, num=num, session=session)
+
+
+def fetch_current_klines(symbols, num: int = 120,
+                         session: str = "regular") -> dict:
+    """銘柄とSPYの現在1分足を安全な共有購読から取得する。
+
+    過去K線APIは呼ばず、失敗時も ``frames`` と ``meta.errors`` を持つ構造を
+    返す。入力シンボルはmoomoo_client側で正規化される。
+    """
+    values = (symbols,) if isinstance(symbols, str) else tuple(symbols or ())
+    try:
+        return _fetch_current_klines_cached(
+            tuple(str(value) for value in values), int(num), str(session))
+    except Exception as exc:
+        return {
+            "frames": {},
+            "meta": {
+                "available": False,
+                "partial": False,
+                "source": "Unavailable",
+                "fetched_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                "session": str(session or "regular").strip().lower(),
+                "requested_symbols": tuple(
+                    str(value or "").strip().upper() for value in values),
+                "subscribed_symbols": (),
+                "errors": {
+                    "adapter": f"リアルタイム1分足を取得できませんでした: {exc}"
+                },
+                "quota": {},
+                "decision_quotes": {},
+                "subscription_reused": False,
+                "retry_after_seconds": None,
+                "timeframe": "K_1M",
+                "uses_daily_bars": False,
+                "uses_history_quota": False,
+                "history_requests": 0,
+            },
+        }
+
+
+# 他の公開fetcherと同じようにテスト・UIから短期キャッシュを消去できるようにする。
+fetch_current_klines.clear = _fetch_current_klines_cached.clear
 
 
 @st.cache_data(ttl=30, show_spinner="チャートデータを取得中...")

@@ -274,6 +274,42 @@ class BoardBuildTests(unittest.TestCase):
         self.assertEqual(item["data"]["alert_kind"], "checked_alert")
         self.assertIn("AAPL: 価格が上回る", item["title_ja"])
 
+    def test_rule_alert_actual_uses_beginner_label_not_internal_code(self):
+        result = information_board.build_information_board({
+            "ticker": "AAPL",
+            "checked_alerts": [{
+                "alert": {
+                    "id": "risk", "ticker": "AAPL",
+                    "kind": "rule_risk_exit", "enabled": True,
+                },
+                "result": {
+                    "triggered": True, "actual": "RISK_EXIT", "reason": "",
+                },
+            }],
+        })
+        item = result["items"][0]
+        self.assertIn("保有株を売る候補（損失を抑える）", item["summary_ja"])
+        self.assertNotIn("RISK_EXIT", item["summary_ja"])
+        self.assertEqual(
+            item["data"]["actual"], "保有株を売る候補（損失を抑える）")
+
+    def test_blocked_buy_alert_keeps_wait_message(self):
+        result = information_board.build_information_board({
+            "ticker": "AAPL",
+            "checked_alerts": [{
+                "alert": {
+                    "id": "buy", "ticker": "AAPL",
+                    "kind": "rule_buy", "enabled": True,
+                },
+                "result": {
+                    "triggered": True, "actual": "BUY_BLOCKED", "reason": "",
+                },
+            }],
+        })
+        item = result["items"][0]
+        self.assertIn("買い条件あり・今は待つ", item["summary_ja"])
+        self.assertNotIn("BUY_BLOCKED", item["summary_ja"])
+
     def test_caller_warnings_are_preserved_and_deduplicated(self):
         result = information_board.build_information_board({
             "warnings": ["ニュース取得失敗", "ニュース取得失敗"],

@@ -114,7 +114,8 @@ def _trade_overview_rows(items: list[dict]) -> list[dict]:
         visual = trade_visuals.evaluation_visual(data, position_mode=mode)
         selected[mode] = {
             "mode": mode,
-            "heading_ja": "未保有なら" if mode == "entry" else "ロング保有中なら",
+            "heading_ja": ("株を持っていない場合" if mode == "entry"
+                           else "株を持っている場合"),
             "visual": visual,
             "summary_ja": item.get("summary_ja"),
         }
@@ -125,8 +126,8 @@ def _render_trade_overview(items: list[dict]) -> None:
     rows = _trade_overview_rows(items)
     if not rows:
         return
-    st.markdown("### 🎯 売買判定の要点")
-    st.caption("保有状況によって行動が異なるため、未保有時とロング保有中を分けています。")
+    st.markdown("### 🎯 売買の目安")
+    st.caption("株を持っているかどうかで、見るカードを選んでください。")
     columns = st.columns(len(rows))
     for column, row in zip(columns, rows):
         visual = row["visual"]
@@ -134,12 +135,14 @@ def _render_trade_overview(items: list[dict]) -> None:
             st.markdown(f"**{row['heading_ja']}**")
             getattr(st, visual["severity"])(
                 f"### {visual['icon']} {visual['action_label_ja']}\n\n"
-                f"**{visual['title_ja']}**\n\n{visual['description_ja']}"
+                f"{visual['description_ja']}"
             )
-            if row.get("summary_ja"):
-                st.caption("判定根拠: " + str(row["summary_ja"]))
-    if any(row["visual"]["is_sell"] for row in rows):
-        st.caption("🔎 「売却候補」は保有株の手仕舞いです。新規空売りの判定ではありません。")
+    if any(row.get("summary_ja") for row in rows):
+        with st.expander("判定の理由と点数を見る"):
+            for row in rows:
+                if row.get("summary_ja"):
+                    st.markdown(f"**{row['heading_ja']}**")
+                    st.write(_plain_markdown(row["summary_ja"]))
     st.divider()
 
 
@@ -164,47 +167,52 @@ def render_information_board(report: dict, *, show_heading: bool = True,
     # フィルターに関係なく、最重要の売買判定を常に上部へ固定表示する。
     _render_trade_overview(items)
 
-    high_items = [item for item in items
+    # 売買判定は上の2枚に集約し、同じ内容を一覧へ重複表示しない。
+    board_items = [item for item in items if item.get("category") != "trade"]
+    high_items = [item for item in board_items
                   if item.get("importance") in {"critical", "high"}]
-    event_items = [item for item in items if item.get("category") == "event"]
-    active_alerts = [item for item in items
+    event_items = [item for item in board_items if item.get("category") == "event"]
+    active_alerts = [item for item in board_items
                      if item.get("category") == "alert"
                      and (item.get("data") or {}).get("triggered") is True]
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("全情報", f"{len(items)}件", border=True)
+    m1.metric("その他の情報", f"{len(board_items)}件", border=True)
     m2.metric("重要", f"{len(high_items)}件", border=True)
     m3.metric("イベント", f"{len(event_items)}件", border=True)
     m4.metric("成立アラート", f"{len(active_alerts)}件", border=True)
 
-    categories = sorted({str(item.get("category_label_ja")) for item in items
+    categories = sorted({str(item.get("category_label_ja")) for item in board_items
                          if item.get("category_label_ja")})
     importance_labels = sorted(
-        {str(item.get("importance_label_ja")) for item in items
+        {str(item.get("importance_label_ja")) for item in board_items
          if item.get("importance_label_ja")},
         key=lambda label: {"最重要": 0, "重要": 1, "要確認": 2,
                            "参考": 3, "情報": 4}.get(label, 9))
-    f1, f2, f3 = st.columns([1.3, 1.1, 1.4])
+    f1, f2 = st.columns([1.3, 1.7])
     selected_categories = f1.multiselect(
         "カテゴリ", categories, default=categories,
         key=f"{key_prefix}_categories")
-    selected_importance = f2.multiselect(
-        "重要度", importance_labels, default=importance_labels,
-        key=f"{key_prefix}_importance")
-    search = f3.text_input(
+    search = f2.text_input(
         "キーワード", placeholder="見出し・内容・情報源を検索",
         key=f"{key_prefix}_search")
-    sort_label = st.radio(
-        "並び順", list(SORT_LABELS), horizontal=True,
-        key=f"{key_prefix}_sort")
+    with st.expander("さらに絞り込む"):
+        selected_importance = st.multiselect(
+            "重要度", importance_labels, default=importance_labels,
+            key=f"{key_prefix}_importance")
+        sort_label = st.radio(
+            "並び順", list(SORT_LABELS), horizontal=True,
+            key=f"{key_prefix}_sort")
 
     shown_items = _filter_items(
-        items, selected_categories, selected_importance, search)
+        board_items, selected_categories, selected_importance, search)
     shown_items.sort(key=lambda item: _item_sort_key(item, SORT_LABELS[sort_label]))
-    st.caption(f"{len(shown_items)} / {len(items)}件を表示")
+    st.caption(f"{len(shown_items)} / {len(board_items)}件を表示")
 
     if not shown_items:
-        if items:
+        if board_items:
             st.info("条件に一致する情報はありません。絞り込みを変更してください。")
+        elif items:
+            st.info("売買の目安以外に表示できる情報はありません。")
         else:
             st.info("表示できる情報がありません。取得上の注意を確認してください。")
         return

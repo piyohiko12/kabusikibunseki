@@ -8,7 +8,8 @@ import streamlit as st
 
 from lib import (alerts as alerts_lib, board_ui, data_fetcher,
                  event_intelligence, information_board, news_fetcher,
-                 rules as rules_lib, settings_store, trading_context)
+                 rules as rules_lib, session_intelligence, settings_store,
+                 trade_summary, trading_context)
 
 
 def _wait_evaluation(mode: str, message: str) -> dict:
@@ -133,14 +134,31 @@ with st.spinner(f"{ticker}の情報を整理中..."):
             position_mode="holding", external_gates=external_gates)
         decision_levels = decision_context["levels"]
 
+    board_session = session_intelligence.detect_current_session(
+        market_state=market_state.get("market_state"),
+        overnight_eligible=None,
+    )
+    board_entry_summary = trade_summary.build_trade_summary({
+        "current_price": snapshot_for_board.get("price"),
+        "current_price_source": snapshot_for_board.get("source"),
+        "snapshot": snapshot_for_board,
+        "history": None if decision_context is None else decision_context["df"],
+        "levels": decision_levels,
+        "session": {"current_session": board_session},
+        "position_mode": "entry",
+        "rule_evaluation": entry_evaluation,
+    })
+    board_entry_blocked = any(
+        action.get("blocking") is True
+        for action in board_entry_summary.get("action_priorities", [])
+    )
     board_checked_at = pd.Timestamp.now(tz="UTC")
     board_entry_evaluation = {
         **entry_evaluation,
         "evaluated_at": board_checked_at,
         "source": f"保存ルール: {active_rule_name}（確定日足）",
         "visual_blocked": (
-            entry_evaluation.get("verdict") == "BUY"
-            and (entry_evaluation.get("risk_plan") or {}).get("valid") is False
+            entry_evaluation.get("verdict") == "BUY" and board_entry_blocked
         ),
     }
     board_holding_evaluation = {
@@ -161,6 +179,7 @@ with st.spinner(f"{ticker}の情報を整理中..."):
         "price": snapshot_for_board.get("price"),
         "previous_close": snapshot_for_board.get("previous_close"),
         "entry_verdict": entry_evaluation.get("verdict"),
+        "entry_blocked": board_entry_blocked,
         "holding_verdict": holding_evaluation.get("verdict"),
     }
     for alert in active_alerts:

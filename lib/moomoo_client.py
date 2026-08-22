@@ -27,6 +27,8 @@ import time
 import pandas as pd
 import streamlit as st
 
+from lib import session_intelligence
+
 # OpenDへの接続の既定値。設定で上書きできる。
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11111
@@ -178,6 +180,16 @@ def _ok(ret) -> bool:
 # 表示中の銘柄だけを購読し、切り替えたら前の銘柄を解除して上限を使い切らないようにする。
 _subscribed: dict = {}
 
+# 1分足はリアルタイム判定専用に、板・歩み値とは別のlease poolで管理する。
+# moomooは購読後60秒未満の解除を認めない。複数の画面・銘柄集合を相互に
+# 追い出さず、十分に古く未使用になった自管理購読だけを掃除する。
+_CURRENT_KLINE_MIN_LEASE_SECONDS = 60.0
+_CURRENT_KLINE_IDLE_SECONDS = 120.0
+_current_kline_lock = threading.Lock()
+_current_kline_leases: dict = {}
+# 初版のprivate名を参照するテスト・開発用コードとの互換alias。
+_current_kline_lease = _current_kline_leases
+
 
 def _ensure_subscribed(ctx, code: str, subtypes: list) -> bool:
     key = tuple(sorted(str(s) for s in subtypes))
@@ -198,7 +210,671 @@ def _ensure_subscribed(ctx, code: str, subtypes: list) -> bool:
     return True
 
 
+def _current_kline_result(*, frames=None, available: bool = False,
+                          partial: bool = False, session: str,
+                          requested_symbols=(), subscribed_symbols=(),
+                          errors=None, quota=None, decision_quotes=None,
+                          reused: bool = False,
+                          retry_after_seconds: float | None = None) -> dict:
+    """current_klinesの成功・失敗を同じpickle可能な形へそろえる。"""
+    fetched_at = pd.Timestamp.now(tz="UTC").isoformat()
+    return {
+        "frames": dict(frames or {}),
+        "meta": {
+            "available": bool(available),
+            "partial": bool(partial),
+            "source": "moomoo OpenAPI current K_1M" if frames else "Unavailable",
+            "fetched_at": fetched_at,
+            "session": session,
+            "requested_symbols": tuple(requested_symbols),
+            "subscribed_symbols": tuple(subscribed_symbols),
+            "errors": dict(errors or {}),
+            "quota": dict(quota or {}),
+            "decision_quotes": dict(decision_quotes or {}),
+            "subscription_reused": bool(reused),
+            "retry_after_seconds": retry_after_seconds,
+            "timeframe": "K_1M",
+            "uses_daily_bars": False,
+            "uses_history_quota": False,
+            "history_requests": 0,
+        },
+    }
+
+
+def _quota_number(value) -> int | None:
+    """boolや小数を受け入れず、購読枠の非負整数だけを返す。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        if float(value) != number:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number >= 0 else None
+
+
+def _normalise_subscription_list(value) -> tuple[dict | None, str | None]:
+    """query_subscriptionのsub_listを ``種別 -> code tuple`` にそろえる。"""
+    if not isinstance(value, dict):
+        return None, "現在の購読一覧を解析できませんでした"
+    result: dict[str, tuple[str, ...]] = {}
+    collected: dict[str, set[str]] = {}
+    for raw_subtype, raw_codes in value.items():
+        subtype_value = getattr(raw_subtype, "value", raw_subtype)
+        if not isinstance(subtype_value, str):
+            return None, "現在の購読種別を解析できませんでした"
+        subtype = subtype_value.strip().upper()
+        if "." in subtype:
+            subtype = subtype.rsplit(".", 1)[-1]
+        if not subtype:
+            return None, "現在の購読種別を解析できませんでした"
+        if isinstance(raw_codes, (str, bytes)) or not isinstance(
+                raw_codes, (list, tuple, set, frozenset)):
+            return None, "現在の購読銘柄を解析できませんでした"
+        bucket = collected.setdefault(subtype, set())
+        for raw_code in raw_codes:
+            if not isinstance(raw_code, str):
+                return None, "現在の購読銘柄を解析できませんでした"
+            code = raw_code.strip().upper()
+            if not code:
+                return None, "現在の購読銘柄を解析できませんでした"
+            if "." not in code:
+                code = to_code(code) or code
+            bucket.add(code)
+    for subtype, codes in collected.items():
+        result[subtype] = tuple(sorted(codes))
+    return result, None
+
+
+def _query_subscription_quota(ctx) -> tuple[dict | None, str | None]:
+    """全接続の購読枠を解析する。曖昧な応答は安全側で失敗にする。"""
+    try:
+        ret, data = ctx.query_subscription(is_all_conn=True)
+    except Exception as exc:
+        return None, f"購読残枠を確認できませんでした: {type(exc).__name__}: {exc}"
+    if not _ok(ret):
+        return None, f"購読残枠を確認できませんでした: {data}"
+    if not isinstance(data, dict):
+        return None, "購読残枠の応答形式を解析できませんでした"
+
+    parsed = {
+        key: _quota_number(data.get(key))
+        for key in ("total_used", "own_used", "remain")
+    }
+    if any(value is None for value in parsed.values()):
+        return None, "購読残枠の数値を解析できませんでした"
+    if "sub_list" not in data:
+        return None, "現在の購読一覧を解析できませんでした"
+    sub_list, sub_error = _normalise_subscription_list(data["sub_list"])
+    if sub_error:
+        return None, sub_error
+    parsed["sub_list"] = sub_list
+    return parsed, None
+
+
+def _session_spec(name: str):
+    """要求セッションを検証し、共通の全時間帯K線購読設定を返す。
+
+    K_1Mの購読条件を画面セッションごとに変えると、SDK上は同じcode/subtypeが
+    既購読に見えてもRTHのまま残り得る。米国株の判定用購読は常にALLへ統一し、
+    取得後の1分足を ``_decision_quote`` で要求セッションだけに絞る。
+    """
+    try:
+        from moomoo import Session
+    except Exception as exc:
+        return None, False, f"moomoo Sessionを読み込めませんでした: {exc}"
+
+    normalised = str(name or "regular").strip().lower()
+    allowed = {
+        "regular", "pre", "premarket", "after", "afterhours",
+        "extended", "all", "overnight",
+    }
+    if normalised not in allowed:
+        return None, False, (
+            "sessionはregular/pre/premarket/after/afterhours/extended/"
+            "all/overnightから選んでください"
+        )
+    enum_name = "ALL"
+    extended_time = True
+    enum_value = getattr(Session, enum_name, None)
+    if enum_value is None:
+        return None, extended_time, (
+            f"現在のmoomoo-apiはSession.{enum_name}に対応していません"
+        )
+    return enum_value, extended_time, None
+
+
+def _normalise_current_kline(data: pd.DataFrame, num: int) -> pd.DataFrame:
+    """get_cur_klineの応答を既存チャートと同じOHLCV形式へ変換する。"""
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return pd.DataFrame()
+    required = {"time_key", "open", "high", "low", "close", "volume"}
+    if not required.issubset(data.columns):
+        return pd.DataFrame()
+
+    index = pd.to_datetime(data["time_key"], errors="coerce")
+    frame = pd.DataFrame({
+        "Open": pd.to_numeric(data["open"], errors="coerce").to_numpy(),
+        "High": pd.to_numeric(data["high"], errors="coerce").to_numpy(),
+        "Low": pd.to_numeric(data["low"], errors="coerce").to_numpy(),
+        "Close": pd.to_numeric(data["close"], errors="coerce").to_numpy(),
+        "Volume": pd.to_numeric(data["volume"], errors="coerce").to_numpy(),
+    }, index=pd.DatetimeIndex(index, name="Datetime"))
+    if "turnover" in data.columns:
+        frame["Turnover"] = pd.to_numeric(
+            data["turnover"], errors="coerce").to_numpy()
+    frame = frame.loc[~frame.index.isna()].dropna(subset=["Close"])
+    frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+    return frame.tail(num)
+
+
+def _canonical_kline_session(name: str) -> str:
+    return {
+        "pre": "premarket", "premarket": "premarket",
+        "regular": "regular",
+        "after": "afterhours", "afterhours": "afterhours",
+        "overnight": "overnight", "extended": "extended", "all": "all",
+    }.get(str(name or "").strip().lower(), "unknown")
+
+
+def _market_timestamp(value) -> pd.Timestamp | None:
+    """moomooの米国市場ローカル時刻をtimezone-awareにする。"""
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(stamp):
+        return None
+    try:
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize(
+                "America/New_York", ambiguous="NaT", nonexistent="NaT")
+        else:
+            stamp = stamp.tz_convert("America/New_York")
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(stamp) else stamp
+
+
+def _session_at_market_time(stamp: pd.Timestamp) -> str:
+    """NYSE定例日・短縮日を考慮してbar時刻のセッションを返す。"""
+    try:
+        detected = session_intelligence.detect_current_session(
+            stamp, overnight_eligible=True)
+    except (TypeError, ValueError, OverflowError):
+        return "closed"
+    return str(detected.get("session") or "closed")
+
+
+def _decision_quote(frame: pd.DataFrame, session_name: str, symbol: str) -> dict:
+    """指定セッション内の最新K_1M終値と検証可能なbar時刻を返す。"""
+    requested = _canonical_kline_session(session_name)
+    allowed = {
+        "premarket": {"premarket"}, "regular": {"regular"},
+        "afterhours": {"afterhours"}, "overnight": {"overnight"},
+        "extended": {"premarket", "afterhours"},
+        "all": {"premarket", "regular", "afterhours", "overnight"},
+    }.get(requested, set())
+    base = {
+        "available": False, "session": requested, "requested_session": requested,
+        "symbol": str(symbol or "").strip().upper(),
+        "price": None, "updated_at": None, "bar_time": None,
+        "timestamp_verified": False, "timestamp_semantics": "bar_start",
+        "timeframe": "K_1M", "source": "moomoo OpenAPI current K_1M",
+        "uses_daily_bars": False,
+    }
+    if not isinstance(frame, pd.DataFrame) or frame.empty or "Close" not in frame:
+        return {**base, "error": "利用できる1分足がありません"}
+
+    selected = None
+    for position, raw_stamp in enumerate(frame.index):
+        stamp = _market_timestamp(raw_stamp)
+        if stamp is None:
+            continue
+        actual = _session_at_market_time(stamp)
+        if actual in allowed:
+            selected = position, stamp, actual
+    if selected is None:
+        return {**base, "error": "指定セッションの1分足がありません"}
+
+    position, stamp, actual = selected
+    try:
+        price = float(frame.iloc[position]["Close"])
+    except (TypeError, ValueError, OverflowError):
+        price = None
+    if price is None or not pd.notna(price) or price <= 0:
+        return {**base, "error": "指定セッションの価格を確認できません"}
+    stamp_iso = stamp.isoformat()
+    return {
+        **base, "available": True, "session": actual,
+        "price": price, "updated_at": stamp_iso, "bar_time": stamp_iso,
+        "timestamp_verified": True,
+    }
+
+
+def _current_kline_symbols(
+        symbols) -> tuple[tuple[str, ...], dict[str, str], tuple[str, ...], dict]:
+    """入力をUSコードへ正規化し、比較対象SPYを必ず同じ購読へ含める。"""
+    values = (symbols,) if isinstance(symbols, str) else tuple(symbols or ())
+    codes: list[str] = []
+    code_to_symbol: dict[str, str] = {}
+    requested_symbols: list[str] = []
+    errors: dict[str, str] = {}
+    for original in values:
+        label = str(original or "").strip().upper() or "(empty)"
+        code = to_code(label)
+        if not code or not code.startswith("US."):
+            errors[label] = "リアルタイム1分足は米国銘柄だけに対応しています"
+            continue
+        symbol = code.split(".", 1)[1]
+        if code not in code_to_symbol:
+            codes.append(code)
+            code_to_symbol[code] = symbol
+            requested_symbols.append(symbol)
+    if codes and "US.SPY" not in code_to_symbol:
+        codes.append("US.SPY")
+        code_to_symbol["US.SPY"] = "SPY"
+    return tuple(sorted(codes)), code_to_symbol, tuple(requested_symbols), errors
+
+
+def _current_kline_key(ctx, codes: tuple[str, ...], session_name: str) -> tuple:
+    """全セッション共通leaseのkeyを作る。
+
+    ``session_name`` は旧private呼び出しとの互換用。購読自体は常にALLなので、
+    regular→afterhoursの画面切替でも同じleaseを再利用する。
+    """
+    try:
+        hash(ctx)
+        context_key = ctx
+    except TypeError:
+        context_key = ("context_id", id(ctx))
+    return context_key, codes, "all"
+
+
+def _active_all_session_codes(ctx) -> set[str]:
+    """このprocessがALL購読を確認済みのcode集合を返す。"""
+    covered: set[str] = set()
+    for lease in _current_kline_leases.values():
+        if lease.get("ctx") is ctx and lease.get("state") == "active":
+            covered.update(lease.get("codes") or ())
+    return covered
+
+
+def _elapsed(now: float, value) -> float | None:
+    try:
+        return max(0.0, now - float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _quota_for_codes(quota: dict, codes: tuple[str, ...]) -> tuple[dict, tuple[str, ...]]:
+    existing = set((quota.get("sub_list") or {}).get("K_1M", ()))
+    missing = tuple(code for code in codes if code not in existing)
+    result = {
+        **quota,
+        "required": len(missing),
+        "already_subscribed": tuple(code for code in codes if code in existing),
+        "missing": missing,
+    }
+    return result, missing
+
+
+def _cleanup_current_kline_leases(now: float, target_ctx) -> str | None:
+    """新規取得時だけ、120秒使われていない自管理購読を安全に掃除する。"""
+    blocked_error = None
+    candidate_keys = []
+    for key, lease in list(_current_kline_leases.items()):
+        age = _elapsed(now, lease.get("started_at"))
+        idle = _elapsed(now, lease.get("last_used"))
+        if (age is not None and idle is not None
+                and age >= _CURRENT_KLINE_MIN_LEASE_SECONDS
+                and idle >= _CURRENT_KLINE_IDLE_SECONDS):
+            candidate_keys.append(key)
+
+    for key in candidate_keys:
+        lease = _current_kline_leases.get(key)
+        if lease is None:
+            continue
+        lease_ctx = lease.get("ctx")
+        managed = set(lease.get("managed_codes") or ())
+        if lease.get("state") == "uncertain":
+            reconciled, reconcile_error = _query_subscription_quota(lease_ctx)
+            if reconcile_error:
+                if lease_ctx is target_ctx:
+                    blocked_error = reconcile_error
+                continue
+            present = set(
+                (reconciled.get("sub_list") or {}).get("K_1M", ()))
+            # 応答が返らなかった購読のうち、サーバーで確認できた分だけが
+            # 解除対象。存在しないcodeへunsubscribeして新規取得を塞がない。
+            managed &= present
+            lease["managed_codes"] = tuple(sorted(managed))
+        protectors: dict[str, tuple] = {}
+        for code in managed:
+            for other_key, other in _current_kline_leases.items():
+                if other_key == key or other.get("ctx") is not lease_ctx:
+                    continue
+                if code in set(other.get("codes") or ()):
+                    protectors[code] = other_key
+                    break
+        removable = tuple(sorted(managed - set(protectors)))
+        if removable:
+            try:
+                ret, msg = lease_ctx.unsubscribe(
+                    list(removable), [lease.get("subtype")])
+            except Exception as exc:
+                message = ("古い1分足購読を解除できませんでした: "
+                           f"{type(exc).__name__}: {exc}")
+                if lease_ctx is target_ctx:
+                    blocked_error = message
+                continue
+            if not _ok(ret):
+                # SDKが失敗時に内部sub_recordを変更するためleaseは保持する。
+                message = f"古い1分足購読を解除できませんでした: {msg}"
+                if lease_ctx is target_ctx:
+                    blocked_error = message
+                continue
+
+        # 共有コードの所有権を残るleaseへ渡し、後で孤児購読にならないようにする。
+        for code, protector_key in protectors.items():
+            protector = _current_kline_leases.get(protector_key)
+            if protector is None:
+                continue
+            owned = set(protector.get("managed_codes") or ())
+            owned.add(code)
+            protector["managed_codes"] = tuple(sorted(owned))
+        _current_kline_leases.pop(key, None)
+    return blocked_error
+
+
+def _acquire_current_kline_lease(ctx, codes: tuple[str, ...], *,
+                                 session_name: str, session_value,
+                                 extended_time: bool, subtype) -> tuple[dict | None, dict]:
+    """全セッションK_1M購読をquota-aware poolで再利用し、安全に追加する。"""
+    now = time.monotonic()
+    wanted_key = _current_kline_key(ctx, codes, session_name)
+    with _current_kline_lock:
+        lease = _current_kline_leases.get(wanted_key)
+        recovered_managed: set[str] = set()
+        if lease and lease.get("state") == "active":
+            lease["last_used"] = now
+            age = _elapsed(now, lease.get("started_at")) or 0.0
+            return dict(lease.get("quota") or {}), {
+                "ok": True, "reused": True, "age": age,
+                "subscribed_codes": codes,
+            }
+
+        if lease and lease.get("state") == "uncertain":
+            age = _elapsed(now, lease.get("started_at"))
+            lease["last_used"] = now
+            if age is None or age < _CURRENT_KLINE_MIN_LEASE_SECONDS:
+                retry_after = (_CURRENT_KLINE_MIN_LEASE_SECONDS
+                               if age is None else
+                               _CURRENT_KLINE_MIN_LEASE_SECONDS - age)
+                return None, {
+                    "ok": False,
+                    "error": "前回の購読結果を確認できないため、新しい購読を保留します",
+                    "retry_after": retry_after,
+                    "subscribed_codes": tuple(lease.get("observed_codes") or ()),
+                }
+
+            reconciled, reconcile_error = _query_subscription_quota(ctx)
+            if reconcile_error:
+                return None, {
+                    "ok": False, "error": reconcile_error,
+                    "subscribed_codes": tuple(lease.get("observed_codes") or ()),
+                }
+            reconciled, missing = _quota_for_codes(reconciled, codes)
+            existing = set(reconciled.get("already_subscribed") or ())
+            recovered_managed = (
+                set(lease.get("managed_codes") or ()) & existing)
+            mode_upgrade = set(lease.get("mode_upgrade_codes") or ())
+            if not missing and not mode_upgrade:
+                lease.update({
+                    "state": "active", "last_used": now,
+                    "managed_codes": tuple(sorted(recovered_managed)),
+                    "quota": reconciled,
+                })
+                return reconciled, {
+                    "ok": True, "reused": True, "age": age,
+                    "subscribed_codes": codes,
+                }
+            # 既存codeのALL化を試みた応答が不明な場合、query_subscriptionでは
+            # session条件まで証明できない。60秒経過後に安全に再試行する。
+            # 新規codeが無い場合も同様に、このuncertain leaseを一旦捨てる。
+            _current_kline_leases.pop(wanted_key, None)
+
+        cleanup_error = _cleanup_current_kline_leases(now, ctx)
+        quota, quota_error = _query_subscription_quota(ctx)
+        if quota_error:
+            return None, {"ok": False, "error": quota_error,
+                          "subscribed_codes": ()}
+        quota, missing = _quota_for_codes(quota, codes)
+        already = tuple(quota.get("already_subscribed") or ())
+        # query_subscriptionのsub_listはsession条件を含まない。別画面・外部接続の
+        # 既購読codeでも、このprocessでALL購読を確認できないものは一度だけ
+        # 同じcodeをALLで再subscribeして購読条件を明示する。既存codeなので
+        # 新規購読枠のrequiredには数えず、自管理unsubscribe対象にもしない。
+        compatible = _active_all_session_codes(ctx)
+        mode_upgrade = tuple(
+            code for code in already if code not in compatible)
+        subscribe_codes = tuple(sorted(set(missing) | set(mode_upgrade)))
+        if subscribe_codes and cleanup_error:
+            return None, {
+                "ok": False, "error": cleanup_error, "quota": quota,
+                "subscribed_codes": already,
+            }
+        if quota["remain"] < len(missing):
+            return None, {
+                "ok": False,
+                "error": (f"リアルタイム1分足の購読枠が不足しています"
+                          f"（必要 {len(missing)} / 残り {quota['remain']}）"),
+                "quota": quota,
+                "subscribed_codes": already,
+            }
+
+        if not subscribe_codes:
+            _current_kline_leases[wanted_key] = {
+                "ctx": ctx, "codes": codes, "subtype": subtype,
+                "session": session_name, "started_at": now, "last_used": now,
+                "state": "active", "quota": quota,
+                "managed_codes": tuple(sorted(recovered_managed)),
+            }
+            return quota, {"ok": True, "reused": False, "age": 0.0,
+                           "subscribed_codes": codes}
+
+        subscribe_started = time.monotonic()
+        managed_codes = tuple(sorted(recovered_managed | set(missing)))
+        uncertain = {
+            "ctx": ctx, "codes": codes, "subtype": subtype,
+            "session": session_name, "started_at": subscribe_started,
+            "last_used": now, "state": "uncertain", "quota": quota,
+            "managed_codes": managed_codes, "attempted_codes": subscribe_codes,
+            "mode_upgrade_codes": mode_upgrade,
+            "observed_codes": already,
+        }
+        try:
+            ret, msg = ctx.subscribe(
+                list(subscribe_codes), [subtype], is_first_push=False,
+                subscribe_push=False, extended_time=extended_time,
+                session=session_value,
+            )
+        except Exception as exc:
+            _current_kline_leases[wanted_key] = uncertain
+            return None, {
+                "ok": False,
+                "error": f"1分足を購読できませんでした: {type(exc).__name__}: {exc}",
+                "quota": quota,
+                "retry_after": _CURRENT_KLINE_MIN_LEASE_SECONDS,
+                "subscribed_codes": already,
+            }
+        if not _ok(ret):
+            _current_kline_leases[wanted_key] = uncertain
+            return None, {
+                "ok": False,
+                "error": f"1分足を購読できませんでした: {msg}",
+                "quota": quota,
+                "retry_after": _CURRENT_KLINE_MIN_LEASE_SECONDS,
+                "subscribed_codes": already,
+            }
+
+        _current_kline_leases[wanted_key] = {
+            **uncertain, "state": "active", "observed_codes": codes,
+        }
+        return quota, {"ok": True, "reused": False, "age": 0.0,
+                       "subscribed_codes": codes}
+
+
+def current_klines(symbols, num: int = 120, session: str = "regular") -> dict:
+    """銘柄とSPYの現在1分足を、履歴K線枠を使わず読み取り専用で返す。
+
+    購読はcontext・銘柄集合ごとに全セッション共通で再利用する。利用中の別集合は
+    維持し、古い自管理購読だけを60秒制約と残り枠を確認して掃除する。
+    """
+    session_name = str(session or "regular").strip().lower()
+    try:
+        count = int(num)
+    except (TypeError, ValueError, OverflowError):
+        count = 0
+    if count < 1 or count > 1000:
+        return _current_kline_result(
+            session=session_name, errors={"num": "numは1〜1000で指定してください"})
+
+    session_value, extended_time, session_error = _session_spec(session_name)
+    if session_error:
+        return _current_kline_result(
+            session=session_name, errors={"session": session_error})
+
+    codes, code_to_symbol, requested_symbols, errors = _current_kline_symbols(symbols)
+    if not codes:
+        if not errors:
+            errors["symbols"] = "銘柄を1つ以上指定してください"
+        return _current_kline_result(
+            session=session_name, requested_symbols=requested_symbols,
+            errors=errors)
+
+    ctx = _ctx()
+    if ctx is None:
+        errors["connection"] = status()["message"]
+        return _current_kline_result(
+            session=session_name, requested_symbols=requested_symbols,
+            errors=errors)
+    try:
+        from moomoo import AuType, KLType, SubType
+    except Exception as exc:
+        errors["sdk"] = f"moomooの1分足APIを読み込めませんでした: {exc}"
+        return _current_kline_result(
+            session=session_name, requested_symbols=requested_symbols,
+            errors=errors)
+
+    quota, lease = _acquire_current_kline_lease(
+        ctx, codes, session_name="all", session_value=session_value,
+        extended_time=extended_time, subtype=SubType.K_1M,
+    )
+    if not lease.get("ok"):
+        errors["subscription"] = str(lease.get("error") or "1分足を購読できませんでした")
+        active_symbols = tuple(
+            str(code).split(".", 1)[-1]
+            for code in lease.get("subscribed_codes") or ()
+        )
+        return _current_kline_result(
+            session=session_name, requested_symbols=requested_symbols,
+            subscribed_symbols=active_symbols,
+            errors=errors, quota=lease.get("quota") or quota,
+            retry_after_seconds=lease.get("retry_after"))
+
+    frames: dict[str, pd.DataFrame] = {}
+    for code in codes:
+        symbol = code_to_symbol[code]
+        try:
+            ret, data = ctx.get_cur_kline(
+                code, count, ktype=KLType.K_1M, autype=AuType.NONE)
+        except Exception as exc:
+            errors[symbol] = f"1分足を取得できませんでした: {type(exc).__name__}: {exc}"
+            continue
+        if not _ok(ret):
+            errors[symbol] = f"1分足を取得できませんでした: {data}"
+            continue
+        frame = _normalise_current_kline(data, count)
+        if frame.empty:
+            errors[symbol] = "利用できる1分足がありません"
+            continue
+        frames[symbol] = frame
+
+    decision_quotes: dict[str, dict] = {}
+    for code in codes:
+        symbol = code_to_symbol[code]
+        quote = _decision_quote(
+            frames.get(symbol, pd.DataFrame()), session_name, symbol)
+        decision_quotes[symbol] = quote
+        if not quote.get("available"):
+            errors.setdefault(
+                symbol, str(quote.get("error") or "指定セッションの価格を確認できません"))
+
+    complete = (bool(frames) and not errors and len(frames) == len(codes)
+                and all(row.get("available") for row in decision_quotes.values()))
+    partial = bool(frames) and not complete
+    return _current_kline_result(
+        frames=frames, available=complete, partial=partial,
+        session=session_name, requested_symbols=requested_symbols,
+        subscribed_symbols=tuple(code_to_symbol[code] for code in codes),
+        errors=errors, quota=quota, decision_quotes=decision_quotes,
+        reused=bool(lease.get("reused")),
+    )
+
+
 # ------------------------------------------------------------------- 取得API
+
+def _positive_snapshot_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if pd.notna(number) and number > 0 else None
+
+
+def _snapshot_session_quotes(row: dict, fetched_at: str) -> dict[str, dict]:
+    """snapshotの各価格を、時刻の証明範囲を誇張せず公開する。"""
+    snapshot_stamp = _market_timestamp(row.get("update_time"))
+    snapshot_updated_at = (
+        snapshot_stamp.isoformat() if snapshot_stamp is not None else None)
+    snapshot_session = (
+        _session_at_market_time(snapshot_stamp)
+        if snapshot_stamp is not None else "closed")
+    fields = {
+        "premarket": ("pre_price", "pre_volume"),
+        "regular": ("last_price", "volume"),
+        "afterhours": ("after_price", "after_volume"),
+        "overnight": ("overnight_price", "overnight_volume"),
+    }
+    result: dict[str, dict] = {}
+    for session_name, (price_field, volume_field) in fields.items():
+        price = _positive_snapshot_number(row.get(price_field))
+        regular_timestamp = (
+            session_name == "regular" and snapshot_session == "regular")
+        result[session_name] = {
+            "available": price is not None,
+            "session": session_name,
+            "price": price,
+            "volume": _positive_snapshot_number(row.get(volume_field)),
+            # SDKは時間外価格ごとの時刻を返さない。汎用update_timeを時間外の
+            # 鮮度時刻に流用せず、K_1Mのdecision_quotesでbar時刻を確認する。
+            "updated_at": snapshot_updated_at if regular_timestamp else None,
+            "snapshot_updated_at": snapshot_updated_at,
+            "fetched_at": fetched_at,
+            "timestamp_verified": bool(regular_timestamp),
+            "actionable_from_snapshot": bool(price is not None and regular_timestamp),
+            "price_field": price_field,
+            "source": "moomoo OpenAPI snapshot",
+            "uses_daily_bars": False,
+        }
+    return result
 
 @st.cache_data(ttl=5, show_spinner=False)
 def snapshot(tickers: tuple[str, ...]) -> dict[str, dict]:
@@ -225,6 +901,7 @@ def snapshot(tickers: tuple[str, ...]) -> dict[str, dict]:
     if not _ok(ret) or not isinstance(data, pd.DataFrame) or data.empty:
         return {}
 
+    fetched_at = pd.Timestamp.now(tz="UTC").isoformat()
     out = {}
     for row in data.to_dict("records"):
         t = back.get(row.get("code"))
@@ -232,9 +909,9 @@ def snapshot(tickers: tuple[str, ...]) -> dict[str, dict]:
             continue
         last = row.get("last_price")
         prev = row.get("prev_close_price")
-        if last is None or pd.isna(last):
-            # 価格が取れない銘柄は結果に含めない。
-            # 呼び出し側が「moomooに無い」と判断してyfinanceに戻せるようにする。
+        session_quotes = _snapshot_session_quotes(row, fetched_at)
+        if not any(item["available"] for item in session_quotes.values()):
+            # どのセッションにも価格が無ければ、呼び出し側がYahooへ戻せるよう除外。
             continue
         change_pct = None
         if last is not None and prev:
@@ -280,6 +957,9 @@ def snapshot(tickers: tuple[str, ...]) -> dict[str, dict]:
             "overnight_change_percent": row.get("overnight_change_rate"),
             "volume_ratio": row.get("volume_ratio"),
             "update_time": row.get("update_time"),
+            "update_time_iso": session_quotes["regular"]["snapshot_updated_at"],
+            "snapshot_fetched_at": fetched_at,
+            "session_quotes": session_quotes,
             "suspension": row.get("suspension"),
         }
     return out

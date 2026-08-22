@@ -25,6 +25,18 @@ class RuleAlertTests(unittest.TestCase):
         self.assertFalse(alerts.check(
             alerts.new_alert("AAPL", "rule_risk_exit"), ctx)["triggered"])
 
+    def test_blocked_buy_alert_still_triggers_but_explains_to_wait(self):
+        alert = alerts.new_alert("AAPL", "rule_buy")
+        checked = alerts.check(alert, {
+            "entry_verdict": "BUY", "entry_blocked": True,
+        })
+        self.assertTrue(checked["triggered"])
+        self.assertEqual(checked["actual"], "BUY_BLOCKED")
+        self.assertEqual(
+            alerts.format_actual(alert, checked["actual"]),
+            "買い条件あり・今は待つ",
+        )
+
     def test_price_alert_prefers_realtime_snapshot(self):
         frame = pd.DataFrame({"Close": [100.0, 101.0]})
         alert = alerts.new_alert("AAPL", "price_above", 105)
@@ -35,11 +47,12 @@ class RuleAlertTests(unittest.TestCase):
 
     def test_rule_actuals_are_japanese_and_legacy_sell_is_not_short_sale(self):
         cases = {
-            "BUY": "新規買い候補",
-            "RISK_EXIT": "保有株の売却候補・リスク退出",
-            "TAKE_PROFIT": "保有株の売却候補・利益確定",
-            "HOLD": "保有継続",
-            "SELL": "保有株の手仕舞い・旧形式",
+            "BUY": "買い候補",
+            "BUY_BLOCKED": "買い条件あり・今は待つ",
+            "RISK_EXIT": "保有株を売る候補（損失を抑える）",
+            "TAKE_PROFIT": "保有株を売る候補（利益を確定する）",
+            "HOLD": "そのまま保有",
+            "SELL": "保有株を売る候補（以前の設定）",
         }
         for actual, expected in cases.items():
             with self.subTest(actual=actual):
@@ -47,6 +60,7 @@ class RuleAlertTests(unittest.TestCase):
                     alerts.new_alert("AAPL", "rule_sell"), actual)
                 self.assertIn(expected, shown)
                 self.assertNotIn("空売り", shown)
+                self.assertNotIn(f"（{actual}）", shown)
 
     def test_non_rule_actual_is_not_relabelled(self):
         alert = alerts.new_alert("AAPL", "price_above", 100)
