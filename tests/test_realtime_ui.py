@@ -37,15 +37,15 @@ class RealtimeTimingUiContractTests(unittest.TestCase):
         ticker_guard = self.source.index("if not ticker:")
         self.assertGreater(call_position, self.source.index("st.stop()", ticker_guard))
         self.assertEqual(self.source.count(call_text), 1)
-        self.assertEqual(
-            self.source.count("**⚡ リアルタイム売買タイミング**"), 1)
+        self.assertIn('else "⚡ リアルタイム売買タイミング")', self.card)
         self.assertNotIn("realtime_box =", self.source)
 
     def test_card_is_a_top_level_function_independent_of_daily_page_state(self):
         self.assertLess(self.card_node.lineno, self.source[:self.source.index(
             'st.title("📈 銘柄分析")')].count("\n") + 1)
         self.assertEqual([arg.arg for arg in self.card_node.args.args], ["ticker"])
-        self.assertIn("with st.container(border=True):", self.card)
+        self.assertIn("with st.expander(", self.card)
+        self.assertIn("expanded=bool(st.session_state[realtime_monitor_key])", self.card)
         loaded_names = {
             node.id for node in ast.walk(self.card_node)
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
@@ -71,7 +71,8 @@ class RealtimeTimingUiContractTests(unittest.TestCase):
         self.assertIn("@st.fragment(run_every=", self.source)
         self.assertIn('"監視する"', self.card)
         self.assertIn('if realtime_monitoring:', self.card)
-        self.assertIn('with st.expander("監視の設定", expanded=True):', self.card)
+        self.assertIn('realtime_panel_label = (', self.card)
+        self.assertNotIn('with st.expander("監視の設定"', self.card)
         self.assertIn("▶ 停止中 — ONにすると現在の1分足を確認します", self.card)
         self.assertNotIn('st.info("監視は停止中です', self.card)
 
@@ -108,7 +109,7 @@ class RealtimeTimingUiContractTests(unittest.TestCase):
             self.assertIn(label, self.source)
         self.assertIn("moomoo過去K線枠の追加使用は0です", self.source)
         self.assertIn("日足・チャートは別機能です", self.source)
-        self.assertIn("そちらが別途", self.source)
+        self.assertIn("買い表示は利益を保証せず", self.source)
 
     def test_realtime_judgement_is_independent_of_daily_and_purchase_plan(self):
         for forbidden in (

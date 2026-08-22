@@ -9,7 +9,7 @@ import streamlit as st
 from lib import (alerts as alerts_lib, board_ui, data_fetcher,
                  event_intelligence, information_board, news_fetcher,
                  rules as rules_lib, session_intelligence, settings_store,
-                 trade_summary, trading_context)
+                 today_inputs, trade_summary, trading_context)
 
 
 def _wait_evaluation(mode: str, message: str) -> dict:
@@ -136,7 +136,7 @@ with st.spinner(f"{ticker}の情報を整理中..."):
 
     board_session = session_intelligence.detect_current_session(
         market_state=market_state.get("market_state"),
-        overnight_eligible=None,
+        overnight_eligible=today_inputs.overnight_eligibility(snapshot_for_board),
     )
     board_entry_summary = trade_summary.build_trade_summary({
         "current_price": snapshot_for_board.get("price"),
@@ -193,7 +193,7 @@ with st.spinner(f"{ticker}の情報を整理中..."):
         })
 
     try:
-        news = news_fetcher.fetch_news(ticker)
+        news = news_fetcher.fetch_news(ticker, info.get("name"))
     except Exception as exc:
         news = []
         warnings.append(f"ニュースを取得できませんでした: {exc}")

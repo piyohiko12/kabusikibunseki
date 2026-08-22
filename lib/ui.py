@@ -4,6 +4,7 @@
 """
 
 from datetime import datetime, timezone
+import html
 
 import plotly.graph_objects as go
 
@@ -28,9 +29,27 @@ SENTIMENT_LABELS = {"Bullish": "強気", "Bearish": "弱気"}
 
 def chip(text: str, color: str = "gray") -> str:
     bg, fg = _CHIP_STYLES.get(color, _CHIP_STYLES["gray"])
+    safe_text = html.escape(str(text))
     return (f'<span style="background:{bg};color:{fg};padding:2px 10px;'
             f'border-radius:12px;font-size:0.78rem;font-weight:600;'
-            f'white-space:nowrap;">{text}</span>')
+            f'white-space:nowrap;">{safe_text}</span>')
+
+
+def compact_kpi_grid(items: list[tuple[object, object, object | None]]) -> str:
+    """主要数値を、小さく折り返せる安全なカード列へ変換する。"""
+    cards = []
+    for label, value, note in items:
+        label_text = html.escape(str(label or "—"))
+        value_text = html.escape(str(value if value not in (None, "") else "—"))
+        note_text = html.escape(str(note or ""))
+        note_html = (f'<div class="compact-kpi-note">{note_text}</div>'
+                     if note_text else "")
+        cards.append(
+            '<div class="compact-kpi" role="listitem">'
+            f'<div class="compact-kpi-label">{label_text}</div>'
+            f'<div class="compact-kpi-value">{value_text}</div>'
+            f'{note_html}</div>')
+    return '<div class="compact-kpi-grid" role="list">' + "".join(cards) + "</div>"
 
 
 def source_chip(source: str) -> str:
@@ -86,8 +105,8 @@ def stacked_bar(segments: list[tuple[str, int, str, str]]) -> go.Figure:
 def sentiment_bar(bullish: int, bearish: int, neutral: int) -> go.Figure:
     """強気/弱気/表明なしの内訳バー。"""
     return stacked_bar([
-        ("強気", bullish, "#0ca30c", "#ffffff"),
-        ("弱気", bearish, "#d03b3b", "#ffffff"),
+        ("強気", bullish, "#006300", "#ffffff"),
+        ("弱気", bearish, "#a32d2d", "#ffffff"),
         ("表明なし", neutral, "#c3c2b7", "#0b0b0b"),
     ])
 
@@ -96,8 +115,8 @@ def rating_bar(counts: dict) -> go.Figure:
     """アナリストレーティング分布バー(強い買い→強い売り)。"""
     return stacked_bar([
         ("強い買い", counts.get("strongBuy", 0), "#006300", "#ffffff"),
-        ("買い", counts.get("buy", 0), "#0ca30c", "#ffffff"),
+        ("買い", counts.get("buy", 0), "#006300", "#ffffff"),
         ("中立", counts.get("hold", 0), "#c3c2b7", "#0b0b0b"),
-        ("売り", counts.get("sell", 0), "#ec835a", "#ffffff"),
-        ("強い売り", counts.get("strongSell", 0), "#d03b3b", "#ffffff"),
+        ("売り", counts.get("sell", 0), "#ec835a", "#0b0b0b"),
+        ("強い売り", counts.get("strongSell", 0), "#a32d2d", "#ffffff"),
     ])

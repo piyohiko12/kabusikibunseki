@@ -23,6 +23,15 @@ from lib.data_fetcher import FetchError
 
 _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) stock-analyzer/1.0"}
 
+_CORPORATE_WORDS = {
+    "inc", "incorporated", "corp", "corporation", "company", "co", "ltd",
+    "limited", "plc", "holdings", "holding", "group", "sa", "ag", "nv",
+}
+_KNOWN_NEWS_ALIASES = {
+    "GOOG": ("google",), "GOOGL": ("google",),
+    "META": ("facebook",), "BRK-B": ("berkshire",),
+}
+
 
 def _sec_user_agent() -> dict:
     """SEC EDGAR用のUser-Agent。
@@ -68,8 +77,58 @@ def _strip_html(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", " ", text or "")).strip()
 
 
+def _normalized_news_symbol(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("symbol") or value.get("ticker") or value.get("code")
+    text = str(value or "").strip().upper()
+    if text.startswith("US."):
+        text = text[3:]
+    return text.replace(".", "-")
+
+
+def _tagged_news_symbols(item: dict, content: dict) -> set[str]:
+    """Yahooが記事へ明示した関連銘柄だけを正規化して返す。"""
+    tagged = []
+
+    def add(values) -> None:
+        if isinstance(values, (str, dict)):
+            tagged.append(values)
+        elif isinstance(values, (list, tuple, set)):
+            tagged.extend(values)
+
+    finance = content.get("finance")
+    if isinstance(finance, dict):
+        add(finance.get("stockTickers"))
+        add(finance.get("tickers"))
+    for holder in (item, content):
+        add(holder.get("relatedTickers"))
+        add(holder.get("stockTickers"))
+    return {symbol for symbol in map(_normalized_news_symbol, tagged) if symbol}
+
+
+def _news_aliases(ticker: str, company_name: str | None) -> set[str]:
+    symbol = _normalized_news_symbol(ticker)
+    aliases = {symbol, symbol.replace("-", "."), symbol.replace("-", "")}
+    aliases.update(_KNOWN_NEWS_ALIASES.get(symbol, ()))
+    words = re.findall(r"[a-z0-9]+", str(company_name or "").casefold())
+    meaningful = [word for word in words if word not in _CORPORATE_WORDS]
+    if meaningful:
+        phrase = " ".join(meaningful)
+        aliases.add(phrase)
+        aliases.update(word for word in meaningful if len(word) >= 4)
+    return {alias.casefold() for alias in aliases if len(alias) >= 2}
+
+
+def _mentions_company(text: str, ticker: str, company_name: str | None) -> bool:
+    searchable = str(text or "").casefold()
+    for alias in _news_aliases(ticker, company_name):
+        if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", searchable):
+            return True
+    return False
+
+
 @st.cache_data(ttl=900, show_spinner="ニュースを取得中...")
-def fetch_news(ticker: str) -> list[dict]:
+def fetch_news(ticker: str, company_name: str | None = None) -> list[dict]:
     """最新ニュースを最大10件取得する。取得できない場合は空リスト。"""
     try:
         items = yf.Ticker(ticker).news or []
@@ -81,6 +140,17 @@ def fetch_news(ticker: str) -> list[dict]:
         c = item.get("content") or {}
         title = c.get("title")
         if not title:
+            continue
+        tagged_symbols = _tagged_news_symbols(item, c)
+        if (tagged_symbols
+                and _normalized_news_symbol(ticker) not in tagged_symbols):
+            # Yahooのおすすめ記事が銘柄ニュースへ混ざる場合があるため、
+            # 明示タグが別銘柄だけの記事は表示・イベント化しない。
+            continue
+        article_text = " ".join((title, c.get("summary") or "",
+                                 c.get("description") or ""))
+        if (not tagged_symbols and company_name
+                and not _mentions_company(article_text, ticker, company_name)):
             continue
         news.append({
             "title": title,

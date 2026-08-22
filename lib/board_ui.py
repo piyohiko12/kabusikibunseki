@@ -175,11 +175,12 @@ def render_information_board(report: dict, *, show_heading: bool = True,
     active_alerts = [item for item in board_items
                      if item.get("category") == "alert"
                      and (item.get("data") or {}).get("triggered") is True]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("その他の情報", f"{len(board_items)}件", border=True)
-    m2.metric("重要", f"{len(high_items)}件", border=True)
-    m3.metric("イベント", f"{len(event_items)}件", border=True)
-    m4.metric("成立アラート", f"{len(active_alerts)}件", border=True)
+    st.markdown(ui.compact_kpi_grid([
+        ("その他の情報", f"{len(board_items)}件", None),
+        ("重要", f"{len(high_items)}件", None),
+        ("イベント", f"{len(event_items)}件", None),
+        ("成立アラート", f"{len(active_alerts)}件", None),
+    ]), unsafe_allow_html=True)
 
     categories = sorted({str(item.get("category_label_ja")) for item in board_items
                          if item.get("category_label_ja")})
@@ -188,6 +189,10 @@ def render_information_board(report: dict, *, show_heading: bool = True,
          if item.get("importance_label_ja")},
         key=lambda label: {"最重要": 0, "重要": 1, "要確認": 2,
                            "参考": 3, "情報": 4}.get(label, 9))
+    default_importance = [
+        label for label in importance_labels
+        if label in {"最重要", "重要"}
+    ] or importance_labels
     f1, f2 = st.columns([1.3, 1.7])
     selected_categories = f1.multiselect(
         "カテゴリ", categories, default=categories,
@@ -197,8 +202,8 @@ def render_information_board(report: dict, *, show_heading: bool = True,
         key=f"{key_prefix}_search")
     with st.expander("さらに絞り込む"):
         selected_importance = st.multiselect(
-            "重要度", importance_labels, default=importance_labels,
-            key=f"{key_prefix}_importance")
+            "重要度", importance_labels, default=default_importance,
+            key=f"{key_prefix}_importance_v2")
         sort_label = st.radio(
             "並び順", list(SORT_LABELS), horizontal=True,
             key=f"{key_prefix}_sort")
@@ -206,7 +211,7 @@ def render_information_board(report: dict, *, show_heading: bool = True,
     shown_items = _filter_items(
         board_items, selected_categories, selected_importance, search)
     shown_items.sort(key=lambda item: _item_sort_key(item, SORT_LABELS[sort_label]))
-    st.caption(f"{len(shown_items)} / {len(board_items)}件を表示")
+    st.caption(f"最重要・重要を優先して {len(shown_items)} / {len(board_items)}件を表示")
 
     if not shown_items:
         if board_items:

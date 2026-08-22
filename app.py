@@ -13,6 +13,7 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    [data-testid="stAppViewContainer"] [data-testid="stMainBlockContainer"],
     [data-testid="stAppViewContainer"] .main .block-container {
         max-width: 1480px;
         padding-top: 1.15rem;
@@ -71,19 +72,70 @@ st.markdown(
         font-size: .88rem;
         font-weight: 600;
     }
+    [data-testid="stTabs"] [data-testid="stTab"],
     [data-testid="stTabs"] [data-baseweb="tab"] {
         height: 2.55rem;
         padding-left: .7rem;
         padding-right: .7rem;
     }
+    [data-testid="stTabs"] [role="tablist"] {
+        gap: .55rem;
+    }
+    .compact-kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+        gap: .42rem;
+        margin: .32rem 0 .55rem;
+    }
+    .compact-kpi {
+        border: 1px solid rgba(128, 128, 128, .28);
+        border-radius: .55rem;
+        padding: .48rem .58rem;
+        min-width: 0;
+    }
+    .compact-kpi-label {
+        font-size: .72rem;
+        line-height: 1.2;
+        opacity: .72;
+    }
+    .compact-kpi-value {
+        font-size: 1.04rem;
+        line-height: 1.25;
+        font-weight: 650;
+        margin-top: .12rem;
+        overflow-wrap: anywhere;
+    }
+    .compact-kpi-note {
+        font-size: .68rem;
+        line-height: 1.25;
+        opacity: .72;
+        margin-top: .1rem;
+    }
     @media (max-width: 700px) {
+        [data-testid="stAppViewContainer"] [data-testid="stMainBlockContainer"],
         [data-testid="stAppViewContainer"] .main .block-container {
-            padding: .72rem .78rem 1.5rem;
+            padding: 4rem .78rem 1.5rem;
         }
         [data-testid="stAppViewContainer"] h1 { font-size: 1.55rem; }
         [data-testid="stMetric"] { padding: .45rem .55rem; }
         [data-testid="stMetricValue"] { font-size: 1.12rem; }
         [data-testid="stAlert"] { padding: .55rem .65rem; }
+        [data-testid="stTabs"] [data-testid="stTab"],
+        [data-testid="stTabs"] [data-baseweb="tab"] {
+            height: 2.35rem;
+            padding-left: .22rem;
+            padding-right: .22rem;
+        }
+        [data-testid="stTabs"] [data-testid="stTab"] p,
+        [data-testid="stTabs"] [data-baseweb="tab"] p {
+            font-size: .76rem;
+            white-space: nowrap;
+        }
+        [data-testid="stTabs"] [role="tablist"] { gap: .25rem; }
+        .compact-kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .compact-kpi { padding: .42rem .4rem; }
+        .compact-kpi-value { font-size: .9rem; }
+        .compact-kpi-note { font-size: .66rem; }
     }
     </style>
     """,

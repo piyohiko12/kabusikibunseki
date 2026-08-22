@@ -950,7 +950,8 @@ def _fetch_event_intelligence_uncached(
     news: list[dict] = []
     if include_news:
         yahoo_news = _safe_source(
-            "yahoo_news", lambda: news_fetcher.fetch_news(symbol), [], errors)
+            "yahoo_news",
+            lambda: news_fetcher.fetch_news(symbol, info.get("name")), [], errors)
         sec_news = _safe_source(
             "sec_filings", lambda: news_fetcher.fetch_sec_filings(symbol), [], errors)
         news = list(yahoo_news or []) + list(sec_news or [])
