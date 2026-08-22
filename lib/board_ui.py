@@ -126,7 +126,7 @@ def _render_trade_overview(items: list[dict]) -> None:
     rows = _trade_overview_rows(items)
     if not rows:
         return
-    st.markdown("### 🎯 売買の目安")
+    st.markdown("**🎯 売買の目安**")
     st.caption("株を持っているかどうかで、見るカードを選んでください。")
     columns = st.columns(len(rows))
     for column, row in zip(columns, rows):
@@ -134,7 +134,7 @@ def _render_trade_overview(items: list[dict]) -> None:
         with column:
             st.markdown(f"**{row['heading_ja']}**")
             getattr(st, visual["severity"])(
-                f"### {visual['icon']} {visual['action_label_ja']}\n\n"
+                f"**{visual['icon']} {visual['action_label_ja']}** — "
                 f"{visual['description_ja']}"
             )
     if any(row.get("summary_ja") for row in rows):
@@ -228,7 +228,7 @@ def render_information_board(report: dict, *, show_heading: bool = True,
                         IMPORTANCE_COLORS.get(importance, "gray")),
             ]
             st.markdown(" ".join(chips), unsafe_allow_html=True)
-            st.markdown(f"#### {_plain_markdown(item.get('title_ja'))}")
+            st.markdown(f"**{_plain_markdown(item.get('title_ja'))}**")
             if item.get("summary_ja"):
                 st.markdown(_plain_markdown(item.get("summary_ja")))
             source = str(item.get("source") or "情報源不明")

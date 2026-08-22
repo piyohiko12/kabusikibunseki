@@ -135,8 +135,8 @@ else:
                 "現値": "${:,.2f}", "観測ドル出来高": "${:,.0f}"}),
                 hide_index=True)
             st.caption(f"合格ライン {v6.STOCK_PASS}点 / "
-                       f"流動性は${v6.MIN_PRICE:.2f}以上かつ"
-                       f"${v6.MIN_DOLLAR_VOLUME:,.0f}以上")
+                       f"流動性はUSD {v6.MIN_PRICE:.2f}以上かつ"
+                       f"USD {v6.MIN_DOLLAR_VOLUME:,.0f}以上")
 
     with c_etf:
         st.markdown("**日次2倍ETF**")

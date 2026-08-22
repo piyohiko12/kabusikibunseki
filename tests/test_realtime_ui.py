@@ -38,7 +38,7 @@ class RealtimeTimingUiContractTests(unittest.TestCase):
         self.assertGreater(call_position, self.source.index("st.stop()", ticker_guard))
         self.assertEqual(self.source.count(call_text), 1)
         self.assertEqual(
-            self.source.count("### ⚡ リアルタイム売買タイミング"), 1)
+            self.source.count("**⚡ リアルタイム売買タイミング**"), 1)
         self.assertNotIn("realtime_box =", self.source)
 
     def test_card_is_a_top_level_function_independent_of_daily_page_state(self):
@@ -69,8 +69,11 @@ class RealtimeTimingUiContractTests(unittest.TestCase):
         self.assertIn("st.session_state[realtime_monitor_key] = False", self.source)
         self.assertIn("REALTIME_REFRESH_SECONDS = (5, 10, 30)", self.source)
         self.assertIn("@st.fragment(run_every=", self.source)
-        self.assertIn("リアルタイム監視（ONで開始 / OFFで停止）", self.source)
-        self.assertIn('st.caption("⏸ 監視中" if realtime_monitoring else "▶ 停止中")', self.source)
+        self.assertIn('"監視する"', self.card)
+        self.assertIn('if realtime_monitoring:', self.card)
+        self.assertIn('with st.expander("監視の設定", expanded=True):', self.card)
+        self.assertIn("▶ 停止中 — ONにすると現在の1分足を確認します", self.card)
+        self.assertNotIn('st.info("監視は停止中です', self.card)
 
     def test_live_adapter_does_not_fall_back_to_delayed_quote(self):
         self.assertIn('getattr(data_fetcher, "fetch_current_klines", None)', self.source)

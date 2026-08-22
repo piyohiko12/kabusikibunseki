@@ -436,38 +436,43 @@ def render_realtime_timing_card(ticker: str) -> None:
     realtime_interval_key = f"realtime_refresh_seconds_{ticker}"
     if realtime_monitor_key not in st.session_state:
         st.session_state[realtime_monitor_key] = False
+    if realtime_mode_key not in st.session_state:
+        st.session_state[realtime_mode_key] = next(iter(REALTIME_POSITION_MODES))
     if realtime_interval_key not in st.session_state:
         st.session_state[realtime_interval_key] = 5
 
     with st.container(border=True):
-        st.markdown("### ⚡ リアルタイム売買タイミング")
-        st.caption(
-            "確定1分足の短期条件、今の値動き、売買前の安全確認を順番に見ます。"
-            "短い値動きだけで売買を決めません。")
-        realtime_controls = st.columns([1.45, 1, 1.25])
-        with realtime_controls[0]:
-            realtime_mode_label = st.radio(
-                "現在の状況",
-                list(REALTIME_POSITION_MODES),
-                horizontal=True,
-                key=realtime_mode_key,
-            )
-        with realtime_controls[1]:
-            realtime_refresh_seconds = st.selectbox(
-                "更新間隔",
-                REALTIME_REFRESH_SECONDS,
-                format_func=lambda seconds: f"{seconds}秒ごと",
-                key=realtime_interval_key,
-                help="表示中の銘柄だけを部分更新します。",
-            )
-        with realtime_controls[2]:
-            st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+        realtime_header = st.columns([3.7, 1.3])
+        with realtime_header[0]:
+            st.markdown("**⚡ リアルタイム売買タイミング**")
+            st.caption("確定1分足で、今の短期タイミングだけを確認します。")
+        with realtime_header[1]:
             realtime_monitoring = st.toggle(
-                "リアルタイム監視（ONで開始 / OFFで停止）",
+                "監視する",
                 key=realtime_monitor_key,
                 help="既定はOFFです。ONの間だけmoomooの当日足と最新価格を確認します。",
             )
-            st.caption("⏸ 監視中" if realtime_monitoring else "▶ 停止中")
+
+        realtime_mode_label = str(st.session_state[realtime_mode_key])
+        realtime_refresh_seconds = int(st.session_state[realtime_interval_key])
+        if realtime_monitoring:
+            with st.expander("監視の設定", expanded=True):
+                realtime_controls = st.columns([1.6, 1])
+                with realtime_controls[0]:
+                    realtime_mode_label = st.radio(
+                        "現在の状況",
+                        list(REALTIME_POSITION_MODES),
+                        horizontal=True,
+                        key=realtime_mode_key,
+                    )
+                with realtime_controls[1]:
+                    realtime_refresh_seconds = st.selectbox(
+                        "更新間隔",
+                        REALTIME_REFRESH_SECONDS,
+                        format_func=lambda seconds: f"{seconds}秒ごと",
+                        key=realtime_interval_key,
+                        help="表示中の銘柄だけを部分更新します。",
+                    )
 
         realtime_mode = REALTIME_POSITION_MODES.get(realtime_mode_label, "entry")
         holding_entry_value = holding_stop_value = holding_target_value = None
@@ -512,8 +517,7 @@ def render_realtime_timing_card(ticker: str) -> None:
         def render_realtime_timing_panel():
             """最新データの取得・判定・表示を、このカード内だけで更新する。"""
             if not realtime_monitoring:
-                st.info("監視は停止中です。必要なときに上の『リアルタイム監視』をONにしてください。")
-                st.caption("停止中はリアルタイム足を取得せず、連続成立回数もリセットします。")
+                st.caption("▶ 停止中 — ONにすると現在の1分足を確認します。停止中はデータを取得しません。")
                 return
 
             def reset_ticker_memory() -> None:
@@ -526,12 +530,12 @@ def render_realtime_timing_card(ticker: str) -> None:
                 live_snapshot = data_fetcher.fetch_realtime_snapshot(ticker)
             except Exception as exc:
                 reset_ticker_memory()
-                st.warning(f"### ⚫ 判断できない\n\n最新価格を受信できませんでした（{type(exc).__name__}）。")
+                st.warning(f"**⚫ 判断できない** — 最新価格を受信できませんでした（{type(exc).__name__}）。")
                 return
 
             if live_snapshot.get("source") != "moomoo OpenAPI":
                 reset_ticker_memory()
-                st.warning("### ⚫ 判断できない\n\nmoomooの最新価格を確認できません。"
+                st.warning("**⚫ 判断できない** — moomooの最新価格を確認できません。"
                            "Yahoo Financeの代替値はリアルタイム判定に使用しません。")
                 reason = live_snapshot.get("fallback_reason")
                 if reason:
@@ -569,7 +573,7 @@ def render_realtime_timing_card(ticker: str) -> None:
             if live_session_code not in session_intelligence.SESSION_NAMES:
                 realtime_memories.pop(identity, None)
                 label = SUMMARY_SESSION_LABELS.get(live_session_code, "取引可否を確認")
-                st.warning(f"### ⚫ 判断できない\n\n現在は{label}です。取引可能なセッションで再確認してください。")
+                st.warning(f"**⚫ 判断できない** — 現在は{label}です。取引可能なセッションで再確認してください。")
                 st.caption(f"判定時刻: {fmt_et_jst(live_session.get('as_of'))}")
                 return
 
@@ -580,11 +584,11 @@ def render_realtime_timing_card(ticker: str) -> None:
             live_source = str(live_meta.get("source") or "")
             if live_klines.get("error"):
                 realtime_memories.pop(identity, None)
-                st.warning(f"### ⚫ 判断できない\n\n{live_klines['error']}。売買せずに待ちます。")
+                st.warning(f"**⚫ 判断できない** — {live_klines['error']}。売買せずに待ちます。")
                 return
             if "moomoo" not in live_source.lower():
                 realtime_memories.pop(identity, None)
-                st.warning("### ⚫ 判断できない\n\nmoomoo以外の代替足は、"
+                st.warning("**⚫ 判断できない** — moomoo以外の代替足は、"
                            "リアルタイム売買タイミングに使用しません。")
                 return
 
@@ -597,7 +601,7 @@ def render_realtime_timing_card(ticker: str) -> None:
                 live_snapshot, decision_quote, live_session_code)
             if live_decision_snapshot.get("decision_ready") is not True:
                 realtime_memories.pop(identity, None)
-                st.warning("### ⚫ 判断できない\n\n現在の取引時間に対応した価格・気配・"
+                st.warning("**⚫ 判断できない** — 現在の取引時間に対応した価格・気配・"
                            "1分足時刻を照合できません。推測せず待ちます。")
                 decision_errors = live_decision_snapshot.get("decision_errors") or []
                 if decision_errors:
@@ -632,12 +636,12 @@ def render_realtime_timing_card(ticker: str) -> None:
                 )
             except Exception as exc:
                 realtime_memories.pop(identity, None)
-                st.warning(f"### ⚫ 判断できない\n\nリアルタイム判定を更新できませんでした"
+                st.warning(f"**⚫ 判断できない** — リアルタイム判定を更新できませんでした"
                            f"（{type(exc).__name__}）。売買せずに待ちます。")
                 return
             if not isinstance(realtime_result, dict):
                 realtime_memories.pop(identity, None)
-                st.warning("### ⚫ 判断できない\n\n判定結果を確認できません。売買せずに待ちます。")
+                st.warning("**⚫ 判断できない** — 判定結果を確認できません。売買せずに待ちます。")
                 return
 
             memory = realtime_result.get("memory")
@@ -664,7 +668,7 @@ def render_realtime_timing_card(ticker: str) -> None:
             st.markdown("**② 今のタイミング**")
             visual = realtime_action_visual(realtime_result)
             getattr(st, visual["severity"])(
-                f"### {visual['icon']} {visual['label_ja']}\n\n"
+                f"**{visual['icon']} {visual['label_ja']}** — "
                 f"{visual['description_ja']}")
             confirmation = (realtime_result.get("confirmation")
                             if isinstance(realtime_result.get("confirmation"), dict)
@@ -717,16 +721,14 @@ def render_realtime_timing_card(ticker: str) -> None:
                            "そのセッションの1分足・気配値・データ品質を確認できない場合は判断を保留します。")
 
         render_realtime_timing_panel()
-        st.caption(
-            "このカードは判定表示だけで、注文APIを呼びません。"
-            "現在足・snapshotだけを使うため、このリアルタイム機能による"
-            "moomoo過去K線枠の追加使用は0です。"
-            "『買いを検討』は値上がりや利益の保証ではなく、1分足や気配値は短時間で反転します。"
-            "監視を止めると取得更新は止まりますが、再利用のため購読枠が保持される場合があります。")
-        st.caption(
-            "※ 同じページの日足・チャートは別機能です。サイドバーで"
-            "『過去K線もmoomooを使用』を有効にした場合は、そちらが別途"
-            "過去K線枠を使うことがあります。")
+        with st.expander("仕組みと注意"):
+            st.caption(
+                "表示専用で注文APIは呼びません。現在足とsnapshotだけを使うため、"
+                "このリアルタイム機能によるmoomoo過去K線枠の追加使用は0です。"
+                "買い表示は利益を保証せず、1分足や気配値は短時間で反転します。")
+            st.caption(
+                "監視を止めると取得更新は止まりますが、再利用のため購読枠が保持される場合があります。"
+                "日足・チャートは別機能です。設定によっては、そちらが別途過去K線枠を使います。")
 
 
 st.title("📈 銘柄分析")
@@ -735,14 +737,14 @@ _settings = settings_store.load()
 _initial = (st.query_params.get("ticker")
             or _settings.get("default_ticker") or "AAPL").strip().upper()
 
-col_ticker, col_star, col_period = st.columns([1, 0.5, 1.7])
+col_ticker, col_star, col_period = st.columns(
+    [1, 0.5, 1.7], vertical_alignment="bottom")
 with col_ticker:
     ticker = st.text_input(
         "ティッカーシンボル", value=_initial, placeholder="例: AAPL",
     ).strip().upper()
 with col_star:
-    st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
-    if st.button("⭐ 既定にする",
+    if st.button("⭐ 既定",
                  help="次回からこの銘柄を最初に表示します",
                  disabled=(not ticker
                            or ticker == _settings.get("default_ticker"))):
@@ -827,27 +829,29 @@ else:
     price_now = latest
     price_label = "株価(直近終値)"
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric(price_label, f"${price_now:,.2f}",
-          f"{change:+,.2f}({change_pct:+.2f}%)", border=True)
-m2.metric("52週高値", f"${year['High'].max():,.2f}", border=True)
-m3.metric("52週安値", f"${year['Low'].min():,.2f}", border=True)
+price_column, basic_column = st.columns([1.05, 2.4])
+price_column.metric(price_label, f"${price_now:,.2f}",
+                    f"{change:+,.2f} ({change_pct:+.2f}%)", border=True)
 if rsi_now is not None and pd.notna(rsi_now):
     if rsi_now >= 70:
-        rsi_delta, rsi_color = "買われすぎ", "inverse"
+        rsi_delta = "買われすぎ"
     elif rsi_now <= 30:
-        rsi_delta, rsi_color = "売られすぎ", "normal"
+        rsi_delta = "売られすぎ"
     else:
-        rsi_delta, rsi_color = "中立圏", "off"
-    m4.metric("RSI(14)", f"{rsi_now:.1f}", rsi_delta,
-              delta_color=rsi_color, border=True)
+        rsi_delta = "中立圏"
+    rsi_text = f"{rsi_now:.1f}（{rsi_delta}）"
 else:
-    m4.metric("RSI(14)", "—", border=True)
+    rsi_text = "—"
+with basic_column:
+    st.markdown("**基本指標**")
+    st.caption(
+        f"52週高値 USD {year['High'].max():,.2f} ／ "
+        f"52週安値 USD {year['Low'].min():,.2f} ／ RSI(14) {rsi_text}")
 
 if snapshot.get("source") == "moomoo OpenAPI":
     spread = ""
     if snapshot.get("bid") is not None and snapshot.get("ask") is not None:
-        spread = f"・Bid ${snapshot['bid']:,.2f} / Ask ${snapshot['ask']:,.2f}"
+        spread = f"・Bid USD {snapshot['bid']:,.2f} / Ask USD {snapshot['ask']:,.2f}"
     updated = f"・更新 {snapshot['update_time']}" if snapshot.get("update_time") else ""
     st.caption(f"⚡ 最新価格: moomoo OpenAPI({snapshot.get('code', ticker)})"
                f"{spread}{updated}。財務・ニュースはYahoo Finance等を併用。")
@@ -930,23 +934,23 @@ target_labels = {
 }
 summary_box = tab_today.container(border=True)
 with summary_box:
-    summary_title, summary_target, summary_action = st.columns([2.4, 1.4, 1.2])
-    with summary_title:
-        st.markdown("### 🛒 購入プラン")
-        last_bar = (decision_context or {}).get("bar_meta", {}).get("last_bar")
-        st.caption("買う・待つ・見送るを、価格と許容損失まで含めて確認します。")
-    with summary_target:
-        target_session = st.selectbox(
-            "寄付き診断の対象", list(target_labels),
-            format_func=lambda key: target_labels[key],
-            key=f"today_target_{ticker}")
-    with summary_action:
-        st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
-        load_today = st.button(
-            "寄付き・イベントを更新", type="primary", width="stretch",
-            key=f"load_today_intelligence_{ticker}_{target_session}",
-            help="Yahooデータとニュースを必要時だけ取得します。moomoo過去K線枠は使いません。",
-        )
+    st.markdown("**🛒 購入プラン**")
+    last_bar = (decision_context or {}).get("bar_meta", {}).get("last_bar")
+    st.caption("結論 → 買う上限 → 損切り・目標の順に確認します。")
+    with st.expander("寄付き・イベント診断を更新"):
+        summary_target, summary_action = st.columns([1.5, 1])
+        with summary_target:
+            target_session = st.selectbox(
+                "診断する時間帯", list(target_labels),
+                format_func=lambda key: target_labels[key],
+                key=f"today_target_{ticker}")
+        with summary_action:
+            st.markdown('<div style="height:1.8rem"></div>', unsafe_allow_html=True)
+            load_today = st.button(
+                "診断を更新", type="primary", width="stretch",
+                key=f"load_today_intelligence_{ticker}_{target_session}",
+                help="Yahooデータとニュースを必要時だけ取得します。moomoo過去K線枠は使いません。",
+            )
 
 result_store = st.session_state.setdefault("today_intelligence_results", {})
 result_key = (ticker, target_session)
@@ -1079,7 +1083,7 @@ purchase_plan = trade_summary.build_purchase_plan(
 )
 
 with summary_box:
-    st.markdown("#### 1. 今、購入を検討できるか")
+    st.markdown("**今、購入を検討できるか**")
     daily_signal = purchase_plan.get("daily_signal") or {}
     daily_icon = ("✅" if daily_signal.get("is_buy_candidate") else
                   "⏳" if daily_signal.get("verdict") == "WAIT" else "—")
@@ -1092,7 +1096,7 @@ with summary_box:
     purchase_icon = ("🟢" if purchase_status == "READY" else
                      "⚪" if purchase_status == "NOT_CANDIDATE" else "🟠")
     purchase_message = (
-        f"### {purchase_icon} {purchase_plan['label_ja']}\n\n"
+        f"**{purchase_icon} {purchase_plan['label_ja']}** — "
         f"{purchase_plan['description_ja']}"
     )
     if purchase_status == "READY":
@@ -1102,14 +1106,31 @@ with summary_box:
     else:
         st.warning(purchase_message)
 
-    wait_reasons = purchase_plan.get("wait_reasons") or []
-    if wait_reasons:
-        for reason in wait_reasons[:2]:
-            st.markdown(f"- **{reason['label_ja']}** — {reason['detail_ja']}")
-        if len(wait_reasons) > 2:
-            st.caption(f"ほか {len(wait_reasons) - 2}件は「購入を中止する条件」で確認できます。")
+    wait_reasons = []
+    seen_wait_reasons = set()
+    for reason in purchase_plan.get("wait_reasons") or []:
+        key = (str(reason.get("code") or ""),
+               str(reason.get("label_ja") or ""),
+               str(reason.get("detail_ja") or ""))
+        # 上流が同じ理由を「判定」と「安全確認」の両方から返しても1回だけ表示する。
+        semantic_key = key[2].strip() or key[1].strip()
+        if semantic_key in seen_wait_reasons:
+            continue
+        seen_wait_reasons.add(semantic_key)
+        wait_reasons.append(reason)
+    main_wait_reasons = [
+        reason for reason in wait_reasons
+        if str(reason.get("detail_ja") or "").strip()
+        != str(purchase_plan.get("description_ja") or "").strip()
+    ]
+    if main_wait_reasons:
+        first_reason = main_wait_reasons[0]
+        st.caption(f"主な理由: {first_reason['label_ja']} — {first_reason['detail_ja']}")
+        hidden_reason_count = len(wait_reasons) - 1
+        if hidden_reason_count > 0:
+            st.caption(f"ほか {hidden_reason_count}件は「購入を中止する条件」で確認できます。")
 
-    st.markdown("#### 2. 買う価格・損切り・利益確定")
+    st.markdown("**価格の目安**")
     quote = purchase_plan.get("quote") or {}
     buy_zone = purchase_plan.get("buy_zone") or {}
     risk = purchase_plan.get("risk") or {}
@@ -1145,9 +1166,11 @@ with summary_box:
     if ask_price is not None and buy_limit is not None:
         gap = ask_price - buy_limit
         if gap > 0:
-            st.warning(f"売り気配（Ask）は上限より ${gap:,.2f} 高いため、追いかけず待ちます。")
+            st.warning(md_escape(
+                f"売り気配（Ask）は上限より ${gap:,.2f} 高いため、追いかけず待ちます。"))
         else:
-            st.caption(f"売り気配（Ask）は上限まで ${abs(gap):,.2f} の範囲内です。")
+            st.caption(md_escape(
+                f"売り気配（Ask）は上限まで ${abs(gap):,.2f} の範囲内です。"))
     below_reference = next(
         (item for item in purchase_plan.get("cautions") or []
          if item.get("code") == "below_reference"),
@@ -1163,48 +1186,47 @@ with summary_box:
             f"現在の売り気配（Ask）での利益÷損失: {chase['current_rr']:.2f}倍 ／ "
             f"利用中ルールの最低基準: {chase['minimum_rr']:.2f}倍")
 
-    st.markdown("#### 3. 購入株数の上限を計算")
-    input_budget, input_loss = st.columns(2)
-    input_budget.number_input(
-        "この銘柄に使える金額の上限（ドル）",
-        min_value=1.0, step=100.0, key=purchase_budget_key,
-        help="この画面だけで使う計算値です。口座残高や注文には接続しません。")
-    input_loss.number_input(
-        "この1回で許容する損失（ドル）",
-        min_value=1.0, step=10.0, key=purchase_loss_key,
-        help="損切り目安まで通常どおり約定した場合の損失上限です。")
-
     position = purchase_plan.get("position_size") or {}
     shares = position.get("shares") if position.get("available") else None
     planned_price = position.get("purchase_price")
     expected_profit = position.get("estimated_target_profit")
     if expected_profit is None and None not in (shares, planned_price, risk.get("target")):
         expected_profit = max(float(shares) * (float(risk["target"]) - float(planned_price)), 0.0)
-    size_columns = st.columns(4)
-    size_columns[0].metric(
-        "上限株数（推奨ではない）",
-        "—" if shares is None else f"{shares:,}株",
-        position.get("limiting_factor") or position.get("reason_ja") or "計算不能",
-        delta_color="off", border=True)
-    size_columns[1].metric(
-        "使用額の目安",
-        "—" if position.get("estimated_cost") is None
-        else f"${position['estimated_cost']:,.2f}",
-        "買う価格の上限で計算", delta_color="off", border=True)
-    size_columns[2].metric(
-        "通常時の想定損失",
-        "—" if position.get("estimated_max_loss") is None
-        else f"${position['estimated_max_loss']:,.2f}",
-        "価格飛び・滑りは未反映", delta_color="off", border=True)
-    size_columns[3].metric(
-        "目標到達時の想定利益",
-        "—" if expected_profit is None else f"${expected_profit:,.2f}",
-        "手数料・税・為替は未反映", delta_color="off", border=True)
-    if position.get("available") and not position.get("can_buy_one_share"):
-        st.warning("1株でも購入予算または許容損失を超えるため、計算上の上限は0株です。")
-    st.caption(
-        "上限株数は推奨株数ではありません。損切り注文の価格は約定を保証せず、"
-        "相場急変・価格飛び・滑りによって実際の損失が計算値を超えることがあります。")
+    with st.expander("購入株数を計算"):
+        input_budget, input_loss = st.columns(2)
+        input_budget.number_input(
+            "この銘柄に使える金額の上限（ドル）",
+            min_value=1.0, step=100.0, key=purchase_budget_key,
+            help="この画面だけで使う計算値です。口座残高や注文には接続しません。")
+        input_loss.number_input(
+            "この1回で許容する損失（ドル）",
+            min_value=1.0, step=10.0, key=purchase_loss_key,
+            help="損切り目安まで通常どおり約定した場合の損失上限です。")
+        size_columns = st.columns(4)
+        size_columns[0].metric(
+            "上限株数（推奨ではない）",
+            "—" if shares is None else f"{shares:,}株",
+            position.get("limiting_factor") or position.get("reason_ja") or "計算不能",
+            delta_color="off", border=True)
+        size_columns[1].metric(
+            "使用額の目安",
+            "—" if position.get("estimated_cost") is None
+            else f"${position['estimated_cost']:,.2f}",
+            "買う価格の上限で計算", delta_color="off", border=True)
+        size_columns[2].metric(
+            "通常時の想定損失",
+            "—" if position.get("estimated_max_loss") is None
+            else f"${position['estimated_max_loss']:,.2f}",
+            "価格飛び・滑りは未反映", delta_color="off", border=True)
+        size_columns[3].metric(
+            "目標到達時の想定利益",
+            "—" if expected_profit is None else f"${expected_profit:,.2f}",
+            "手数料・税・為替は未反映", delta_color="off", border=True)
+        if position.get("available") and not position.get("can_buy_one_share"):
+            st.warning("1株でも購入予算または許容損失を超えるため、計算上の上限は0株です。")
+        st.caption(
+            "上限株数は推奨株数ではありません。相場急変・価格飛び・滑りにより、"
+            "実際の損失が計算値を超えることがあります。")
 
     if entry_summary["session"].get("code") in {"premarket", "afterhours", "overnight"}:
         st.warning("立会時間外は価格差と値動きが大きくなりやすいため、成行へ切り替えず、"
@@ -1247,7 +1269,7 @@ with summary_box:
             "visual_blocked": bool(holding_blocking),
         }, position_mode="holding")
         getattr(st, holding_visual["severity"])(
-            f"### {holding_visual['icon']} {holding_visual['action_label_ja']}\n\n"
+            f"**{holding_visual['icon']} {holding_visual['action_label_ja']}** — "
             f"{holding_visual['description_ja']}")
         st.caption(
             "損失を抑えて売る条件: "
@@ -1322,10 +1344,8 @@ with summary_box:
             if alert_check_errors:
                 reasons.append(f"{alert_check_errors}件は保存値を評価できませんでした")
             st.caption("⚠ 判定不能: " + " ／ ".join(reasons))
-    else:
-        st.caption("🔔 この銘柄の有効アラートはありません。"
-                   "必要なら下の詳細画面から追加できます。")
-    st.caption("アラートはこの画面の更新時点だけを照合し、アプリを閉じている間は監視しません。")
+    if active_ticker_alerts:
+        st.caption("アラートは画面更新時点だけを照合し、アプリを閉じている間は監視しません。")
 
     event_risk = entry_summary["event_risk"]
     if event_risk["available"] and event_risk.get("event_name"):
@@ -1347,20 +1367,9 @@ with summary_box:
         st.info(f"📅 次回決算予定: {str(earnings_date)[:10]}。"
                 "影響度★と他イベントは「寄付き・イベントを更新」で確認できます。")
     elif result is None:
-        st.warning("イベント情報は未確認です。「寄付き・イベントを更新」で確認してください。")
+        st.caption("📅 イベント情報は未確認です。必要なときに上の診断を更新してください。")
     else:
         st.info("診断期間内に今後のイベントを確認できませんでした。")
-
-    if result:
-        opening = result["session"]["next_open_diagnosis"]
-        opening_labels = {"up": "上向き", "down": "下向き", "neutral": "方向拮抗",
-                          "unknown": "入力不足"}
-        probability = opening.get("probability_up")
-        st.caption(
-            f"次回開始の参考方向: {opening_labels.get(opening.get('direction'), '—')}"
-            + ("" if probability is None else f"（上向き参考確率 {probability * 100:.0f}%・未校正）")
-            + f" ／ データ品質 {opening['data_quality']['score'] * 100:.0f}%"
-            + f" ／ 最終更新 {fmt_utc_time(result.get('loaded_at'))}")
 
     if rule_warnings:
         st.warning("使用ルールの設定確認: " + " ／ ".join(rule_warnings))
@@ -1417,40 +1426,39 @@ with tab_today:
         st.caption("夜間値がないだけでは24時間取引の対象外と断定しません。"
                    "対象可否はmoomooの銘柄詳細でも確認してください。")
 
-    st.markdown("#### 当日の方向と重要価格帯")
     nearby = daily_decision.nearest_levels(decision_levels, price_now, min_strength=3)
     support, resistance = nearby["support"], nearby["resistance"]
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("当日の方向", trend["label"],
-              ("強さ —" if trend["strength"] is None
-               else f"観測一致度 {trend['strength']:.0f}%"),
-              delta_color="off", border=True)
-    t2.metric("最寄り支持帯（★3以上）",
-              "—" if support is None else f"${support['edge_price']:,.2f}",
-              "データ不足" if support is None else f"現在値から {support['distance_pct']:+.2f}%",
-              delta_color="off", border=True)
-    t3.metric("最寄り抵抗帯（★3以上）",
-              "—" if resistance is None else f"${resistance['edge_price']:,.2f}",
-              "データ不足" if resistance is None else f"現在値から {resistance['distance_pct']:+.2f}%",
-              delta_color="off", border=True)
     rr = nearby.get("reward_risk")
-    t4.metric("支持・抵抗の単純な上下距離比",
-              "—" if rr is None else f"1 : {rr:.2f}",
-              "ストップ未反映・売買計画のR:Rとは別",
-              delta_color="off", border=True)
-
     check_df = pd.DataFrame([{
         "観測": row["label"],
         "方向": {"up": "上向き", "down": "下向き", "flat": "横ばい",
                 "unknown": "未取得"}.get(row["status"], row["status"]),
         "実測": row["actual"],
     } for row in trend["checks"]])
-    st.dataframe(check_df, hide_index=True, use_container_width=True)
     quality_label = ("リアルタイムsnapshot" if trend["data_quality"] == "realtime"
                      else "直近確定日足" if trend["data_quality"] == "close_only"
                      else "取得不能")
-    st.caption(f"方向のデータ品質: {quality_label}。支持抵抗は既存の検証済み検出器から"
-               "★3以上だけを抜粋し、反発保証ではなく損益幅の確認に使います。")
+    with st.expander("当日の方向・支持抵抗を見る"):
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("当日の方向", trend["label"],
+                  ("強さ —" if trend["strength"] is None
+                   else f"観測一致度 {trend['strength']:.0f}%"),
+                  delta_color="off", border=True)
+        t2.metric("最寄り支持帯（★3以上）",
+                  "—" if support is None else f"${support['edge_price']:,.2f}",
+                  "データ不足" if support is None else f"現在値から {support['distance_pct']:+.2f}%",
+                  delta_color="off", border=True)
+        t3.metric("最寄り抵抗帯（★3以上）",
+                  "—" if resistance is None else f"${resistance['edge_price']:,.2f}",
+                  "データ不足" if resistance is None else f"現在値から {resistance['distance_pct']:+.2f}%",
+                  delta_color="off", border=True)
+        t4.metric("支持・抵抗の単純な上下距離比",
+                  "—" if rr is None else f"1 : {rr:.2f}",
+                  "ストップ未反映・売買計画のR:Rとは別",
+                  delta_color="off", border=True)
+        st.dataframe(check_df, hide_index=True, use_container_width=True)
+        st.caption(f"方向のデータ品質: {quality_label}。支持抵抗は★3以上だけを抜粋し、"
+                   "反発保証ではなく損益幅の確認に使います。")
 
     st.markdown("#### 次回寄付き・セッション開始の方向診断")
     if result:
@@ -2202,7 +2210,7 @@ with tab_chart:
         with st.expander("📋 詳細データ(ゾーン範囲・テスト履歴)"):
             st.dataframe(pd.DataFrame([{
                 "種別": lv["type"],
-                "ゾーン": f"${lv['zone_low']:,.2f}〜${lv['zone_high']:,.2f}",
+                "ゾーン": f"USD {lv['zone_low']:,.2f}〜{lv['zone_high']:,.2f}",
                 "中心": f"${lv['price']:,.2f}",
                 "スイング数": lv["swings"],
                 "反発": lv["bounces"],
@@ -2305,7 +2313,7 @@ with tab_news:
             upside = (tg["mean"] / latest - 1) * 100 if latest else 0.0
             a1.metric("平均目標株価", f"${tg['mean']:,.2f}",
                       f"{upside:+.1f}%(現在比)", border=True)
-            a2.metric("目標レンジ", f"${tg['low']:,.0f}〜${tg['high']:,.0f}",
+            a2.metric("目標レンジ", f"USD {tg['low']:,.0f}〜{tg['high']:,.0f}",
                       border=True)
         else:
             a1.metric("平均目標株価", "—", border=True)

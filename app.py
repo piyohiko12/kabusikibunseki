@@ -8,6 +8,88 @@ st.set_page_config(
     layout="wide",
 )
 
+# 情報量の多い分析画面でも、結論と数値を一画面で追いやすい共通表示。
+# 色や機能は変えず、見出し・カード・余白だけを控えめにする。
+st.markdown(
+    """
+    <style>
+    [data-testid="stAppViewContainer"] .main .block-container {
+        max-width: 1480px;
+        padding-top: 1.15rem;
+        padding-bottom: 2rem;
+    }
+    [data-testid="stAppViewContainer"] h1 {
+        font-size: clamp(1.65rem, 2.7vw, 2.15rem);
+        line-height: 1.18;
+        margin-bottom: .35rem;
+    }
+    [data-testid="stAppViewContainer"] h2 {
+        font-size: clamp(1.3rem, 2.1vw, 1.65rem);
+        line-height: 1.22;
+        margin-top: .65rem;
+        margin-bottom: .3rem;
+    }
+    [data-testid="stAppViewContainer"] h3 {
+        font-size: clamp(1.08rem, 1.8vw, 1.28rem);
+        line-height: 1.25;
+        margin-top: .5rem;
+        margin-bottom: .25rem;
+    }
+    [data-testid="stAppViewContainer"] h4 {
+        font-size: 1rem;
+        line-height: 1.25;
+        margin-top: .4rem;
+        margin-bottom: .2rem;
+    }
+    [data-testid="stMetric"] {
+        padding: .55rem .68rem;
+        min-height: 0;
+    }
+    [data-testid="stMetricLabel"] p {
+        font-size: .77rem;
+        line-height: 1.2;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: clamp(1.08rem, 2.2vw, 1.42rem);
+        line-height: 1.2;
+    }
+    [data-testid="stMetricDelta"] {
+        font-size: .72rem;
+    }
+    [data-testid="stAlert"] {
+        padding: .62rem .78rem;
+    }
+    [data-testid="stAlert"] p {
+        font-size: .88rem;
+        line-height: 1.38;
+    }
+    [data-testid="stCaptionContainer"] p {
+        font-size: .75rem;
+        line-height: 1.35;
+    }
+    [data-testid="stExpander"] details summary p {
+        font-size: .88rem;
+        font-weight: 600;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab"] {
+        height: 2.55rem;
+        padding-left: .7rem;
+        padding-right: .7rem;
+    }
+    @media (max-width: 700px) {
+        [data-testid="stAppViewContainer"] .main .block-container {
+            padding: .72rem .78rem 1.5rem;
+        }
+        [data-testid="stAppViewContainer"] h1 { font-size: 1.55rem; }
+        [data-testid="stMetric"] { padding: .45rem .55rem; }
+        [data-testid="stMetricValue"] { font-size: 1.12rem; }
+        [data-testid="stAlert"] { padding: .55rem .65rem; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 pages = [
     st.Page("views/trade_desk.py", title="今日のトレードデスク", icon="🧭"),
     st.Page("views/stock_analysis.py", title="銘柄分析", icon="📈", default=True),
