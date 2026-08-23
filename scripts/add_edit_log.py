@@ -20,7 +20,8 @@ def _git_value(*args: str) -> str | None:
     try:
         result = subprocess.run(
             ["git", *args], cwd=REPO_ROOT, check=True,
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
     value = result.stdout.strip()

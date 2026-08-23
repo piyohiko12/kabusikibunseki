@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "20260823T041847Z-codex-a9493133",
+  "created_at": "2026-08-23T04:18:47Z",
+  "editor": "codex",
+  "status": "completed",
+  "verification_status": "passed",
+  "summary": "編集ログのWindows文字コードと秘密値検出を補強",
+  "changes": [
+    "環境変数形式の秘密値と任意位置の端末固有パスを拒否",
+    "GitメタデータをOSに依存せずUTF-8で安全に取得"
+  ],
+  "files": [
+    "lib/edit_log.py",
+    "scripts/add_edit_log.py",
+    "tests/test_edit_log.py"
+  ],
+  "validation": [
+    "全417件のユニットテスト成功（ResourceWarningをエラー扱い）",
+    "専用27件で環境変数形式・ローカルパス・UTF-8取得を確認",
+    "最終修正後も編集ログ画面を再読込し、ブラウザエラー0件"
+  ],
+  "follow_ups": [],
+  "base_commit": "a612975a421e",
+  "commit": null,
+  "branch": "agent/moomoo-chart-enhancements",
+  "supersedes": null
+}

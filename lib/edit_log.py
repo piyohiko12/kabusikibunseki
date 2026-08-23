@@ -56,8 +56,11 @@ _PRIVATE_PATH_ROOTS = frozenset({".git", ".venv", "data", "reports"})
 _MARKDOWN_RE = re.compile(r"([\\`*_{}\[\]()<>#+\-.!|>$])")
 _SENSITIVE_PATTERNS = (
     re.compile(
-        r"(?i)(?:^|[\s\"'`])(?:/Users/|/home/|/root/|/private/|"
+        r"(?i)(?:/Users/|/home/|/root/|/private/|"
         r"[A-Z]:[\\/]Users[\\/]|\\\\[^\\\s]+\\[^\\\s]+)"),
+    re.compile(
+        r"\b(?:[A-Z][A-Z0-9]*_)+(?:API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|TOKEN|"
+        r"PASSWORD|PASSWD|SECRET|COOKIE)\b\s*(?:[:=]\s*)?\S+"),
     re.compile(
         r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|"
         r"password|passwd|secret|cookie|authorization)\b\s*[:=]\s*\S+"),

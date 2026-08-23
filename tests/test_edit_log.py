@@ -91,8 +91,12 @@ class EntryValidationTests(unittest.TestCase):
     def test_sensitive_values_and_local_paths_are_rejected_in_text_fields(self):
         invalid = (
             {"summary": "ログは /Users/person/project に保存"},
+            {"summary": "cwd=/Users/person/private-project"},
             {"changes": [r"C:\Users\person\secret.txt を参照"]},
+            {"changes": [r"cwd=C:\Users\person\private-project"]},
             {"validation": ["api_key=super-secret-value"]},
+            {"validation": ["OPENAI_API_KEY super-secret-value"]},
+            {"validation": ["GITHUB_TOKEN=super-secret-value"]},
             {"follow_ups": ["token: abcdefghijklmnop"]},
             {"branch": "password=hunter2"},
             {"summary": "GitHub token ghp_abcdefghijklmnop"},
@@ -291,6 +295,16 @@ class EditLogCliTests(unittest.TestCase):
         with mock.patch.object(edit_log, "append_entry", side_effect=OSError("disk")), \
                 mock.patch("sys.stderr", new=io.StringIO()):
             self.assertEqual(add_edit_log.main(self._args()), 1)
+
+    def test_git_metadata_is_decoded_as_utf8_on_windows_too(self):
+        completed = mock.Mock(stdout="日本語ブランチ\n")
+        with mock.patch.object(add_edit_log.subprocess, "run",
+                               return_value=completed) as run:
+            self.assertEqual(add_edit_log._git_value("branch", "--show-current"),
+                             "日本語ブランチ")
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["encoding"], "utf-8")
+        self.assertEqual(kwargs["errors"], "replace")
 
 
 if __name__ == "__main__":
