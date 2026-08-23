@@ -151,6 +151,7 @@ pages = [
     st.Page("views/signals.py", title="売買判定・アラート", icon="🎯"),
     st.Page("views/v6_signal.py", title="V6判定", icon="🤖"),
     st.Page("views/portfolio.py", title="ポートフォリオ管理", icon="💼"),
+    st.Page("views/edit_log.py", title="編集ログ", icon="📝"),
 ]
 nav = st.navigation(pages)
 

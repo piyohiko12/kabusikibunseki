@@ -10,6 +10,20 @@ OpenD未起動・相場権限不足・未対応シンボル・予約枠到達時
 
 ## 機能
 
+### 📝 編集ログ
+
+Codex・Claude・手動編集で「誰が、何を変更し、どこまで確認したか」を
+分析ツール内で確認できます。
+
+- サイドバーの「編集ログ」から、変更内容・対象ファイル・テスト結果・残課題を新しい順に表示
+- 編集者、作業状態、キーワードで絞り込み
+- 1作業につき1つのJSONをGit管理するため、CodexとClaudeの同時編集でも競合しにくい構成
+- 画面は読み取り専用で、市場データAPI・moomoo過去K線・注文APIを呼びません
+- 株価・注文・保有銘柄の履歴ではなく、導入後の開発変更だけを記録します
+
+記録手順と公開リポジトリで記載してはいけない情報は
+[`docs/edit-log/README.md`](docs/edit-log/README.md)を参照してください。
+
 ### 🧭 今日のトレードデスク
 
 米国株の一日の確認順序を1ページにまとめています。
@@ -567,6 +581,7 @@ xattr -d com.apple.quarantine start-app.command
 ```bash
 git pull          # 作業を始める前に最新を取り込む
 # ...ファイルを編集...
+# ...テスト後、Codex/Claude共通CLIで編集ログを1件追加...
 git add -A
 git commit -m "変更内容"
 git push          # 作業が終わったら送る
@@ -600,6 +615,7 @@ git push          # 作業が終わったら送る
 - **市場概況**: 相場全体の地合いとランキングを確認できます
 - **ポートフォリオ管理**: 表を直接編集し「保存」で確定します。
   行の追加は最下行への入力、削除は行左端のチェック→ゴミ箱アイコンで行います
+- **編集ログ**: Codex・Claude・手動編集の変更内容と確認結果を閲覧します
 
 ## 注意事項
 
@@ -627,6 +643,8 @@ git push          # 作業が終わったら送る
 
 ```
 stock-analyzer/
+├── AGENTS.md              # Codex向け共同編集ルール
+├── CLAUDE.md              # Claude向け共同編集ルール
 ├── start-app.cmd          # Windows用ランチャー(ダブルクリック起動)
 ├── start-app.command      # macOS用ランチャー(ダブルクリック起動)
 ├── app.py                 # エントリポイント(ページ登録)
@@ -638,7 +656,8 @@ stock-analyzer/
 │   ├── board.py           # 読み取り専用の情報掲示板ページ
 │   ├── signals.py         # 売買判定・アラートページ
 │   ├── v6_signal.py       # V6判定ページ
-│   └── portfolio.py       # ポートフォリオ管理ページ
+│   ├── portfolio.py       # ポートフォリオ管理ページ
+│   └── edit_log.py        # Codex・Claude共通の編集ログ閲覧ページ
 ├── lib/
 │   ├── data_fetcher.py    # moomoo + yfinanceの自動フォールバック
 │   ├── daily_decision.py  # 当日の方向と最寄り支持抵抗の説明可能分析
@@ -664,11 +683,17 @@ stock-analyzer/
 │   ├── alerts.py          # 株価アラートの判定・保存
 │   ├── information_board.py # 価格・判定・イベント・ニュースの共通一覧化
 │   ├── board_ui.py        # 読み取り専用情報掲示板の日本語UI
+│   ├── edit_log.py        # 追記専用編集ログの検証・保存・検索
 │   ├── charts.py          # plotlyチャート生成
 │   ├── ui.py              # チップ・バーなどのUI部品
 │   ├── portfolio_store.py # ポートフォリオCSVの読み書き
 │   ├── watchlist_store.py # ウォッチリストの読み書き
 │   └── settings_store.py  # 既定銘柄などの設定
+├── scripts/
+│   └── add_edit_log.py    # Codex・Claude・手動編集の共通追記CLI
+├── docs/edit-log/
+│   ├── README.md          # 編集ログ形式・運用ルールの正本
+│   └── entries/           # 1作業1ファイルのGit共有ログ
 ├── data/                  # 個人データ(自動生成・Git管理外)
 │                          # portfolio.csv / watchlist.csv / settings.json
 │                          # rules.json / alerts.json

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "20260823T041603Z-codex-519320bb",
+  "created_at": "2026-08-23T04:16:03Z",
+  "editor": "codex",
+  "status": "completed",
+  "verification_status": "passed",
+  "summary": "編集ログのWindows互換と公開情報保護を強化",
+  "changes": [
+    "本文全体で端末固有パス・秘密値・口座IDらしき入力を拒否",
+    "Windows・macOS・Linux共通の原子的保存と並行書込み保護へ変更",
+    "保存時と読込時のサイズ上限を一致させ、Windows向け手順とテストを追加"
+  ],
+  "files": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    "lib/edit_log.py",
+    "tests/test_edit_log.py",
+    "tests/test_edit_log_ui.py"
+  ],
+  "validation": [
+    "全416件のユニットテスト成功（ResourceWarningをエラー扱い）",
+    "専用26件で原子的保存・並行ロック・サイズ上限・秘密値拒否を確認",
+    "安全性強化後も編集ログ画面を再読込し、ブラウザエラー0件"
+  ],
+  "follow_ups": [],
+  "base_commit": "86741c672d8f",
+  "commit": null,
+  "branch": "agent/moomoo-chart-enhancements",
+  "supersedes": null
+}

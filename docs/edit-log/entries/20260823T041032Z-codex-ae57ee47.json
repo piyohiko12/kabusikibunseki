@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "id": "20260823T041032Z-codex-ae57ee47",
+  "created_at": "2026-08-23T04:10:32Z",
+  "editor": "codex",
+  "status": "completed",
+  "verification_status": "passed",
+  "summary": "Codex・Claude共通の編集ログ機能を追加",
+  "changes": [
+    "Codex・Claude共通の追記専用JSONログと安全なCLIを追加",
+    "分析ツール内に検索・絞り込み対応の読み取り専用編集ログ画面を追加",
+    "共同編集ルールと運用文書、破損・競合・入力安全性テストを追加"
+  ],
+  "files": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "app.py",
+    "docs/edit-log/README.md",
+    "lib/edit_log.py",
+    "scripts/add_edit_log.py",
+    "tests/test_edit_log.py",
+    "tests/test_edit_log_ui.py",
+    "views/edit_log.py"
+  ],
+  "validation": [
+    "全413件のユニットテスト成功（ResourceWarningをエラー扱い）",
+    "変更したPythonファイルの構文検査とgit diff --check成功",
+    "PC幅と390px幅で編集ログ画面を確認し、ブラウザエラー0件"
+  ],
+  "follow_ups": [],
+  "base_commit": "86741c672d8f",
+  "commit": null,
+  "branch": "agent/moomoo-chart-enhancements",
+  "supersedes": null
+}
