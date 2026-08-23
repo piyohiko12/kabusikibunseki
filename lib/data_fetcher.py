@@ -6,6 +6,7 @@ OpenDや権限に問題がある場合はyfinanceへ自動フォールバック�
 """
 
 import math
+from collections.abc import Mapping
 
 import pandas as pd
 import streamlit as st
@@ -170,7 +171,119 @@ def _decision_session_name(value) -> str:
         "regular": "regular",
         "after": "afterhours", "afterhours": "afterhours",
         "overnight": "overnight",
+        "closed": "closed",
     }.get(str(value or "").strip().lower(), "unknown")
+
+
+_SESSION_PRICE_FIELDS = {
+    "premarket": ("pre_price", "プレ価格"),
+    "regular": ("price", "立会価格"),
+    "afterhours": ("after_price", "アフター価格"),
+    "overnight": ("overnight_price", "夜間価格"),
+}
+
+
+def select_session_price(snapshot: dict | None, session: object = None, *,
+                         fallback_price: object = None,
+                         fallback_as_of: object = None) -> dict:
+    """現在の取引セッションに対応する表示・判定価格を選ぶ純粋関数。
+
+    moomooの ``last_price``（公開shapeでは ``price``）をプレ・アフター・
+    夜間へ流用しない。時間外価格にはSDK上の個別更新時刻がないため、価格は
+    利用しても ``timestamp_verified=False`` のまま返す。対象セッション価格が
+    欠ける場合は画面表示だけを立会/日足へフォールバックし、アラート等へ使う
+    ``decision_price`` は欠損にして誤判定を防ぐ。
+    """
+    raw = dict(snapshot or {})
+    if isinstance(session, dict):
+        session_name = _decision_session_name(session.get("session"))
+        calendar_session = _decision_session_name(session.get("calendar_session"))
+    else:
+        session_name = _decision_session_name(session)
+        calendar_session = "unknown"
+    if session_name == "unknown" and calendar_session != "unknown":
+        session_name = calendar_session
+
+    active_session = session_name in _SESSION_PRICE_FIELDS
+    requested_session = session_name if active_session else "regular"
+    field, label = _SESSION_PRICE_FIELDS[requested_session]
+    rows = raw.get("session_quotes")
+    rows = rows if isinstance(rows, dict) else {}
+    row = rows.get(requested_session)
+    row = row if isinstance(row, dict) else {}
+
+    price = _decision_number(row.get("price"), positive=True)
+    if price is None:
+        price = _decision_number(raw.get(field), positive=True)
+    session_specific = price is not None and (
+        requested_session == "regular" or active_session)
+
+    verified = bool(row.get("timestamp_verified"))
+    as_of = row.get("updated_at") if verified else None
+    observed_at = row.get("fetched_at") or raw.get("fetched_at")
+    source = str(row.get("source") or raw.get("source") or "").strip()
+
+    fallback = _decision_number(fallback_price, positive=True)
+    fallback_used = False
+    if price is None:
+        fallback_used = fallback is not None
+        price = fallback
+        as_of = fallback_as_of
+        source = "Yahoo Finance 直近終値" if fallback_used else source
+
+    # 時間外に専用価格を取れなかった場合、立会価格を「現在値」として判定へ
+    # 流さない。closed時の立会/日足は直近参考値として利用可能とする。
+    missing_active_session_price = (
+        session_name in {"premarket", "afterhours", "overnight"}
+        and not session_specific
+    )
+    decision_price = None if missing_active_session_price else price
+    if fallback_used and missing_active_session_price:
+        label = f"{label}未取得・直近終値"
+    elif session_name == "closed":
+        label = "直近立会価格"
+
+    return {
+        "price": price,
+        "decision_price": decision_price,
+        "available": price is not None,
+        "decision_available": decision_price is not None,
+        "session": session_name,
+        "price_field": field if session_specific else None,
+        "label_ja": label,
+        "source": source or None,
+        "as_of": as_of,
+        "observed_at": observed_at,
+        "timestamp_verified": bool(verified and session_specific),
+        "session_specific": bool(session_specific),
+        "fallback_used": fallback_used,
+        "read_only": True,
+    }
+
+
+def snapshot_for_session(snapshot: dict | None,
+                         selected: dict | None) -> dict:
+    """購入計画へ渡すsnapshotを選択中セッションに揃える。
+
+    時間外の専用価格は主表示へ使う一方、個別時刻を検証できない汎用Bid/Askを
+    約定可能な気配として扱わない。購入計画はその場合WAITになり、リアルタイム
+    1分足カードだけがK_1Mとの照合後に執行可否を判定する。
+    """
+    raw = dict(snapshot or {})
+    quote = dict(selected or {})
+    out = {
+        **raw,
+        "raw_snapshot_price": raw.get("price"),
+        "price": quote.get("decision_price"),
+        "price_session": quote.get("session"),
+        "price_field": quote.get("price_field"),
+        "price_timestamp_verified": quote.get("timestamp_verified") is True,
+    }
+    if quote.get("session") in {"premarket", "afterhours", "overnight"}:
+        out.update({"bid": None, "ask": None, "update_time": None})
+    elif quote.get("as_of") is not None:
+        out["update_time"] = quote.get("as_of")
+    return out
 
 
 def _timestamp_session(stamp: pd.Timestamp) -> str:
@@ -558,6 +671,94 @@ def fetch_annual_financials(ticker: str) -> pd.DataFrame:
     out.index = pd.to_datetime(out.index).year
     out = out[~out.index.duplicated()].sort_index()
     return out.tail(4)
+
+
+def _calendar_field(calendar, key: str):
+    """Yahoo calendarのdict/旧DataFrame形式から1項目だけ安全に取り出す。"""
+    try:
+        if isinstance(calendar, Mapping):
+            return calendar.get(key)
+        if isinstance(calendar, pd.Series):
+            return calendar.get(key)
+        if isinstance(calendar, pd.DataFrame):
+            if key in calendar.index:
+                return calendar.loc[key]
+            if key in calendar.columns:
+                return calendar[key]
+    except Exception:
+        return None
+    return None
+
+
+def _calendar_scalar(value):
+    """calendar値の先頭の有効なscalarを返す（壊れた入れ子は無視）。"""
+    pending = [value]
+    # 外部応答を処理するため、循環参照や極端な入れ子でも有限回で終了する。
+    for _ in range(32):
+        if not pending:
+            return None
+        current = pending.pop(0)
+        if isinstance(current, Mapping):
+            continue
+        if isinstance(current, pd.DataFrame):
+            pending.extend(current.to_numpy().ravel().tolist())
+            continue
+        if isinstance(current, pd.Series):
+            pending.extend(current.tolist())
+            continue
+        if isinstance(current, pd.Index):
+            pending.extend(current.tolist())
+            continue
+        if isinstance(current, (list, tuple)):
+            pending.extend(current)
+            continue
+        try:
+            if current is None or bool(pd.isna(current)):
+                continue
+        except (TypeError, ValueError):
+            continue
+        return current
+    return None
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_earnings_calendar(ticker: str) -> dict:
+    """Yahooから次回決算日とEPS予想だけを軽量取得する。
+
+    戻り値は常に ``{"earnings_date": str | None,
+    "eps_estimate": float | None}``。通信失敗・形式変更・不正値は例外にせず
+    該当項目をNoneにする。目標株価や格付け等の重いプロパティは参照しない。
+    """
+    out = {"earnings_date": None, "eps_estimate": None}
+    symbol = str(ticker or "").strip().upper()
+    if not symbol:
+        return out
+
+    try:
+        calendar = yf.Ticker(symbol).calendar
+    except Exception:
+        return out
+
+    try:
+        date_value = _calendar_scalar(
+            _calendar_field(calendar, "Earnings Date"))
+    except Exception:
+        date_value = None
+    if not isinstance(date_value, (bool, int, float)):
+        try:
+            stamp = pd.Timestamp(date_value)
+            if date_value is not None and not pd.isna(stamp):
+                out["earnings_date"] = str(date_value)
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    try:
+        eps_value = _calendar_scalar(
+            _calendar_field(calendar, "Earnings Average"))
+        out["eps_estimate"] = _decision_number(eps_value)
+    except Exception:
+        pass
+    return out
 
 
 @st.cache_data(ttl=21600, show_spinner="アナリスト情報を取得中...")

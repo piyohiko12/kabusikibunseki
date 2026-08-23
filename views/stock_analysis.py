@@ -216,11 +216,6 @@ def realtime_gate_summary(gates) -> tuple[str, list[str]]:
     return f"{len(passed)} / {len(rows)}項目を確認", reasons
 
 
-def md_escape(text: str) -> str:
-    """Markdown/LaTeX として解釈されないように投稿本文をエスケープする。"""
-    return text.replace("$", "\\$").replace("#", "\\#")
-
-
 def fmt(value, suffix="", digits=2):
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "—"
@@ -802,10 +797,28 @@ except data_fetcher.FetchError:
 snapshot = data_fetcher.fetch_realtime_snapshot(ticker)
 hist_latest = float(hist["Close"].iloc[-1])
 hist_prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else hist_latest
-latest = snapshot.get("price") or hist_latest
 prev = snapshot.get("previous_close") or hist_prev
-change = latest - prev
-change_pct = (latest / prev - 1) * 100 if prev else 0.0
+
+# 主表示・購入プラン・価格アラートは、現在の取引セッションと同じ価格を使う。
+# 時間外の専用価格には個別更新時刻がないため、表示には使っても汎用Bid/Askを
+# 購入可能な気配へ流用しない（リアルタイム1分足カードだけがK_1Mで照合する）。
+eligibility = today_inputs.overnight_eligibility(snapshot)
+market_state = data_fetcher.fetch_market_state(ticker)
+session_state = session_intelligence.detect_current_session(
+    market_state=market_state.get("market_state"),
+    overnight_eligible=eligibility,
+)
+session_price = data_fetcher.select_session_price(
+    snapshot, session_state,
+    fallback_price=hist_latest,
+    fallback_as_of=hist.index[-1],
+)
+price_now = float(session_price["price"] or hist_latest)
+price_for_alerts = session_price.get("decision_price")
+session_snapshot = data_fetcher.snapshot_for_session(snapshot, session_price)
+latest = price_now
+change = price_now - float(prev)
+change_pct = (price_now / float(prev) - 1) * 100 if prev else 0.0
 
 with_ind = indicators.add_indicators(hist)
 view = indicators.slice_display(with_ind, display_days)
@@ -819,17 +832,7 @@ if badges:
     st.markdown(" ".join(badges), unsafe_allow_html=True)
     st.markdown("")
 
-# moomooが使えるときは遅延のない現在値に差し替える(使えなければYahooの終値のまま)
-# snapshotはdata_fetcher.fetch_realtime_snapshot経由で1回だけ取得済み。
-if snapshot.get("price"):
-    price_now = float(snapshot["price"])
-    base = snapshot.get("previous_close") or prev
-    change = price_now - float(base)
-    change_pct = (price_now / float(base) - 1) * 100 if base else 0.0
-    price_label = "moomoo最新価格"
-else:
-    price_now = latest
-    price_label = "直近終値"
+price_label = str(session_price.get("label_ja") or "直近終値")
 
 if rsi_now is not None and pd.notna(rsi_now):
     if rsi_now >= 70:
@@ -848,10 +851,17 @@ st.markdown(ui.compact_kpi_grid([
     ("RSI（14日）", rsi_text, "過熱感の目安"),
 ]), unsafe_allow_html=True)
 
-if snapshot.get("source") == "moomoo OpenAPI":
-    update_text = str(snapshot.get("update_time") or "")[:16]
+if session_price.get("source") and not session_price.get("fallback_used"):
+    update_text = str(session_price.get("as_of") or "")[:16]
     updated = f"更新 {update_text} ET ／ " if update_text else ""
-    st.caption(f"{updated}日足・財務: Yahoo Finance")
+    timing_note = (
+        "時間外価格の個別更新時刻は提供されないため参考値 ／ "
+        if (session_price.get("session") in {"premarket", "afterhours", "overnight"}
+            and not session_price.get("timestamp_verified")) else ""
+    )
+    st.caption(
+        f"{updated}{timing_note}価格: {session_price.get('source')} ／ "
+        "日足・財務: Yahoo Finance")
 else:
     reason = snapshot.get("fallback_reason")
     st.caption("データ源: Yahoo Finance"
@@ -865,15 +875,10 @@ tab_tape = tab_flow = tab_orderflow
 
 # ----------------------------------------------------------- 売買情報サマリー
 # 既に取得したhistを再利用する。ここから過去K線APIを追加では呼ばない。
-eligibility = today_inputs.overnight_eligibility(snapshot)
-market_state = data_fetcher.fetch_market_state(ticker)
-session_state = session_intelligence.detect_current_session(
-    market_state=market_state.get("market_state"),
-    overnight_eligible=eligibility,
-)
-# 決算日だけはsignals画面と同じ6時間キャッシュを使う。moomoo履歴枠は使わない。
+# 決算日だけをYahoo calendarから軽量取得する。目標株価・格付け・変更履歴は
+# ニュースタブの明示ボタンを押すまで取得しない。moomoo履歴枠は使わない。
 try:
-    summary_analyst = data_fetcher.fetch_analyst(ticker)
+    summary_analyst = data_fetcher.fetch_earnings_calendar(ticker)
 except Exception:
     summary_analyst = {}
 earnings_date = summary_analyst.get("earnings_date")
@@ -1001,9 +1006,16 @@ if result:
 
 summary_common = {
     "current_price": price_now,
-    "current_price_source": (snapshot.get("source") or _base_meta.get("source")),
-    "current_price_as_of": (snapshot.get("update_time") or _base_meta.get("fetched_at")),
-    "snapshot": snapshot,
+    "current_price_source": (session_price.get("source") or _base_meta.get("source")),
+    # 時間外価格には価格固有の更新時刻がない。取得時刻を価格更新時刻として
+    # 表示しないため、検証済みの時刻だけを下流へ渡す。
+    "current_price_as_of": session_price.get("as_of"),
+    "current_price_quality": (
+        "session_price" if session_price.get("timestamp_verified")
+        else "session_price_time_unverified"
+        if session_price.get("session_specific")
+        else "close_only"),
+    "snapshot": session_snapshot,
     "history": None if decision_context is None else decision_context["df"],
     "levels": summary_levels,
     "trend": trend,
@@ -1036,7 +1048,7 @@ if decision_context is not None:
     alert_context = {
         "df": decision_context["df"],
         "levels": decision_context["levels"],
-        "price": price_now,
+        "price": price_for_alerts,
         "previous_close": prev,
         "entry_verdict": entry_evaluation.get("verdict"),
         "entry_blocked": any(
@@ -1073,7 +1085,7 @@ purchase_plan = trade_summary.build_purchase_plan(
         **summary_common,
         "position_mode": "entry",
         "rule_evaluation": entry_evaluation,
-        "snapshot": snapshot,
+        "snapshot": session_snapshot,
     },
     max_loss=st.session_state[purchase_loss_key],
     max_investment=st.session_state[purchase_budget_key],
@@ -1158,10 +1170,10 @@ with summary_box:
     if ask_price is not None and buy_limit is not None:
         gap = ask_price - buy_limit
         if gap > 0:
-            st.warning(md_escape(
+            st.warning(ui.plain_markdown(
                 f"売り気配（Ask）は上限より ${gap:,.2f} 高いため、追いかけず待ちます。"))
         else:
-            st.caption(md_escape(
+            st.caption(ui.plain_markdown(
                 f"売り気配（Ask）は上限まで ${abs(gap):,.2f} の範囲内です。"))
     below_reference = next(
         (item for item in purchase_plan.get("cautions") or []
@@ -1343,16 +1355,21 @@ with summary_box:
     if event_risk["available"] and event_risk.get("event_name"):
         days = event_risk.get("days_until")
         day_text = "日程差不明" if days is None else "本日" if days == 0 else f"{days}日後"
+        event_name_text = ui.plain_markdown(event_risk["event_name"])
+        event_session_text = ui.plain_markdown(
+            event_risk.get("session") or "発表時間未定")
         st.info(
-            f"📅 次の予定: {event_risk['event_name']} "
+            f"📅 次の予定: {event_name_text} "
             f"{event_risk['impact_stars_text']}（{day_text}）・"
-            f"{event_risk.get('session') or '発表時間未定'}")
+            f"{event_session_text}")
         if event_risk.get("warnings"):
             st.caption("⚠ 一部取得できないイベント情報があります: " + " ／ ".join(
-                localize_event_warning(item) for item in event_risk["warnings"]))
+                ui.plain_markdown(localize_event_warning(item))
+                for item in event_risk["warnings"]))
     elif result is not None and event_risk.get("report_status") in {
             "partial", "unavailable"}:
-        st.warning("📅 " + event_risk["reason"] + "。予定なしとは判定しません。")
+        st.warning("📅 " + ui.plain_markdown(event_risk["reason"])
+                   + "。予定なしとは判定しません。")
     elif result_expired:
         st.warning("📅 前回のイベント診断は15分を超えたため失効しました。再更新してください。")
     elif result is None and earnings_date:
@@ -1429,9 +1446,11 @@ with tab_today:
     quality_label = ("リアルタイムsnapshot" if trend["data_quality"] == "realtime"
                      else "直近確定日足" if trend["data_quality"] == "close_only"
                      else "取得不能")
-    with st.expander("当日の方向・支持抵抗を見る"):
+    trend_scope = ("立会の方向" if current in {"premarket", "afterhours", "overnight"}
+                   and trend["data_quality"] == "realtime" else "当日の方向")
+    with st.expander(f"{trend_scope}・支持抵抗を見る"):
         t1, t2, t3, t4 = st.columns(4)
-        t1.metric("当日の方向", trend["label"],
+        t1.metric(trend_scope, trend["label"],
                   ("強さ —" if trend["strength"] is None
                    else f"観測一致度 {trend['strength']:.0f}%"),
                   delta_color="off", border=True)
@@ -1450,6 +1469,9 @@ with tab_today:
         st.dataframe(check_df, hide_index=True, use_container_width=True)
         st.caption(f"方向のデータ品質: {quality_label}。支持抵抗は★3以上だけを抜粋し、"
                    "反発保証ではなく損益幅の確認に使います。")
+        if trend_scope == "立会の方向":
+            st.caption("時間外の方向は上部のリアルタイム1分足で確認してください。"
+                       "ここでは立会の始値・高値・安値・平均値を混ぜずに表示しています。")
 
     if result:
         st.markdown("#### 次回寄付き・セッション開始の方向診断")
@@ -1581,7 +1603,8 @@ with tab_today:
                     h1.caption(primary_time)
                     if secondary_time != "—":
                         h1.caption(secondary_time)
-                    h2.markdown(f"**{event['display_name_ja']}**")
+                    h2.markdown(
+                        f"**{ui.plain_markdown(event['display_name_ja'])}**")
                     h2.markdown(
                         ui.chip(event["status_label_ja"],
                                 "blue" if event.get("status") == "UPCOMING" else "gray")
@@ -1628,7 +1651,7 @@ with tab_today:
                         if evidence:
                             st.markdown("**日本語で確認できる根拠**")
                             for item in evidence[:4]:
-                                st.markdown(f"- {md_escape(item)}")
+                                st.markdown(f"- {ui.plain_markdown(item)}")
                         original_name = event.get("original_name")
                         english_evidence = [
                             str(item) for item in event.get("evidence") or []
@@ -1644,19 +1667,20 @@ with tab_today:
                                     st.text(str(item))
                         source_text = event_source_label_ja(event.get("source"))
                         st.caption(
-                            f"取得元: {source_text} ・ 根拠の充足度: "
+                            f"取得元: {ui.plain_markdown(source_text)} ・ 根拠の充足度: "
                             f"{event['confidence_label_ja']}")
                         st.caption(
                             "根拠の充足度は、過去標本数・情報源・日程の確かさを"
                             "まとめた説明用の目安で、統計的な信頼区間ではありません。")
-                        if event.get("url"):
+                        event_url = information_board.safe_url(event.get("url"))
+                        if event_url:
                             st.link_button(
-                                "原文の情報源を開く", event["url"],
+                                "原文の情報源を開く", event_url,
                                 key=f"event_source_{ticker}_{target_session}_{index}")
             st.caption("イベントは不確実性の確認材料で、売買スコアへ自動加点していません。"
                        "過去の方向や★の数は将来を保証せず、発表値と市場予想の差を確認してください。")
         for warning in event_report.get("warnings") or []:
-            st.warning(localize_event_warning(warning))
+            st.warning(ui.plain_markdown(localize_event_warning(warning)))
 
 # ---------------------------------------------------------------- チャート・指標
 with tab_chart:
@@ -1810,11 +1834,9 @@ with tab_chart:
                     "パフォーマンス比較", list(BENCHMARKS),
                     default=_saved_adv.get("benchmarks", []))
     with c_refresh:
-        if st.button("↻", help="最新データを再取得", key="refresh_chart"):
-            data_fetcher.fetch_chart_history.clear()
-            data_fetcher.fetch_order_book.clear()
-            moomoo_client.snapshot.clear()
-            st.rerun()
+        chart_refresh_clicked = st.button(
+            "↻", help="選択中の足・上位足・比較データを読み込む / 更新",
+            key="refresh_chart")
 
     macd_slow = max(int(macd_fast) + 1, int(macd_slow_input))
     indicator_params = {
@@ -1855,43 +1877,203 @@ with tab_chart:
     elif interval != "1d":
         chart_period = "10y" if interval == "1wk" else "max"
 
-    try:
-        chart_hist, chart_meta = data_fetcher.fetch_chart_history(
-            ticker, chart_period, interval, allow_new_quota=True)
-    except data_fetcher.FetchError:
-        chart_hist, chart_meta = pd.DataFrame(), {"source": "取得失敗"}
-    if chart_hist.empty:
-        st.warning("この足の間隔のデータを取得できなかったため、日足で表示しています。")
+    requested_interval = interval
+    benchmark_specs = tuple(
+        (str(label), str(BENCHMARKS[label])) for label in benches
+        if label in BENCHMARKS)
+    moomoo_settings_fingerprint = (
+        bool(_settings.get("moomoo_enabled", False)),
+        bool(_settings.get("moomoo_chart_history", False)),
+        str(_settings.get("moomoo_host") or moomoo_client.DEFAULT_HOST),
+        int(_settings.get("moomoo_port") or moomoo_client.DEFAULT_PORT),
+        int(_settings.get("moomoo_history_reserve", 10)),
+    )
+    chart_base_key = (
+        "chart-detail-v3", ticker, period_label, fetch_period, int(display_days),
+        bar_label, requested_interval, chart_period, int(chart_days),
+        ("support-resistance-htf", HTF_MAP.get(requested_interval)),
+        moomoo_settings_fingerprint,
+    )
+    chart_feature_key = (
+        bool(multi_timeframe), bool(show_order_book), benchmark_specs)
+    chart_result_key = (chart_base_key, chart_feature_key)
+    chart_result_store = st.session_state.get("chart_detail_results")
+    if not isinstance(chart_result_store, dict):
+        chart_result_store = {}
+        st.session_state["chart_detail_results"] = chart_result_store
+    while len(chart_result_store) > 2:
+        chart_result_store.pop(next(iter(chart_result_store)))
+
+    if chart_refresh_clicked:
+        # 通信はこのボタンがTrueになる1回だけ行う。取得済みDataFrameと状態は
+        # session_stateへ保存し、st.tabsの非表示再実行では読み直さない。
+        data_fetcher.fetch_chart_history.clear()
+        data_fetcher.fetch_order_book.clear()
+        fetched_frames = {}
+
+        def load_chart_frame(period_value, interval_value):
+            frame_key = (str(period_value), str(interval_value))
+            if frame_key not in fetched_frames:
+                try:
+                    fetched_frames[frame_key] = data_fetcher.fetch_chart_history(
+                        ticker, period_value, interval_value, allow_new_quota=True)
+                except data_fetcher.FetchError:
+                    fetched_frames[frame_key] = (
+                        pd.DataFrame(), {"source": "取得失敗", "code": ticker})
+            return fetched_frames[frame_key]
+
+        loaded_hist, loaded_meta = load_chart_frame(chart_period, interval)
+        loaded_interval = interval
+        loaded_period = chart_period
+        loaded_days = chart_days
+        loaded_limit_note = limit_note
+        main_fallback_used = loaded_hist.empty
+        if main_fallback_used:
+            # 上部で取得済みの日足を使い、失敗時に別の外部取得を連鎖させない。
+            loaded_hist = hist
+            loaded_meta = {
+                **dict(_base_meta),
+                "fallback_reason": (
+                    f"{bar_label}足を取得できなかったため、取得済みの日足を表示"),
+            }
+            loaded_interval = "1d"
+            loaded_period = fetch_period
+            loaded_days = display_days
+            loaded_limit_note = "取得に失敗したため、取得済みの日足を表示しています。"
+
+        loaded_view = indicators.slice_display(
+            indicators.add_indicators(loaded_hist, indicator_params), loaded_days)
+        loaded_levels = levels.find_levels(loaded_view)
+        loaded_htf = None
+        htf_label = HTF_MAP.get(loaded_interval)
+        if not main_fallback_used and htf_label and loaded_levels:
+            if htf_label == "日足":
+                htf_iv, htf_period = "1d", fetch_period
+            else:
+                htf_iv = "1wk" if htf_label == "週足" else "1mo"
+                htf_period = "10y" if htf_iv == "1wk" else "max"
+            htf_hist, htf_meta = load_chart_frame(htf_period, htf_iv)
+            loaded_htf = {
+                "label": htf_label, "interval": htf_iv, "period": htf_period,
+                "hist": htf_hist, "meta": htf_meta,
+            }
+
+        loaded_mtf = []
+        if multi_timeframe and not main_fallback_used:
+            if loaded_interval in INTRADAY_LIMITS:
+                mtf_specs = [("日足・6ヶ月", "1d", "2y", 182),
+                             ("週足・5年", "1wk", "10y", 1826)]
+            elif loaded_interval == "1d":
+                mtf_specs = [("1時間足・30日", "1h", "1mo", 30),
+                             ("週足・5年", "1wk", "10y", 1826)]
+            elif loaded_interval == "1wk":
+                mtf_specs = [("日足・1年", "1d", "2y", 365),
+                             ("月足・10年", "1mo", "max", 3653)]
+            else:
+                mtf_specs = [("日足・1年", "1d", "2y", 365),
+                             ("週足・5年", "1wk", "10y", 1826)]
+            for label, mtf_iv, mtf_period, mtf_days in mtf_specs:
+                mtf_hist, mtf_meta = load_chart_frame(mtf_period, mtf_iv)
+                loaded_mtf.append({
+                    "label": label, "interval": mtf_iv, "period": mtf_period,
+                    "days": mtf_days, "hist": mtf_hist, "meta": mtf_meta,
+                })
+
+        loaded_order_book = pd.DataFrame()
+        loaded_order_book_error = None
+        if show_order_book:
+            try:
+                loaded_order_book = data_fetcher.fetch_order_book(ticker, 10)
+            except data_fetcher.FetchError as exc:
+                loaded_order_book_error = str(exc)
+
+        loaded_benchmarks = []
+        for label, symbol in benchmark_specs:
+            try:
+                benchmark_hist = data_fetcher.fetch_history(
+                    symbol, loaded_period, loaded_interval)
+                benchmark_error = None
+            except data_fetcher.FetchError as exc:
+                benchmark_hist = pd.DataFrame()
+                benchmark_error = str(exc)
+            loaded_benchmarks.append({
+                "label": label, "symbol": symbol, "hist": benchmark_hist,
+                "error": benchmark_error,
+            })
+
+        if loaded_levels:
+            try:
+                loaded_moomoo_state = data_fetcher.moomoo_status()
+            except Exception as exc:
+                loaded_moomoo_state = {
+                    "state": "unavailable", "available": False,
+                    "message": f"接続状態を確認できませんでした: {type(exc).__name__}",
+                }
+        else:
+            loaded_moomoo_state = {
+                "state": "idle", "available": False, "message": "レベル未算出"}
+
+        chart_bundle = {
+            "base_key": chart_base_key, "feature_key": chart_feature_key,
+            "hist": loaded_hist, "meta": loaded_meta,
+            "interval": loaded_interval, "period": loaded_period,
+            "days": loaded_days, "limit_note": loaded_limit_note,
+            "fallback_used": main_fallback_used, "htf": loaded_htf,
+            "mtf": loaded_mtf, "order_book": loaded_order_book,
+            "order_book_error": loaded_order_book_error,
+            "benchmarks": loaded_benchmarks, "moomoo_state": loaded_moomoo_state,
+            "loaded_at": pd.Timestamp.now(tz="UTC"),
+        }
+        chart_result_store.pop(chart_result_key, None)
+        chart_result_store[chart_result_key] = chart_bundle
+        while len(chart_result_store) > 2:
+            chart_result_store.pop(next(iter(chart_result_store)))
+
+    exact_chart_bundle = chart_result_store.get(chart_result_key)
+    chart_features_loaded = isinstance(exact_chart_bundle, dict)
+    chart_bundle = exact_chart_bundle if chart_features_loaded else None
+    if chart_bundle is None:
+        # パネルだけを変更した場合は、同じ足・期間のmain/HTFを再利用する。
+        # MTF・板・比較は新しい組合せで↻が押されるまで表示しない。
+        for candidate in reversed(list(chart_result_store.values())):
+            if (isinstance(candidate, dict)
+                    and candidate.get("base_key") == chart_base_key):
+                chart_bundle = candidate
+                break
+    chart_fetch_requested = chart_bundle is not None
+    if chart_fetch_requested:
+        stored_hist = chart_bundle.get("hist")
+        chart_hist = (stored_hist if isinstance(stored_hist, pd.DataFrame)
+                      and not stored_hist.empty else hist)
+        chart_meta = dict(chart_bundle.get("meta") or _base_meta)
+        interval = str(chart_bundle.get("interval") or "1d")
+        chart_period = str(chart_bundle.get("period") or fetch_period)
+        chart_days = int(chart_bundle.get("days") or display_days)
+        limit_note = str(chart_bundle.get("limit_note") or "")
+        if chart_bundle.get("fallback_used"):
+            st.warning("この足の間隔のデータを取得できなかったため、日足で表示しています。")
+    else:
+        # 初期表示と設定変更後は上部で取得済みの日足だけを再利用する。
+        chart_hist, chart_meta = hist, dict(_base_meta)
         interval = "1d"
-        try:
-            chart_hist, chart_meta = data_fetcher.fetch_chart_history(
-                ticker, fetch_period, interval, allow_new_quota=True)
-        except data_fetcher.FetchError:
-            chart_hist = hist
-            chart_meta = {"source": "Yahoo Finance", "code": ticker,
-                          "fallback_reason": "moomoo・再取得とも利用不可"}
+        chart_period = fetch_period
         chart_days = display_days
-    if chart_hist.empty:
-        chart_hist = hist
-        chart_meta = {"source": "Yahoo Finance", "code": ticker,
-                      "fallback_reason": "moomooからデータを取得できませんでした"}
+        if requested_interval != "1d":
+            limit_note = (
+                f"{bar_label}足は右上の↻を押したときだけ読み込みます。"
+                "現在は取得済みの日足を表示しています。")
+
     chart_view = indicators.slice_display(
         indicators.add_indicators(chart_hist, indicator_params), chart_days)
 
     lv_list = levels.find_levels(chart_view)
 
     # 上位足のサポレジをマージ(分足→日足、日足→週足、週足→月足)
-    htf_label = HTF_MAP.get(interval)
-    if htf_label and lv_list:
-        if htf_label == "日足":
-            htf_iv, htf_period = "1d", fetch_period
-        else:
-            htf_iv = "1wk" if htf_label == "週足" else "1mo"
-            htf_period = "10y" if htf_iv == "1wk" else "max"
-        try:
-            htf_hist, _ = data_fetcher.fetch_chart_history(
-                ticker, htf_period, htf_iv, allow_new_quota=True)
-        except data_fetcher.FetchError:
+    htf_result = chart_bundle.get("htf") if chart_fetch_requested else None
+    if isinstance(htf_result, dict) and lv_list:
+        htf_label = str(htf_result.get("label") or "上位足")
+        htf_hist = htf_result.get("hist")
+        if not isinstance(htf_hist, pd.DataFrame):
             htf_hist = pd.DataFrame()
         htf_view = (indicators.slice_display(
             indicators.add_indicators(htf_hist), max(display_days * 4, 730))
@@ -1903,8 +2085,13 @@ with tab_chart:
     # 再評価の適用状態は銘柄・足・期間・最新バーが一致する間だけ有効。
     # 時間軸を切り替えた際に古い板情報を持ち越さない。
     base_lv_list = [dict(level) for level in lv_list]
+    level_indicator_signature = (
+        tuple(indicator_params["sma_periods"]), int(indicator_params["volume_ma"]))
+    chart_load_identity = (
+        str(chart_bundle.get("loaded_at")) if chart_fetch_requested else "initial")
     review_context = (f"{ticker}|{interval}|{chart_period}|{len(chart_view)}|"
-                      f"{chart_view.index[-1] if not chart_view.empty else 'empty'}")
+                      f"{chart_view.index[-1] if not chart_view.empty else 'empty'}|"
+                      f"{level_indicator_signature}|{chart_load_identity}")
     applied_review = st.session_state.get("moomoo_level_review_applied")
     review_is_applied = bool(
         applied_review
@@ -1939,7 +2126,7 @@ with tab_chart:
         "signals": show_signals,
         "compact_sessions": compact_sessions,
         "interaction": interaction,
-        "current_price": snapshot.get("price"),
+        "current_price": price_now,
     }
     st.plotly_chart(charts.price_chart(chart_view, ticker, opts),
                     config=PLOT_CONFIG, key=f"main_chart_{ticker}")
@@ -1948,82 +2135,85 @@ with tab_chart:
     if chart_meta.get("fallback_reason"):
         reason = str(chart_meta["fallback_reason"])
         source_text += f" / moomooフォールバック: {reason[:160]}"
-    st.caption(source_text)
+    st.caption(ui.plain_markdown(source_text))
     st.caption("💡 ホイール=拡大縮小、ダブルクリック=リセット、凡例クリック=線の表示/非表示。"
                "右上のツールバーでトレンドライン・パス・円・矩形を描画できます。"
                " ◆=配当、★=株式分割。赤帯=抵抗ゾーン、緑帯=サポートゾーン"
                "(濃く太いほど強いレベル)。"
                + (f" {limit_note}" if limit_note else ""))
 
-    if multi_timeframe:
+    if multi_timeframe and chart_features_loaded:
         st.subheader("🔲 マルチタイムフレーム")
-        if interval in INTRADAY_LIMITS:
-            mtf_specs = [("日足・6ヶ月", "1d", "2y", 182),
-                         ("週足・5年", "1wk", "10y", 1826)]
-        elif interval == "1d":
-            mtf_specs = [("1時間足・30日", "1h", "1mo", 30),
-                         ("週足・5年", "1wk", "10y", 1826)]
-        elif interval == "1wk":
-            mtf_specs = [("日足・1年", "1d", "2y", 365),
-                         ("月足・10年", "1mo", "max", 3653)]
+        mtf_results = chart_bundle.get("mtf") or []
+        if not mtf_results:
+            st.info("マルチタイムフレームを取得できませんでした。↻で再試行できます。")
         else:
-            mtf_specs = [("日足・1年", "1d", "2y", 365),
-                         ("週足・5年", "1wk", "10y", 1826)]
+            mtf_cols = st.columns(2)
+            for col, mtf_result in zip(mtf_cols, mtf_results):
+                label = str(mtf_result.get("label") or "上位足")
+                mtf_iv = str(mtf_result.get("interval") or "1d")
+                mtf_days = int(mtf_result.get("days") or display_days)
+                mtf_hist = mtf_result.get("hist")
+                if not isinstance(mtf_hist, pd.DataFrame):
+                    mtf_hist = pd.DataFrame()
+                mtf_meta = dict(mtf_result.get("meta") or {})
+                with col:
+                    if mtf_hist.empty:
+                        st.info(f"{label}を取得できませんでした。")
+                    else:
+                        mtf_view = indicators.slice_display(
+                            indicators.add_indicators(mtf_hist), mtf_days)
+                        st.plotly_chart(
+                            charts.mini_price_chart(
+                                mtf_view, label, interval=mtf_iv,
+                                theme_name=chart_theme),
+                            config={"displaylogo": False, "scrollZoom": True},
+                            key=f"mtf_{ticker}_{mtf_iv}",
+                        )
+                        st.caption(ui.plain_markdown(
+                            f"{mtf_meta.get('source', '不明')} / SMA20・50"))
 
-        mtf_cols = st.columns(2)
-        for col, (label, mtf_iv, mtf_period, mtf_days) in zip(mtf_cols, mtf_specs):
-            try:
-                mtf_hist, mtf_meta = data_fetcher.fetch_chart_history(
-                    ticker, mtf_period, mtf_iv, allow_new_quota=True)
-            except data_fetcher.FetchError:
-                mtf_hist, mtf_meta = pd.DataFrame(), {"source": "取得失敗"}
-            with col:
-                if mtf_hist.empty:
-                    st.info(f"{label}を取得できませんでした。")
-                else:
-                    mtf_view = indicators.slice_display(
-                        indicators.add_indicators(mtf_hist), mtf_days)
-                    st.plotly_chart(
-                        charts.mini_price_chart(
-                            mtf_view, label, interval=mtf_iv,
-                            theme_name=chart_theme),
-                        config={"displaylogo": False, "scrollZoom": True},
-                        key=f"mtf_{ticker}_{mtf_iv}",
-                    )
-                    st.caption(f"{mtf_meta.get('source', '不明')} / SMA20・50")
+    elif multi_timeframe:
+        st.info("マルチタイムフレームは右上の↻を押したときだけ読み込みます。")
 
-    if show_order_book:
+    if show_order_book and chart_features_loaded:
         st.subheader("📖 moomoo 板情報")
-        try:
-            order_book = data_fetcher.fetch_order_book(ticker, 10)
-        except data_fetcher.FetchError as exc:
-            st.info(f"板情報を取得できませんでした: {exc}")
+        order_book = chart_bundle.get("order_book")
+        if not isinstance(order_book, pd.DataFrame):
+            order_book = pd.DataFrame()
+        order_book_error = chart_bundle.get("order_book_error")
+        if order_book_error:
+            st.info(ui.plain_markdown(
+                f"板情報を取得できませんでした: {order_book_error}"))
+        elif order_book.empty:
+            st.info("利用可能な板情報がありません。")
         else:
-            if order_book.empty:
-                st.info("利用可能な板情報がありません。")
-            else:
-                styled_book = order_book.style.format({
-                    "売数量": lambda v: "—" if pd.isna(v) else f"{v:,.0f}",
-                    "売気配値": lambda v: "—" if pd.isna(v) else f"${v:,.3f}",
-                    "買気配値": lambda v: "—" if pd.isna(v) else f"${v:,.3f}",
-                    "買数量": lambda v: "—" if pd.isna(v) else f"{v:,.0f}",
-                })
-                st.dataframe(styled_book, hide_index=True)
-                st.caption("OpenD経由の読み取り専用データです。相場権限により"
-                           "表示段数やリアルタイム性が異なります。")
+            styled_book = order_book.style.format({
+                "売数量": lambda v: "—" if pd.isna(v) else f"{v:,.0f}",
+                "売気配値": lambda v: "—" if pd.isna(v) else f"${v:,.3f}",
+                "買気配値": lambda v: "—" if pd.isna(v) else f"${v:,.3f}",
+                "買数量": lambda v: "—" if pd.isna(v) else f"{v:,.0f}",
+            })
+            st.dataframe(styled_book, hide_index=True)
+            st.caption("OpenD経由の読み取り専用データです。相場権限により"
+                       "表示段数やリアルタイム性が異なります。")
 
-    if benches:
+    elif show_order_book:
+        st.info("板情報は右上の↻を押したときだけ読み込みます。")
+
+    if benches and chart_features_loaded:
         series = {ticker: chart_view["Close"]}
-        for label in benches:
-            try:
-                bhist = data_fetcher.fetch_history(
-                    BENCHMARKS[label], chart_period, interval)
-            except data_fetcher.FetchError:
+        for benchmark_result in chart_bundle.get("benchmarks") or []:
+            label = str(benchmark_result.get("label") or "比較対象")
+            bhist = benchmark_result.get("hist")
+            if not isinstance(bhist, pd.DataFrame):
                 bhist = pd.DataFrame()
             if not bhist.empty:
                 series[label] = indicators.slice_display(bhist, chart_days)["Close"]
         st.subheader("パフォーマンス比較(期間始点=100)")
         st.plotly_chart(charts.comparison_chart(series, interval))
+    elif benches:
+        st.info("比較データは右上の↻を押したときだけ読み込みます。")
 
     if lv_list:
         st.subheader("🧱 サポート / レジスタンス(表示期間ベース)")
@@ -2033,7 +2223,9 @@ with tab_chart:
             "OHLCVで算出した基礎レベルに、moomoo OpenAPIの板・歩み値・"
             "当日資金フローを重ねて更新案を作ります。moomooアプリ内AIの"
             "非公開チャットAPIではなく、根拠を確認できる読み取り専用の再評価です。")
-        moomoo_state = data_fetcher.moomoo_status()
+        moomoo_state = (dict(chart_bundle.get("moomoo_state") or {})
+                        if chart_fetch_requested else
+                        {"state": "idle", "available": False, "message": "未読込"})
         if review_is_applied:
             st.success(
                 f"再評価を適用中: {applied_review.get('summary', '—')} "
@@ -2044,11 +2236,14 @@ with tab_chart:
                 st.session_state.pop("moomoo_level_review_applied", None)
                 st.rerun()
 
+        if not chart_fetch_requested:
+            st.info("moomooデータによる再評価は、右上の↻でチャートを読み込んだ後に使えます。")
         if st.button(
             "moomooデータで再評価",
             key=f"run_level_review_{review_context}",
             type="primary" if not review_is_applied else "secondary",
-            disabled=not moomoo_state.get("available", False),
+            disabled=(not chart_fetch_requested
+                      or not moomoo_state.get("available", False)),
             help="OpenDから板・歩み値・資金フローを取得して更新候補を作ります",
         ):
             warnings = []
@@ -2081,8 +2276,9 @@ with tab_chart:
                            "OpenDのログイン状態と相場権限を確認してください。")
 
         if not moomoo_state.get("available", False):
-            st.info(f"再評価を使うにはOpenDを起動してログインしてください。"
-                    f"現在: {moomoo_state.get('message', '接続できません')}")
+            st.info(ui.plain_markdown(
+                "再評価を使うにはOpenDを起動してログインしてください。"
+                f"現在: {moomoo_state.get('message', '接続できません')}"))
 
         preview = st.session_state.get("moomoo_level_review_preview")
         if preview and preview.get("context") == review_context:
@@ -2264,9 +2460,53 @@ with tab_chart:
         f5.metric("時価総額", fmt_market_cap(info.get("market_cap")), border=True)
 
     st.subheader("⚡ イベント感応度")
-    sens_rows = sensitivity.evaluate(hist, info,
-                                     data_fetcher.fetch_earnings_history(ticker))
-    if not sens_rows:
+    load_financial = st.button(
+        "イベント履歴・業績推移を読み込む / 更新",
+        key=f"load_chart_financial_{ticker}",
+        help="押した回だけYahoo Financeへ問い合わせ、結果はこの画面内で再利用します。")
+    financial_store = st.session_state.get("chart_financial_results")
+    if not isinstance(financial_store, dict):
+        financial_store = {}
+        st.session_state["chart_financial_results"] = financial_store
+    while len(financial_store) > 8:
+        financial_store.pop(next(iter(financial_store)))
+    financial_key = ("chart-financial-v1", ticker)
+    if load_financial:
+        try:
+            loaded_earnings_history = data_fetcher.fetch_earnings_history(ticker)
+            earnings_error = None
+        except Exception:
+            loaded_earnings_history = []
+            earnings_error = "イベント履歴を取得できませんでした"
+        try:
+            loaded_financials = data_fetcher.fetch_annual_financials(ticker)
+            financial_error = None
+        except Exception:
+            loaded_financials = pd.DataFrame()
+            financial_error = "業績推移を取得できませんでした"
+        financial_store.pop(financial_key, None)
+        financial_store[financial_key] = {
+            "earnings_history": (
+                list(loaded_earnings_history)
+                if isinstance(loaded_earnings_history, (list, tuple)) else []),
+            "annual_financials": loaded_financials,
+            "earnings_error": earnings_error,
+            "financial_error": financial_error,
+            "loaded_at": pd.Timestamp.now(tz="UTC"),
+        }
+        while len(financial_store) > 8:
+            financial_store.pop(next(iter(financial_store)))
+
+    financial_bundle = financial_store.get(financial_key)
+    financial_loaded = isinstance(financial_bundle, dict)
+    if financial_loaded:
+        earnings_history = list(financial_bundle.get("earnings_history") or [])
+        sens_rows = sensitivity.evaluate(hist, info, earnings_history)
+    else:
+        sens_rows = []
+    if not financial_loaded:
+        st.info("イベント感応度と業績推移は、上のボタンを押したときだけ読み込みます。")
+    elif not sens_rows:
         st.info("感応度を評価するためのデータが不足しています。")
     else:
         st.dataframe(pd.DataFrame(sens_rows), hide_index=True)
@@ -2275,12 +2515,21 @@ with tab_chart:
                    "★が多いほどそのイベント・要因に反応しやすい銘柄です。")
 
     st.subheader("業績推移(過去4年)")
-    try:
-        fin = data_fetcher.fetch_annual_financials(ticker)
-    except data_fetcher.FetchError:
+    if financial_loaded:
+        stored_financials = financial_bundle.get("annual_financials")
+        fin = (stored_financials if isinstance(stored_financials, pd.DataFrame)
+               else pd.DataFrame())
+        for error_message in (
+                financial_bundle.get("earnings_error"),
+                financial_bundle.get("financial_error")):
+            if error_message:
+                st.caption(f"⚠ {error_message}")
+    else:
         fin = pd.DataFrame()
 
-    if fin.empty:
+    if not financial_loaded:
+        st.caption("業績データは未読込です。")
+    elif fin.empty:
         st.warning("財務データを取得できませんでした。")
     else:
         col_rev, col_eps = st.columns(2)
@@ -2291,7 +2540,29 @@ with tab_chart:
 
 # ---------------------------------------------------------------- タブ2
 with tab_news:
-    analyst = data_fetcher.fetch_analyst(ticker)
+    # 決算日は上の軽量取得を再利用し、目標株価・格付けは明示ボタン時だけ取得する。
+    analyst_store = st.session_state.setdefault("stock_analyst_results", {})
+    load_analyst = st.button(
+        "アナリスト評価を読み込む / 更新",
+        key=f"load_analyst_{ticker}",
+        help="押した回だけYahoo Financeへ問い合わせ、結果はこの画面内で再利用します。")
+    if load_analyst:
+        try:
+            analyst_store[ticker] = dict(data_fetcher.fetch_analyst(ticker) or {})
+            while len(analyst_store) > 8:
+                analyst_store.pop(next(iter(analyst_store)))
+        except Exception:
+            analyst_store.pop(ticker, None)
+            st.warning("アナリスト評価を取得できませんでした。時間をおいて再試行してください。")
+    loaded_analyst = analyst_store.get(ticker)
+    analyst = {
+        "targets": None, "ratings": None, "changes": [],
+        "earnings_date": None, "eps_estimate": None,
+        **dict(summary_analyst or {}),
+        **(dict(loaded_analyst) if isinstance(loaded_analyst, dict) else {}),
+    }
+    if ticker not in analyst_store:
+        st.caption("目標株価・格付けは未読込です。必要なときだけ上のボタンで取得します。")
     if analyst["targets"] or analyst["ratings"] or analyst["earnings_date"]:
         analyst_panel = st.expander("🎯 アナリスト評価・決算予定", expanded=False)
         a1, a2, a3, a4 = analyst_panel.columns(4)
@@ -2332,42 +2603,80 @@ with tab_news:
         st.subheader("📰 最新ニュース")
         news_src = st.pills("ニュースソース", NEWS_SOURCES,
                             default="Yahoo Finance") or "Yahoo Finance"
-        try:
-            if news_src == "Google News":
-                news = news_fetcher.fetch_google_news(ticker, "en")
-            elif news_src == "🇯🇵 日本語":
-                news = news_fetcher.fetch_google_news(ticker, "ja")
-            elif news_src == "SEC開示":
-                news = news_fetcher.fetch_sec_filings(ticker)
-            else:
-                news = news_fetcher.fetch_news(ticker, info.get("name"))
-        except data_fetcher.FetchError:
-            news = []
-            st.warning("ニュースの取得に失敗しました。しばらく時間をおいて再試行してください。")
-        if not news:
+        news_store = st.session_state.setdefault("stock_news_results", {})
+        news_key = (ticker, news_src)
+        load_news = st.button(
+            "このニュースを読み込む / 更新",
+            key=f"load_news_{ticker}_{news_src}", use_container_width=True)
+        if load_news:
+            try:
+                if news_src == "Google News":
+                    loaded_news = news_fetcher.fetch_google_news(ticker, "en")
+                elif news_src == "🇯🇵 日本語":
+                    loaded_news = news_fetcher.fetch_google_news(ticker, "ja")
+                elif news_src == "SEC開示":
+                    loaded_news = news_fetcher.fetch_sec_filings(ticker)
+                else:
+                    loaded_news = news_fetcher.fetch_news(ticker, info.get("name"))
+                news_store[news_key] = list(loaded_news or [])
+                while len(news_store) > 12:
+                    news_store.pop(next(iter(news_store)))
+            except Exception:
+                news_store.pop(news_key, None)
+                st.warning("ニュースの取得に失敗しました。しばらく時間をおいて再試行してください。")
+        news_loaded = news_key in news_store
+        news = list(news_store.get(news_key) or [])
+        if not news_loaded:
+            st.info("ニュースは必要なときだけ読み込みます。上のボタンを押してください。")
+        elif not news:
             st.info("このソースでは情報が見つかりませんでした。")
         if news_src == "SEC開示":
             st.caption("米SEC(証券取引委員会)への公式開示書類です。リンク先は英語の原文です。")
-        for n in news:
+        for news_index, n in enumerate(news):
             with st.container(border=True):
-                title = f"[{n['title']}]({n['url']})" if n["url"] else n["title"]
-                st.markdown(f"**{title}**")
-                chip_color = "violet" if n["provider"] == "SEC EDGAR" else "gray"
-                meta = ui.chip(n["provider"] or "ニュース", chip_color)
+                title = str(n.get("title") or "見出しなし")
+                st.markdown(f"**{ui.plain_markdown(title)}**")
+                news_url = information_board.safe_url(n.get("url"))
+                if news_url:
+                    st.link_button(
+                        "原文を開く", news_url,
+                        key=f"news_source_{ticker}_{news_src}_{news_index}")
+                provider = str(n.get("provider") or "ニュース")
+                chip_color = "violet" if provider == "SEC EDGAR" else "gray"
+                meta = ui.chip(provider, chip_color)
+                relative = html.escape(str(ui.relative_time(str(n.get("pub_date") or ""))))
                 meta += (f' <span style="color:#898781;font-size:0.8rem;">'
-                         f'{ui.relative_time(n["pub_date"])}</span>')
+                         f'{relative}</span>')
                 st.markdown(meta, unsafe_allow_html=True)
-                if n["summary"]:
-                    summary = n["summary"]
-                    st.write(md_escape(summary[:280] + ("…" if len(summary) > 280 else "")))
+                if n.get("summary"):
+                    summary = str(n["summary"])
+                    st.markdown(ui.plain_markdown(
+                        summary[:280] + ("…" if len(summary) > 280 else "")))
 
     with col_social:
         st.subheader("💬 ネットの反応")
-        social = news_fetcher.fetch_social(ticker)
+        social_store = st.session_state.setdefault("stock_social_results", {})
+        load_social = st.button(
+            "投稿を読み込む / 更新", key=f"load_social_{ticker}",
+            use_container_width=True)
+        if load_social:
+            try:
+                social_store[ticker] = news_fetcher.fetch_social(ticker)
+                while len(social_store) > 8:
+                    social_store.pop(next(iter(social_store)))
+            except Exception:
+                social_store.pop(ticker, None)
+                st.warning("投稿を取得できませんでした。時間をおいて再試行してください。")
+        social_loaded = ticker in social_store
+        social = social_store.get(ticker) or {
+            "errors": [], "total": 0, "bullish": 0, "bearish": 0, "posts": []}
         if social["errors"]:
-            st.warning("一部ソースの取得に失敗しました: " + ", ".join(social["errors"]))
+            st.warning("一部ソースの取得に失敗しました: " + ", ".join(
+                ui.plain_markdown(error) for error in social["errors"]))
 
-        if social["total"] == 0:
+        if not social_loaded:
+            st.info("ネット上の投稿は必要なときだけ読み込みます。上のボタンを押してください。")
+        elif social["total"] == 0:
             st.info("この銘柄への投稿が見つかりませんでした。")
         else:
             s1, s2, s3 = st.columns(3)
@@ -2405,18 +2714,26 @@ with tab_news:
                     break
                 shown += 1
                 with st.container(border=True):
-                    when = ui.relative_time(p["created_at"])
-                    when_html = (f'<a href="{p["url"]}" target="_blank" '
+                    when = html.escape(str(ui.relative_time(str(p.get("created_at") or ""))))
+                    post_url = information_board.safe_url(p.get("url"))
+                    when_html = (f'<a href="{html.escape(post_url, quote=True)}" target="_blank" '
+                                 f'rel="noopener noreferrer" '
                                  f'style="color:#898781;font-size:0.8rem;">{when} ↗</a>'
-                                 if p["url"] else
+                                 if post_url else
                                  f'<span style="color:#898781;font-size:0.8rem;">{when}</span>')
-                    likes = f'&nbsp;<span style="color:#898781;font-size:0.8rem;">♥ {p["likes"]}</span>' if p["likes"] else ""
+                    likes_value = p.get("likes")
+                    likes = (f'&nbsp;<span style="color:#898781;font-size:0.8rem;">'
+                             f'♥ {html.escape(str(likes_value))}</span>'
+                             if likes_value else "")
                     st.markdown(
-                        f'{ui.source_chip(p["source"])} {ui.sentiment_chip(p["sentiment"])} '
-                        f'<b>{html.escape(p["user"])}</b> · {when_html}{likes}',
+                        f'{ui.source_chip(str(p.get("source") or "投稿"))} '
+                        f'{ui.sentiment_chip(p.get("sentiment"))} '
+                        f'<b>{html.escape(str(p.get("user") or "匿名"))}</b> · '
+                        f'{when_html}{likes}',
                         unsafe_allow_html=True)
-                    body = p["body"]
-                    st.write(md_escape(body[:300] + ("…" if len(body) > 300 else "")))
+                    body = str(p.get("body") or "")
+                    st.markdown(ui.plain_markdown(
+                        body[:300] + ("…" if len(body) > 300 else "")))
 
 
 # -------------------------------------------------------------- 情報掲示板
@@ -2435,11 +2752,10 @@ for alert in active_ticker_alerts:
         "result": {**checked, "checked_at": alert_checked_at},
     })
 
-# ニュースタブの選択状態に左右されないYahooの一覧を使う。これはキャッシュ済みの
-# 読み取り専用ニュース取得であり、moomooの過去K線枠には触れない。
+# ニュースタブで明示的に取得済みの一覧だけを再利用する。
 try:
-        stock_board_news = (news if news_src == "Yahoo Finance"
-                            else news_fetcher.fetch_news(ticker, info.get("name")))
+    # 隠れた情報一覧タブのために別ソースへ自動通信しない。
+    stock_board_news = list(news or [])
 except Exception:
     stock_board_news = []
 
@@ -2458,7 +2774,7 @@ else:
         stock_board_events = {
             "status": "unavailable", "events": [], "warnings": [str(exc)]}
 
-stock_board_snapshot = dict(snapshot or {})
+stock_board_snapshot = dict(session_snapshot or {})
 if not stock_board_snapshot.get("price"):
     completed = None if decision_context is None else decision_context["df"]
     completed_price = (float(completed["Close"].iloc[-1])
@@ -2518,14 +2834,14 @@ with tab_orderflow:
         default="板・歩み値", key=f"orderflow_section_{ticker}",
         label_visibility="collapsed",
     ) or "板・歩み値"
-    orderflow_load = st.toggle(
-        "選んだ情報を読み込む", value=False,
+    orderflow_load = st.button(
+        "選んだ情報を読み込む", type="primary",
         key=f"orderflow_load_{ticker}",
-        help="必要なときだけmoomooの板・歩み値または需給データを取得します。",
+        help="このボタンを押した回だけmoomooの板・歩み値または需給データを取得します。",
     )
     orderflow_state = {"state": "idle"}
     if not orderflow_load:
-        st.caption("必要な項目を選び、読み込みをONにしてください。")
+        st.caption("必要な項目を選び、読み込みボタンを押してください。")
     else:
         orderflow_state = moomoo_client.status()
         if orderflow_state["state"] != "ok":
@@ -2664,8 +2980,9 @@ with tab_flow:
         st.markdown("#### 🌪️ オプションの変動率(IV / HV)")
         vol = moomoo_client.option_volatility(ticker)
         if not vol:
-            st.caption("オプションの変動率を取得できませんでした"
-                       "(オプションが上場していない銘柄の可能性があります)。")
+            st.caption("原資産向けIV/HV統計を取得できませんでした。"
+                       "銘柄の対象可否・相場権限・moomoo SDK対応状況を確認してください。"
+                       "オプション契約コードを原資産から推測して代用していません。")
         else:
             v_chart, v_note = st.columns([1.6, 1])
             with v_chart:
@@ -2684,7 +3001,8 @@ with tab_flow:
                     st.info(vol["analysis"])
                 st.caption("IVが高いほどオプション市場が今後の大きな値動きを"
                            "見込んでいることを示します。HVを大きく上回るときは"
-                           "決算などのイベントが控えている場合があります。")
+                           "決算などのイベントが控えている場合があります。"
+                           f"取得元: {vol.get('source', 'moomoo 原資産オプション統計')}")
 
 
 # ---------------------------------------------------------------- タブ5
@@ -2958,12 +3276,28 @@ with tab_derivatives:
                                 fmt(row.get("funding_rate_pct"), "%", 4),
                                 f"単純年率 {fmt(row.get('funding_annualized_pct'), '%', 2)}",
                                 delta_color="off")
+                            freshness = (row.get("metric_freshness")
+                                         if isinstance(row.get("metric_freshness"), dict)
+                                         else {})
+                            freshness_ja = {
+                                "fresh": "新しい", "stale": "古い",
+                                "missing": "未取得", "future": "時刻不整合",
+                                "unknown": "不明",
+                            }
+                            mark_status = freshness_ja.get(
+                                (freshness.get("mark_price") or {}).get("status"), "不明")
+                            oi_status = freshness_ja.get(
+                                (freshness.get("open_interest_usd") or {}).get("status"), "不明")
                             st.caption(
                                 f"OI {fmt(row.get('open_interest_usd'), ' USD', 0)}｜"
                                 f"24h出来高 {fmt(row.get('volume_base_24h'), '', 0)} "
                                 f"{row.get('asset', '')}\n\n"
                                 f"次回Funding決済 {fmt_utc_time(row.get('funding_time'))}｜"
-                                f"更新 {fmt_utc_time(row.get('as_of'))}")
+                                f"Mark更新 {fmt_utc_time(row.get('mark_as_of'))}（{mark_status}）｜"
+                                f"OI更新 {fmt_utc_time(row.get('open_interest_as_of'))}（{oi_status}）")
+                            if str(row.get("status") or "") in {"partial", "stale"}:
+                                st.warning("一部データの更新時刻が揃っていません。"
+                                           "古い指標は現在値として扱わないでください。")
                             if row.get("error"):
                                 st.warning(str(row["error"]))
 

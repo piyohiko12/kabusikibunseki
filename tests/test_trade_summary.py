@@ -175,6 +175,20 @@ class PricePlanAndLevelTests(unittest.TestCase):
         self.assertTrue(any("リアルタイムではなく" in warning
                             for warning in fallback["data_quality"]["warnings"]))
 
+    def test_unverified_extended_price_is_available_but_freshness_is_disclosed(self):
+        result = trade_summary.build_trade_summary({
+            "current_price": 163.77,
+            "current_price_source": "moomoo OpenAPI snapshot",
+            "current_price_quality": "session_price_time_unverified",
+        })
+        self.assertTrue(result["current_price"]["available"])
+        self.assertFalse(
+            result["data_quality"]["current_price_timestamp_verified"])
+        self.assertTrue(any(
+            "個別更新時刻を確認できない" in warning
+            for warning in result["data_quality"]["warnings"]
+        ))
+
 
 class ContextProjectionTests(unittest.TestCase):
     def test_intraday_trend_is_preferred_and_regime_is_safe_fallback(self):

@@ -62,17 +62,24 @@ def _wall(rows: list[tuple[float, float]]) -> dict | None:
 
 
 def _tick_imbalance(ticks: pd.DataFrame | None) -> tuple[float, int]:
-    """買い約定を+、売り約定を-とした出来高加重の偏りを返す。"""
+    """買い約定を+、売り約定を-とした出来高加重の偏りを返す。
+
+    件数は買い/売りへ分類でき、かつ正の出来高がある行だけを数える。中立約定
+    しかない入力をライブ証拠として信頼度へ加算しない。
+    """
     if ticks is None or ticks.empty or "ticker_direction" not in ticks:
         return 0.0, 0
     volume_values = (ticks["volume"] if "volume" in ticks
                      else pd.Series(1.0, index=ticks.index))
     volumes = pd.to_numeric(volume_values, errors="coerce").fillna(0).clip(lower=0)
     directions = ticks["ticker_direction"].astype(str).str.upper()
-    buy = float(volumes[directions.str.contains("BUY", na=False)].sum())
-    sell = float(volumes[directions.str.contains("SELL", na=False)].sum())
+    buy_mask = directions.str.contains("BUY", na=False)
+    sell_mask = directions.str.contains("SELL", na=False)
+    classified = (buy_mask | sell_mask) & volumes.gt(0)
+    buy = float(volumes[buy_mask & volumes.gt(0)].sum())
+    sell = float(volumes[sell_mask & volumes.gt(0)].sum())
     total = buy + sell
-    return ((buy - sell) / total if total > 0 else 0.0), int(len(ticks))
+    return ((buy - sell) / total if total > 0 else 0.0), int(classified.sum())
 
 
 def _capital_net(capital: dict | None) -> float:

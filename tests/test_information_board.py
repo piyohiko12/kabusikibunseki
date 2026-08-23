@@ -340,6 +340,22 @@ class BoardBuildTests(unittest.TestCase):
         self.assertTrue(snapshot["data"]["change_pct_calculated_from_previous_close"])
         self.assertIn("+2.00%", snapshot["summary_ja"])
 
+    def test_snapshot_names_the_selected_extended_session(self):
+        result = information_board.build_information_board({
+            "ticker": "SKHY",
+            "snapshot": {
+                "price": 163.77, "previous_close": 163.09,
+                "price_session": "afterhours", "price_field": "after_price",
+                "price_timestamp_verified": False,
+                "source": "moomoo OpenAPI snapshot",
+            },
+        })
+        snapshot = result["items"][0]
+        self.assertEqual(snapshot["title_ja"], "アフター価格のスナップショット")
+        self.assertIn("アフター価格 $163.77", snapshot["summary_ja"])
+        self.assertEqual(snapshot["data"]["price_session"], "afterhours")
+        self.assertFalse(snapshot["data"]["price_timestamp_verified"])
+
     def test_malformed_zone_is_omitted_not_silently_reversed(self):
         result = information_board.build_information_board({
             "ticker": "MU",

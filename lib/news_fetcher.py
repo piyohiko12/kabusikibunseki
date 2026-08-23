@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 import streamlit as st
@@ -106,6 +107,38 @@ def _tagged_news_symbols(item: dict, content: dict) -> set[str]:
     return {symbol for symbol in map(_normalized_news_symbol, tagged) if symbol}
 
 
+def _text(value) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _url_value(value) -> str:
+    """YahooのURLが文字列・{url: ...}のどちらでも安全に読む。"""
+    if isinstance(value, dict):
+        value = value.get("url")
+    return _text(value)
+
+
+def _provider_name(value) -> str:
+    if isinstance(value, dict):
+        return (_text(value.get("displayName")) or _text(value.get("name")))
+    return _text(value)
+
+
+def _published_at(item: dict, content: dict) -> str:
+    value = content.get("pubDate") or item.get("pubDate")
+    if isinstance(value, str):
+        return value[:16].replace("T", " ")
+    # yfinance旧形式のproviderPublishTimeはUnix秒。
+    epoch = item.get("providerPublishTime")
+    if isinstance(epoch, bool):
+        return ""
+    try:
+        return datetime.fromtimestamp(float(epoch), timezone.utc).strftime(
+            "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
 def _news_aliases(ticker: str, company_name: str | None) -> set[str]:
     symbol = _normalized_news_symbol(ticker)
     aliases = {symbol, symbol.replace("-", "."), symbol.replace("-", "")}
@@ -134,11 +167,16 @@ def fetch_news(ticker: str, company_name: str | None = None) -> list[dict]:
         items = yf.Ticker(ticker).news or []
     except Exception as e:
         raise FetchError(str(e)) from e
+    if not isinstance(items, (list, tuple)):
+        return []
 
     news = []
     for item in items[:10]:
-        c = item.get("content") or {}
-        title = c.get("title")
+        if not isinstance(item, dict):
+            continue
+        raw_content = item.get("content")
+        c = raw_content if isinstance(raw_content, dict) else {}
+        title = _text(c.get("title")) or _text(item.get("title"))
         if not title:
             continue
         tagged_symbols = _tagged_news_symbols(item, c)
@@ -147,18 +185,23 @@ def fetch_news(ticker: str, company_name: str | None = None) -> list[dict]:
             # Yahooのおすすめ記事が銘柄ニュースへ混ざる場合があるため、
             # 明示タグが別銘柄だけの記事は表示・イベント化しない。
             continue
-        article_text = " ".join((title, c.get("summary") or "",
-                                 c.get("description") or ""))
+        summary = (_text(c.get("summary")) or _text(c.get("description"))
+                   or _text(item.get("summary")) or _text(item.get("description")))
+        article_text = " ".join((title, summary))
         if (not tagged_symbols and company_name
                 and not _mentions_company(article_text, ticker, company_name)):
             continue
         news.append({
             "title": title,
-            "summary": c.get("summary") or c.get("description") or "",
-            "pub_date": (c.get("pubDate") or "")[:16].replace("T", " "),
-            "provider": (c.get("provider") or {}).get("displayName") or "",
-            "url": ((c.get("canonicalUrl") or {}).get("url")
-                    or (c.get("clickThroughUrl") or {}).get("url") or ""),
+            "summary": summary,
+            "pub_date": _published_at(item, c),
+            "provider": (_provider_name(c.get("provider"))
+                         or _provider_name(item.get("provider"))
+                         or _text(item.get("publisher"))),
+            "url": (_url_value(c.get("canonicalUrl"))
+                    or _url_value(c.get("clickThroughUrl"))
+                    or _url_value(item.get("link"))
+                    or _url_value(item.get("url"))),
         })
     return news
 
@@ -209,14 +252,18 @@ def _sec_cik_map() -> dict:
                                  headers=_sec_user_agent())
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read().decode("utf-8"))
-    return {v["ticker"]: v["cik_str"] for v in data.values()}
+    return {
+        _normalized_news_symbol(v.get("ticker")): v.get("cik_str")
+        for v in data.values() if isinstance(v, dict) and v.get("ticker")
+    }
 
 
 @st.cache_data(ttl=21600, show_spinner="SEC開示情報を取得中...")
 def fetch_sec_filings(ticker: str) -> list[dict]:
     """SEC EDGARから主要な開示書類(直近10件)を取得する。米国上場企業のみ。"""
     try:
-        cik = _sec_cik_map().get(ticker)
+        # SECのクラス株表記はBRK.BではなくBRK-B。
+        cik = _sec_cik_map().get(_normalized_news_symbol(ticker))
     except Exception as e:
         raise FetchError(str(e)) from e
     if cik is None:

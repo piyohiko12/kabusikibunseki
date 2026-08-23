@@ -31,10 +31,12 @@ def session_prices(snapshot: Mapping[str, Any] | None,
     snap = dict(snapshot or {})
     stamp = snap.get("update_time")
     live = snap.get("source") == "moomoo OpenAPI"
-    quality = 1.0 if live else 0.45
     result: dict[str, dict] = {}
 
     if live:
+        session_quotes = (snap.get("session_quotes")
+                          if isinstance(snap.get("session_quotes"), Mapping)
+                          else {})
         fields = {
             "premarket": ("pre_price", "pre_volume"),
             "regular": ("price", "volume"),
@@ -42,17 +44,34 @@ def session_prices(snapshot: Mapping[str, Any] | None,
             "overnight": ("overnight_price", "overnight_volume"),
         }
         for session, (price_key, volume_key) in fields.items():
-            price = _positive(snap.get(price_key))
+            quote = (session_quotes.get(session)
+                     if isinstance(session_quotes.get(session), Mapping) else {})
+            price = _positive(quote.get("price")) or _positive(snap.get(price_key))
             if price is None:
                 continue
+            # moomoo SDKの汎用update_timeは、時間外価格ごとの更新時刻ではない。
+            # session_quotesがある場合はtimestamp_verified=Trueの時刻だけ公開し、
+            # 未検証の時間外値を「最新」と見せない。
+            if quote:
+                timestamp_verified = bool(quote.get("timestamp_verified"))
+                timestamp = quote.get("updated_at") if timestamp_verified else None
+                quality = 1.0 if timestamp_verified else 0.65
+            else:
+                timestamp_verified = session == "regular" and stamp is not None
+                timestamp = stamp if timestamp_verified else None
+                quality = 1.0 if timestamp_verified else 0.65
             result[session] = {
                 "price": price,
                 "open": (_positive(snap.get("open"))
                          if session == "regular" else None),
-                "volume": _number(snap.get(volume_key)),
-                "timestamp": stamp,
-                "source": "moomoo OpenAPI snapshot",
+                "volume": (_number(quote.get("volume"))
+                           if quote.get("volume") is not None
+                           else _number(snap.get(volume_key))),
+                "timestamp": timestamp,
+                "source": (str(quote.get("source")) if quote.get("source")
+                           else "moomoo OpenAPI snapshot"),
                 "quality": quality,
+                "timestamp_verified": timestamp_verified,
             }
     elif daily_bar is not None:
         bar = dict(daily_bar)
@@ -62,7 +81,8 @@ def session_prices(snapshot: Mapping[str, Any] | None,
                 "price": close, "open": _positive(bar.get("Open")),
                 "volume": _number(bar.get("Volume")),
                 "timestamp": getattr(daily_bar, "name", None),
-                "source": "Yahoo Finance 直近確定日足", "quality": quality,
+                "source": "Yahoo Finance 直近確定日足", "quality": 0.45,
+                "timestamp_verified": True,
             }
     return result
 
@@ -92,7 +112,17 @@ def imminent_event_risk(report: Mapping[str, Any] | None, *,
         if pd.isna(event_date):
             continue
         distance = (event_date.date() - current).days
-        if 0 <= distance <= max(0, int(window_days)) and int(event.get("impact_score") or 0) >= 2:
+        level = str(event.get("impact_level") or "").strip().upper()
+        if level in {"HIGH", "CRITICAL"}:
+            high_impact = True
+        elif level in {"LOW", "MEDIUM"}:
+            high_impact = False
+        else:
+            # 旧データにimpact_levelがない場合だけ0〜100点を使う。
+            # 現行生成値はMEDIUMが最大58、HIGHが最小68なので60を境界とする。
+            score = _number(event.get("impact_score"))
+            high_impact = score is not None and score >= 60
+        if 0 <= distance <= max(0, int(window_days)) and high_impact:
             return True
     return False
 

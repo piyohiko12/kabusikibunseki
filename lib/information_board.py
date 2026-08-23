@@ -571,9 +571,16 @@ def _build_price_item(snapshot: Any, ticker: str | None, warnings: list[str]) ->
     if price is None and bid is None and ask is None:
         warnings.append("株価スナップショットに表示可能な価格がありません。")
         return None
+    session_code = str(row.get("price_session") or "").strip().lower()
+    session_labels = {
+        "premarket": "プレ価格", "regular": "立会価格",
+        "afterhours": "アフター価格", "overnight": "夜間価格",
+        "closed": "直近立会価格",
+    }
+    price_label = session_labels.get(session_code, "現在値")
     summary_parts = []
     if price is not None:
-        summary_parts.append(f"現在値 ${price:,.2f}")
+        summary_parts.append(f"{price_label} ${price:,.2f}")
     if change_pct is not None:
         summary_parts.append(f"前日比 {change_pct:+.2f}%")
     if bid is not None:
@@ -587,7 +594,7 @@ def _build_price_item(snapshot: Any, ticker: str | None, warnings: list[str]) ->
         "category": "price",
         "kind": "snapshot",
         "importance": importance,
-        "title_ja": "株価スナップショット",
+        "title_ja": f"{price_label}のスナップショット",
         "summary_ja": " ／ ".join(summary_parts),
         "occurred_at": as_of,
         "source": row.get("source"),
@@ -597,6 +604,9 @@ def _build_price_item(snapshot: Any, ticker: str | None, warnings: list[str]) ->
             "change_pct": change_pct,
             "change_pct_calculated_from_previous_close": change_pct_calculated,
             "bid": bid, "ask": ask,
+            "price_session": session_code or None,
+            "price_field": _one_line(row.get("price_field"), 50),
+            "price_timestamp_verified": row.get("price_timestamp_verified") is True,
             "market_state": _one_line(row.get("market_state"), 100),
         },
         "identity_key": (

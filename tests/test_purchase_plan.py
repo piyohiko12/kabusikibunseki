@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import unittest
 
-from lib import trade_summary
+from lib import data_fetcher, trade_summary
 
 
 NOW = datetime(2026, 8, 10, 14, 0, 0, tzinfo=timezone.utc)
@@ -131,6 +131,38 @@ class PurchaseReadinessTests(unittest.TestCase):
         self.assertIn("通常時の想定損失を超える", result["disclaimer"])
         self.assertIn("gap_slippage_risk",
                       [row["code"] for row in result["cautions"]])
+
+    def test_extended_session_uses_its_price_but_not_unverified_regular_bbo(self):
+        payload = purchase_input()
+        raw = {
+            **payload["snapshot"],
+            "price": 163.41,
+            "after_price": 163.77,
+            "bid": 163.40,
+            "ask": 163.42,
+            "session_quotes": {
+                "afterhours": {
+                    "price": 163.77, "timestamp_verified": False,
+                    "source": "moomoo OpenAPI snapshot",
+                },
+            },
+        }
+        selected = data_fetcher.select_session_price(
+            raw, {"session": "afterhours"})
+        payload["current_price"] = selected["price"]
+        payload["current_price_quality"] = "session_price_time_unverified"
+        payload["snapshot"] = data_fetcher.snapshot_for_session(raw, selected)
+        payload["session"]["current_session"].update({
+            "session": "afterhours", "tradable": True,
+        })
+
+        result = trade_summary.build_purchase_plan(payload, now=NOW)
+
+        self.assertEqual(selected["price"], 163.77)
+        self.assertIsNone(result["quote"]["bid"])
+        self.assertIsNone(result["quote"]["ask"])
+        self.assertFalse(result["actionable"])
+        self.assertIn("ask_unavailable", reason_codes(result))
 
     def test_neutral_and_wait_never_become_ready(self):
         neutral = trade_summary.build_purchase_plan(

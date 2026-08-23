@@ -5,6 +5,8 @@
 
 from datetime import datetime, timezone
 import html
+import re
+import string
 
 import plotly.graph_objects as go
 
@@ -25,6 +27,15 @@ SOURCE_COLORS = {
 }
 
 SENTIMENT_LABELS = {"Bullish": "強気", "Bearish": "弱気"}
+_MARKDOWN_PUNCTUATION = re.compile(
+    f"([{re.escape(string.punctuation)}])")
+
+
+def plain_markdown(value: object) -> str:
+    """外部文字列をMarkdownのリンク・画像・HTMLとして解釈させない。"""
+    text = str(value or "")
+    text = _MARKDOWN_PUNCTUATION.sub(r"\\\1", text)
+    return text.replace("\n", "  \n")
 
 
 def chip(text: str, color: str = "gray") -> str:

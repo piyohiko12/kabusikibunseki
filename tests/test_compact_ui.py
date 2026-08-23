@@ -35,9 +35,10 @@ class CompactUiContractTests(unittest.TestCase):
                 "購入株数を計算",
                 "購入を中止する条件",
                 "すでに株を持っている場合",
-                "判定の理由・相場の状態・支持抵抗",
-                "当日の方向・支持抵抗を見る"):
+                "判定の理由・相場の状態・支持抵抗"):
             self.assertIn(f'st.expander("{label}"', self.stock)
+        self.assertIn('with st.expander(f"{trend_scope}・支持抵抗を見る")', self.stock)
+        self.assertIn('"立会の方向" if current in', self.stock)
         self.assertNotIn('st.markdown("#### 3. 購入株数の上限を計算")', self.stock)
         self.assertNotIn('st.markdown("#### 当日の方向と重要価格帯")', self.stock)
 
@@ -83,6 +84,18 @@ class CompactUiContractTests(unittest.TestCase):
         rendered = ui.chip('</span><script>alert("x")</script>', "blue")
         self.assertIn("&lt;script&gt;", rendered)
         self.assertNotIn("<script>", rendered)
+
+    def test_plain_markdown_disables_external_links_images_and_html(self):
+        rendered = ui.plain_markdown(
+            '[公式](https://phishing.invalid) ![追跡](https://tracker.invalid/p.gif) '
+            '<script>alert("x")</script>')
+        self.assertNotIn("[公式](", rendered)
+        self.assertNotIn("![追跡](", rendered)
+        self.assertNotIn("<script>", rendered)
+        self.assertNotIn("https://", rendered)
+        self.assertIn(r"\[公式\]\(", rendered)
+        self.assertIn(r"\!\[追跡\]\(", rendered)
+        self.assertIn(r"\<script\>", rendered)
 
     def test_declared_streamlit_minimum_uses_compatible_width_arguments(self):
         self.assertNotIn('width="stretch"', self.stock)

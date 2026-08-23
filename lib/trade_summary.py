@@ -155,12 +155,13 @@ def _current_price(payload: Mapping[str, Any]) -> dict:
         source = payload.get("current_price_source")
         if not source and same_as_snapshot:
             source = snapshot.get("source")
+        explicit_quality = payload.get("current_price_quality")
         return {
             "value": explicit,
             "available": True,
             "source": str(source or "呼び出し側の現在値"),
             "as_of": payload.get("current_price_as_of", snapshot.get("update_time")),
-            "quality": (
+            "quality": str(explicit_quality) if explicit_quality else (
                 "realtime"
                 if same_as_snapshot and snapshot.get("source") == "moomoo OpenAPI"
                 else "supplied"
@@ -548,6 +549,9 @@ def _data_quality(*, price: Mapping[str, Any], verdict: Mapping[str, Any],
     quality_warnings = list(dict.fromkeys(str(item) for item in warnings if item))
     if price.get("quality") == "close_only":
         quality_warnings.append("現在値はリアルタイムではなく直近確定日足です")
+    elif price.get("quality") == "session_price_time_unverified":
+        quality_warnings.append(
+            "時間外価格の個別更新時刻を確認できないため参考値として表示しています")
     return {
         "status": status,
         "label_ja": label,
@@ -558,6 +562,9 @@ def _data_quality(*, price: Mapping[str, Any], verdict: Mapping[str, Any],
         "components": components,
         "missing": tuple(label for label, available in components.items() if not available),
         "warnings": tuple(dict.fromkeys(quality_warnings)),
+        "current_price_timestamp_verified": (
+            price.get("quality") != "session_price_time_unverified"
+        ),
         "score_effect": 0,
     }
 

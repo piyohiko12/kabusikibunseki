@@ -1,4 +1,8 @@
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -45,6 +49,25 @@ class RuleAlertTests(unittest.TestCase):
         self.assertTrue(result["triggered"])
         self.assertEqual(result["actual"], "$106.00")
 
+    def test_explicit_missing_session_price_does_not_fall_back_to_daily_close(self):
+        frame = pd.DataFrame({"Close": [100.0, 110.0]})
+        price_result = alerts.check(
+            alerts.new_alert("AAPL", "price_above", 105),
+            {"df": frame, "price": None},
+        )
+        change_result = alerts.check(
+            alerts.new_alert("AAPL", "change_above", 0.1),
+            {"df": frame, "price": None, "previous_close": 100.0},
+        )
+        level_result = alerts.check(
+            alerts.new_alert("AAPL", "near_resistance", 3),
+            {"df": frame, "price": None,
+             "levels": [{"type": "抵抗線", "price": 111.0}]},
+        )
+        for result in (price_result, change_result, level_result):
+            self.assertFalse(result["triggered"])
+            self.assertEqual(result["actual"], "取得できず")
+
     def test_rule_actuals_are_japanese_and_legacy_sell_is_not_short_sale(self):
         cases = {
             "BUY": "買い候補",
@@ -66,6 +89,54 @@ class RuleAlertTests(unittest.TestCase):
         alert = alerts.new_alert("AAPL", "price_above", 100)
         self.assertEqual(alerts.format_actual(alert, "$101.00"), "$101.00")
         self.assertEqual(alerts.format_actual(alert, 0), "0")
+
+    def test_resistance_alert_ignores_already_crossed_level(self):
+        result = alerts.check(alerts.new_alert(
+            "AAPL", "near_resistance", 5), {
+                "price": 101,
+                "levels": [
+                    {"type": "抵抗線", "price": 100},
+                    {"type": "抵抗線", "price": 110},
+                ],
+            })
+        self.assertFalse(result["triggered"])
+        self.assertEqual(result["actual"], "8.91%")
+
+    def test_support_alert_ignores_level_above_current_price(self):
+        result = alerts.check(alerts.new_alert(
+            "AAPL", "near_support", 5), {
+                "price": 101,
+                "levels": [
+                    {"type": "サポート", "price": 100},
+                    {"type": "サポート", "price": 110},
+                ],
+            })
+        self.assertTrue(result["triggered"])
+        self.assertEqual(result["actual"], "0.99%")
+
+    def test_missing_threshold_fails_safe_in_check_and_describe(self):
+        broken = {"ticker": "AAPL", "kind": "price_above", "value": None}
+        result = alerts.check(broken, {"price": 120})
+        self.assertFalse(result["triggered"])
+        self.assertEqual(result["actual"], "設定不正")
+        self.assertIn("基準値が不正", alerts.describe(broken))
+
+    def test_load_skips_missing_values_and_disables_malformed_enabled_flag(self):
+        payload = {"alerts": [
+            {"ticker": "AAPL", "kind": "price_above", "value": None},
+            {"ticker": "MSFT", "kind": "price_below", "value": "101.5",
+             "enabled": "false", "note": 123},
+            {"ticker": "NVDA", "kind": "rule_buy"},
+        ]}
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "alerts.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with mock.patch.object(alerts, "DATA_FILE", path):
+                loaded = alerts.load()
+        self.assertEqual([row["ticker"] for row in loaded], ["MSFT", "NVDA"])
+        self.assertEqual(loaded[0]["value"], 101.5)
+        self.assertFalse(loaded[0]["enabled"])
+        self.assertEqual(loaded[0]["note"], "")
 
 
 if __name__ == "__main__":

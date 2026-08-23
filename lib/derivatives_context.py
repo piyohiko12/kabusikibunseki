@@ -368,13 +368,24 @@ PERP_COLUMNS = [
     "change_24h_pct", "high_24h", "low_24h", "volume_base_24h",
     "funding_rate_pct", "funding_interval_hours", "funding_annualized_pct",
     "funding_premium_pct", "open_interest_usd", "funding_time",
-    "next_funding_time", "as_of",
+    "next_funding_time", "ticker_as_of", "mark_as_of",
+    "open_interest_as_of", "funding_as_of", "as_of", "latest_as_of",
+    "endpoint_freshness", "metric_freshness", "freshness_status",
     "status", "error",
 ]
 
 OKX_BASE_URL = "https://www.okx.com/api/v5"
 OKX_USER_AGENT = "kabusikibunseki/1.0 (read-only market context)"
 OKX_TIMEOUT_SECONDS = 6
+PERP_FRESHNESS_MAX_AGE_SECONDS = 300
+PERP_FUTURE_TOLERANCE_SECONDS = 60
+PERP_ENDPOINTS = ("ticker", "mark_price", "open_interest", "funding_rate")
+PERP_METRIC_ENDPOINTS = {
+    "last": "ticker",
+    "mark_price": "mark_price",
+    "open_interest_usd": "open_interest",
+    "funding_rate_pct": "funding_rate",
+}
 OKX_REQUIRED_NUMERIC_FIELDS = {
     "market/ticker": ("last", "open24h", "high24h", "low24h", "volCcy24h", "ts"),
     "public/mark-price": ("markPx", "ts"),
@@ -438,6 +449,49 @@ def _funding_interval_hours(funding: dict) -> float:
     return hours if np.isfinite(hours) and hours > 0 else np.nan
 
 
+def _perp_endpoint_freshness(
+        responses: dict[str, dict], fetched_at: pd.Timestamp) -> dict[str, dict]:
+    """各endpointの応答時刻と鮮度を、取得時刻を基準に保守的に判定する。"""
+    fetched = _as_utc(fetched_at)
+    result: dict[str, dict] = {}
+    for endpoint in PERP_ENDPOINTS:
+        stamp = _ms_to_utc((responses.get(endpoint) or {}).get("ts"))
+        if pd.isna(stamp):
+            result[endpoint] = {
+                "as_of": pd.NaT, "age_seconds": np.nan, "status": "missing"}
+            continue
+        age_seconds = ((fetched - stamp).total_seconds()
+                       if not pd.isna(fetched) else np.nan)
+        if not np.isfinite(age_seconds):
+            status = "unknown"
+        elif age_seconds < -PERP_FUTURE_TOLERANCE_SECONDS:
+            status = "future"
+        elif age_seconds <= PERP_FRESHNESS_MAX_AGE_SECONDS:
+            status = "fresh"
+        else:
+            status = "stale"
+        result[endpoint] = {
+            "as_of": stamp,
+            "age_seconds": age_seconds,
+            "status": status,
+        }
+    return result
+
+
+def _perp_freshness_status(endpoint_freshness: dict[str, dict]) -> str:
+    statuses = [str((endpoint_freshness.get(key) or {}).get("status", "missing"))
+                for key in PERP_ENDPOINTS]
+    if statuses and all(status == "fresh" for status in statuses):
+        return "fresh"
+    if statuses and all(status == "stale" for status in statuses):
+        return "stale"
+    if any(status == "fresh" for status in statuses):
+        return "partial"
+    if any(status in {"stale", "future", "unknown"} for status in statuses):
+        return "stale"
+    return "unavailable"
+
+
 def _empty_perp_row(asset: str) -> dict:
     row = {column: np.nan for column in PERP_COLUMNS}
     row.update({
@@ -446,7 +500,15 @@ def _empty_perp_row(asset: str) -> dict:
         "venue": "OKX",
         "funding_time": pd.NaT,
         "next_funding_time": pd.NaT,
+        "ticker_as_of": pd.NaT,
+        "mark_as_of": pd.NaT,
+        "open_interest_as_of": pd.NaT,
+        "funding_as_of": pd.NaT,
         "as_of": pd.NaT,
+        "latest_as_of": pd.NaT,
+        "endpoint_freshness": {},
+        "metric_freshness": {},
+        "freshness_status": "unavailable",
         "status": "unavailable",
         "error": "",
     })
@@ -470,12 +532,39 @@ def _parse_okx_perp(asset: str, responses: dict[str, dict],
                   if np.isfinite(funding_pct) and np.isfinite(interval) and interval > 0
                   else np.nan)
 
-    timestamps = [
-        _ms_to_utc(ticker.get("ts")), _ms_to_utc(mark.get("ts")),
-        _ms_to_utc(interest.get("ts")), _ms_to_utc(funding.get("ts")),
-    ]
+    endpoint_freshness = _perp_endpoint_freshness(responses, fetched_at)
+    metric_freshness = {
+        metric: dict(endpoint_freshness[endpoint])
+        for metric, endpoint in PERP_METRIC_ENDPOINTS.items()
+    }
+    freshness_status = _perp_freshness_status(endpoint_freshness)
+    timestamps = [details["as_of"] for details in endpoint_freshness.values()]
     timestamps = [stamp for stamp in timestamps if not pd.isna(stamp)]
-    as_of = max(timestamps) if timestamps else fetched_at
+    # 全体の時刻には最古の必須endpointを使う。maxだけを使うと、Markが最新でも
+    # OIだけ古いケースを「最新」に見せてしまう。
+    as_of = min(timestamps) if timestamps else fetched_at
+    latest_as_of = max(timestamps) if timestamps else fetched_at
+
+    freshness_errors = []
+    for endpoint, details in endpoint_freshness.items():
+        endpoint_status = details["status"]
+        if endpoint_status in {"stale", "future", "unknown"}:
+            age = details.get("age_seconds")
+            age_text = f"{age:.0f}秒" if np.isfinite(age) else "不明"
+            freshness_errors.append(f"{endpoint}: 鮮度={endpoint_status}({age_text})")
+    all_errors = [f"{key}: {value}" for key, value in errors.items()]
+    all_errors.extend(freshness_errors)
+
+    if not responses:
+        row_status = "unavailable"
+    elif len(responses) < len(PERP_ENDPOINTS) or errors:
+        row_status = "partial"
+    elif freshness_status == "fresh":
+        row_status = "ok"
+    elif freshness_status == "stale":
+        row_status = "stale"
+    else:
+        row_status = "partial"
 
     row.update({
         "last": last,
@@ -495,9 +584,17 @@ def _parse_okx_perp(asset: str, responses: dict[str, dict],
         "open_interest_usd": _safe_number(interest.get("oiUsd")),
         "funding_time": _ms_to_utc(funding.get("fundingTime")),
         "next_funding_time": _ms_to_utc(funding.get("nextFundingTime")),
+        "ticker_as_of": endpoint_freshness["ticker"]["as_of"],
+        "mark_as_of": endpoint_freshness["mark_price"]["as_of"],
+        "open_interest_as_of": endpoint_freshness["open_interest"]["as_of"],
+        "funding_as_of": endpoint_freshness["funding_rate"]["as_of"],
         "as_of": as_of,
-        "status": "ok" if len(responses) == 4 else "partial" if responses else "unavailable",
-        "error": "; ".join(f"{key}: {value}" for key, value in errors.items()),
+        "latest_as_of": latest_as_of,
+        "endpoint_freshness": endpoint_freshness,
+        "metric_freshness": metric_freshness,
+        "freshness_status": freshness_status,
+        "status": row_status,
+        "error": "; ".join(all_errors),
     })
     return row
 
@@ -510,9 +607,11 @@ def _empty_perp_result(requested: tuple[str, ...], error: str | None = None):
         "requested": requested,
         "ok": (),
         "partial": (),
+        "stale": (),
         "unavailable": requested,
         "fetched_at": _utc_now(),
         "errors": ({"request": error} if error else {}),
+        "freshness": {},
         "authenticated": False,
         "read_only": True,
     }
@@ -522,13 +621,17 @@ def _empty_perp_result(requested: tuple[str, ...], error: str | None = None):
 def _finalize_perp_rows(rows: list[dict], requested: tuple[str, ...],
                         fetched_at: pd.Timestamp) -> tuple[pd.DataFrame, dict]:
     frame = pd.DataFrame(rows, columns=PERP_COLUMNS)
-    for column in ("funding_time", "next_funding_time", "as_of"):
+    for column in ("funding_time", "next_funding_time", "ticker_as_of",
+                   "mark_as_of", "open_interest_as_of", "funding_as_of",
+                   "as_of", "latest_as_of"):
         frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
     ok = tuple(frame.loc[frame["status"] == "ok", "asset"])
     partial = tuple(frame.loc[frame["status"] == "partial", "asset"])
+    stale = tuple(frame.loc[frame["status"] == "stale", "asset"])
     unavailable = tuple(frame.loc[frame["status"] == "unavailable", "asset"])
     status = "ok" if len(ok) == len(requested) else (
-        "partial" if len(ok) + len(partial) > 0 else "unavailable")
+        "stale" if len(stale) == len(requested) else
+        "partial" if len(ok) + len(partial) + len(stale) > 0 else "unavailable")
     meta = {
         "source": "OKX Public API",
         "venue": "OKX",
@@ -536,9 +639,12 @@ def _finalize_perp_rows(rows: list[dict], requested: tuple[str, ...],
         "requested": requested,
         "ok": ok,
         "partial": partial,
+        "stale": stale,
         "unavailable": unavailable,
         "fetched_at": fetched_at,
         "errors": {row["asset"]: row["error"] for row in rows if row["error"]},
+        "freshness": {
+            row["asset"]: row.get("endpoint_freshness", {}) for row in rows},
         "authenticated": False,
         "read_only": True,
     }

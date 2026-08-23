@@ -9,6 +9,7 @@
 """
 
 import json
+import math
 import uuid
 from pathlib import Path
 
@@ -60,36 +61,76 @@ def new_alert(ticker: str, kind: str, value: float | None = None,
 
 
 def _price(df) -> float | None:
-    if df is None or df.empty:
+    if df is None or df.empty or "Close" not in df:
         return None
-    return float(df["Close"].iloc[-1])
+    return _finite_number(df["Close"].iloc[-1], positive=True)
 
 
 def _change_pct(df) -> float | None:
-    if df is None or len(df) < 2:
+    if df is None or "Close" not in df or len(df) < 2:
         return None
-    prev = float(df["Close"].iloc[-2])
-    if prev == 0:
+    prev = _finite_number(df["Close"].iloc[-2], positive=True)
+    current = _finite_number(df["Close"].iloc[-1], positive=True)
+    if prev is None or current is None:
         return None
-    return (float(df["Close"].iloc[-1]) / prev - 1) * 100
+    return (current / prev - 1) * 100
 
 
 def _rsi(df) -> float | None:
     if df is None or "RSI" not in df.columns or df.empty:
         return None
-    v = df["RSI"].iloc[-1]
-    return float(v) if pd.notna(v) else None
+    return _finite_number(df["RSI"].iloc[-1])
+
+
+def _finite_number(value, *, positive: bool = False) -> float | None:
+    """bool・NaN・無限大を数値として受け入れない。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or (positive and number <= 0):
+        return None
+    return number
+
+
+def _valid_alert_value(kind: str, value) -> float | None:
+    number = _finite_number(value)
+    if number is None:
+        return None
+    if kind in {"price_above", "price_below"} and number <= 0:
+        return None
+    if kind in {"rsi_above", "rsi_below"} and not 0 <= number <= 100:
+        return None
+    if kind in {"near_support", "near_resistance"} and number < 0:
+        return None
+    return number
 
 
 def _nearest_distance(levels, price, kind) -> float | None:
-    side = [l for l in (levels or []) if l["type"] == kind]
-    if not side or not price:
+    current = _finite_number(price, positive=True)
+    if current is None:
+        return None
+    side: list[float] = []
+    for level in levels or []:
+        if not isinstance(level, dict) or level.get("type") != kind:
+            continue
+        level_price = _finite_number(level.get("price"), positive=True)
+        if level_price is None:
+            continue
+        # 通過済みの線を「次の」支持・抵抗として扱わない。現在値と同値は
+        # その水準へ到達中なので有効（距離0%）とする。
+        if ((kind == "抵抗線" and level_price >= current)
+                or (kind == "サポート" and level_price <= current)):
+            side.append(level_price)
+    if not side:
         return None
     if kind == "抵抗線":
-        nearest = min(side, key=lambda l: l["price"])
-        return abs(nearest["price"] / price - 1) * 100
-    nearest = max(side, key=lambda l: l["price"])
-    return abs(1 - nearest["price"] / price) * 100
+        nearest = min(side)
+        return (nearest / current - 1) * 100
+    nearest = max(side)
+    return (1 - nearest / current) * 100
 
 
 def check(alert: dict, ctx: dict) -> dict:
@@ -101,13 +142,20 @@ def check(alert: dict, ctx: dict) -> dict:
     df = ctx.get("df")
     kind = alert.get("kind")
     value = alert.get("value")
-    try:
-        price = float(ctx.get("price")) if ctx.get("price") is not None else _price(df)
-    except (TypeError, ValueError):
-        price = _price(df)
+    # 呼び出し側がpriceキーを明示してNoneにした場合は、時間外専用価格などを
+    # 取得できなかったという意味を保つ。確定日足へ黙って戻すと、古い立会価格で
+    # 価格アラートが成立してしまうため、キー自体がない旧呼び出しだけdfへ補完する。
+    price = (_finite_number(ctx.get("price"), positive=True)
+             if "price" in ctx else _price(df))
 
     def out(trig, actual, reason=""):
         return {"triggered": bool(trig), "actual": actual, "reason": reason}
+
+    spec = KINDS.get(kind)
+    if spec and spec.get("needs_value"):
+        value = _valid_alert_value(kind, value)
+        if value is None:
+            return out(False, "設定不正", "アラートの基準値が欠損または不正です")
 
     if kind in ("price_above", "price_below"):
         if price is None:
@@ -122,7 +170,7 @@ def check(alert: dict, ctx: dict) -> dict:
                    if price is not None and float(previous_close) != 0 else None)
         except (TypeError, ValueError, ZeroDivisionError):
             chg = None
-        if chg is None:
+        if chg is None and "price" not in ctx:
             chg = _change_pct(df)
         if chg is None:
             return out(False, "取得できず", "前日比を計算できませんでした")
@@ -138,6 +186,8 @@ def check(alert: dict, ctx: dict) -> dict:
 
     if kind in ("near_support", "near_resistance"):
         side = "サポート" if kind == "near_support" else "抵抗線"
+        if price is None:
+            return out(False, "取得できず", "現在の取引セッションの価格を取得できませんでした")
         dist = _nearest_distance(ctx.get("levels"), price, side)
         if dist is None:
             return out(False, "取得できず", f"{side}が検出されていません")
@@ -167,14 +217,19 @@ def check(alert: dict, ctx: dict) -> dict:
 
 def describe(alert: dict) -> str:
     """アラートの内容を1行の日本語にする。"""
+    if not isinstance(alert, dict):
+        return "不正なアラート設定"
     spec = KINDS.get(alert.get("kind"), {})
-    label = spec.get("label", alert.get("kind"))
+    label = spec.get("label", str(alert.get("kind") or "不明な種類"))
+    ticker = str(alert.get("ticker") or "銘柄不明")
     if not spec.get("needs_value"):
-        return f"{alert['ticker']}: {label}"
+        return f"{ticker}: {label}"
     unit = spec.get("unit", "")
-    val = alert.get("value")
+    val = _valid_alert_value(str(alert.get("kind") or ""), alert.get("value"))
+    if val is None:
+        return f"{ticker}: {label}（基準値が不正）"
     shown = f"{unit}{val:,.2f}" if unit == "$" else f"{val:,.2f}{unit}"
-    return f"{alert['ticker']}: {label} {shown}"
+    return f"{ticker}: {label} {shown}"
 
 
 def format_actual(alert: dict, actual: object) -> str:
@@ -199,11 +254,32 @@ def load() -> list[dict]:
         return []
     out = []
     for a in items:
-        if isinstance(a, dict) and a.get("ticker") and a.get("kind") in KINDS:
-            a.setdefault("id", uuid.uuid4().hex[:8])
-            a.setdefault("enabled", True)
-            a.setdefault("note", "")
-            out.append(a)
+        if not isinstance(a, dict):
+            continue
+        ticker = a.get("ticker")
+        kind = a.get("kind")
+        if not isinstance(ticker, str) or not ticker.strip() or kind not in KINDS:
+            continue
+        spec = KINDS[kind]
+        value = (_valid_alert_value(kind, a.get("value"))
+                 if spec.get("needs_value") else None)
+        # 基準値なしの価格・指標アラートは成立させず、一覧表示でも落とさない。
+        if spec.get("needs_value") and value is None:
+            continue
+        alert_id = a.get("id")
+        note = a.get("note")
+        enabled = a.get("enabled", True)
+        out.append({
+            **a,
+            "id": (alert_id.strip() if isinstance(alert_id, str) and alert_id.strip()
+                   else uuid.uuid4().hex[:8]),
+            "ticker": ticker.strip().upper()[:32],
+            "kind": kind,
+            "value": value,
+            "note": note.strip() if isinstance(note, str) else "",
+            # 文字列"false"等を真として監視しない。破損時は安全側の無効。
+            "enabled": enabled if isinstance(enabled, bool) else False,
+        })
     return out
 
 
@@ -217,6 +293,9 @@ def tickers(alerts: list[dict]) -> list[str]:
     """有効なアラートが対象にしている銘柄の一覧(重複なし)。"""
     seen = []
     for a in alerts:
-        if a.get("enabled") and a["ticker"] not in seen:
-            seen.append(a["ticker"])
+        if not isinstance(a, dict) or a.get("enabled") is not True:
+            continue
+        ticker = a.get("ticker")
+        if isinstance(ticker, str) and ticker and ticker not in seen:
+            seen.append(ticker)
     return seen

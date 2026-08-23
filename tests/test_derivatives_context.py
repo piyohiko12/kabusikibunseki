@@ -50,9 +50,11 @@ def okx_payload(data, code="0", msg=""):
     return {"code": code, "msg": msg, "data": [data] if data is not None else []}
 
 
-def okx_handler(fail_endpoint=None, asset_prices=None):
+def okx_handler(fail_endpoint=None, asset_prices=None, endpoint_ts_offsets_ms=None):
     asset_prices = asset_prices or {asset: 100.0 for asset in dc.PERP_ASSETS}
-    funding_time = 1_700_000_000_000
+    endpoint_ts_offsets_ms = endpoint_ts_offsets_ms or {}
+    base_ts = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000) - 10_000
+    funding_time = base_ts
     next_funding_time = funding_time + 8 * 60 * 60 * 1000
 
     def handle(url, params):
@@ -62,22 +64,23 @@ def okx_handler(fail_endpoint=None, asset_prices=None):
         instrument = params["instId"]
         asset = instrument.split("-", 1)[0]
         price = asset_prices[asset]
+        endpoint_ts = base_ts + endpoint_ts_offsets_ms.get(endpoint, 0)
         if endpoint == "market/ticker":
             data = {"instId": instrument, "last": str(price),
                     "open24h": str(price * 0.8), "high24h": str(price * 1.1),
                     "low24h": str(price * 0.7), "volCcy24h": "123.5",
-                    "ts": "1700000001000"}
+                    "ts": str(endpoint_ts)}
         elif endpoint == "public/mark-price":
             data = {"instId": instrument, "markPx": str(price * 1.01),
-                    "ts": "1700000002000"}
+                    "ts": str(endpoint_ts)}
         elif endpoint == "public/open-interest":
             data = {"instId": instrument, "oiUsd": "5000000",
-                    "ts": "1700000003000"}
+                    "ts": str(endpoint_ts)}
         elif endpoint == "public/funding-rate":
             data = {"instId": instrument, "fundingRate": "0.0001",
                     "premium": "0.0002", "fundingTime": str(funding_time),
                     "nextFundingTime": str(next_funding_time),
-                    "ts": "1700000004000"}
+                    "ts": str(endpoint_ts)}
         else:
             raise AssertionError(f"unexpected endpoint: {endpoint}")
         return FakeResponse(okx_payload(data))
@@ -245,6 +248,10 @@ class OkxPerpetualTests(unittest.TestCase):
         self.assertAlmostEqual(float(row["funding_premium_pct"]), 0.02)
         self.assertAlmostEqual(float(row["open_interest_usd"]), 5_000_000)
         self.assertIsNotNone(row["as_of"].tzinfo)
+        self.assertIsNotNone(row["latest_as_of"].tzinfo)
+        self.assertEqual(row["freshness_status"], "fresh")
+        self.assertEqual(row["metric_freshness"]["open_interest_usd"]["status"],
+                         "fresh")
         self.assertIsNotNone(row["funding_time"].tzinfo)
         self.assertIsNotNone(row["next_funding_time"].tzinfo)
         self.assertEqual(len(session.calls), 4)
@@ -254,6 +261,25 @@ class OkxPerpetualTests(unittest.TestCase):
         self.assertFalse(meta["authenticated"])
         self.assertTrue(meta["read_only"])
         self.assertEqual(meta["errors"], {})
+        self.assertEqual(meta["freshness"]["BTC"]["mark_price"]["status"],
+                         "fresh")
+
+    def test_stale_open_interest_prevents_overall_ok_even_when_mark_is_fresh(self):
+        session = FakeSession(okx_handler(endpoint_ts_offsets_ms={
+            "public/open-interest": -(dc.PERP_FRESHNESS_MAX_AGE_SECONDS + 60) * 1000,
+        }))
+        frame, meta = dc._fetch_okx_perpetuals_uncached(("BTC",), session=session)
+
+        row = frame.iloc[0]
+        self.assertEqual(row["metric_freshness"]["mark_price"]["status"], "fresh")
+        self.assertEqual(
+            row["metric_freshness"]["open_interest_usd"]["status"], "stale")
+        self.assertEqual(row["freshness_status"], "partial")
+        self.assertEqual(row["status"], "partial")
+        self.assertEqual(meta["status"], "partial")
+        self.assertEqual(row["as_of"], row["open_interest_as_of"])
+        self.assertGreater(row["latest_as_of"], row["as_of"])
+        self.assertIn("open_interest", row["error"])
 
     def test_partial_endpoint_failure_keeps_row_and_error(self):
         session = FakeSession(okx_handler(fail_endpoint="public/mark-price"))

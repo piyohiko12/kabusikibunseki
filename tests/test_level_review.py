@@ -101,6 +101,22 @@ class MoomooLevelReviewTests(unittest.TestCase):
         self.assertTrue(all(level["moomoo_reason"] == "OHLCV基礎評価のみ"
                             for level in result["levels"]))
 
+    def test_neutral_only_ticks_are_not_counted_as_live_evidence(self):
+        ticks = pd.DataFrame({
+            "ticker_direction": ["NEUTRAL", "NEUTRAL", None],
+            "volume": [500, 300, 100],
+        })
+        baseline = level_review.review_levels(self.prices, self.levels)
+        result = level_review.review_levels(self.prices, self.levels, ticks=ticks)
+
+        self.assertNotIn("歩み値", result["sources"])
+        self.assertNotIn("直近約定", result["summary"])
+        for actual, expected in zip(result["levels"], baseline["levels"]):
+            self.assertEqual(actual["moomoo_score"], expected["moomoo_score"])
+            self.assertEqual(actual["moomoo_confidence"],
+                             expected["moomoo_confidence"])
+            self.assertEqual(actual["moomoo_reason"], "OHLCV基礎評価のみ")
+
 
 if __name__ == "__main__":
     unittest.main()

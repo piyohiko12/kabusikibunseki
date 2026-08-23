@@ -43,6 +43,11 @@ _RETRY_INTERVAL = 60.0
 _last_failure: dict = {"at": 0.0, "reason": ""}
 _lock = threading.Lock()
 
+# moomooの正式なmarket prefixだけを「既に正規化済み」とみなす。
+# 米国のclass share（BRK.Bなど）もドットを含むため、単に"."の有無で
+# 判定するとBRK.BをそのままSDKへ渡してしまう。
+_MARKET_PREFIXES = frozenset({"US", "HK", "SH", "SZ", "SG", "MY", "JP", "CC"})
+
 
 class _State:
     OFF = "off"                  # 設定で無効
@@ -62,7 +67,8 @@ def to_code(ticker: str) -> str | None:
     t = (ticker or "").strip().upper()
     if not t or t.startswith("^") or "=" in t:
         return None
-    if "." in t:  # すでに "US.AAPL" 形式
+    prefix, separator, _ = t.partition(".")
+    if separator and prefix in _MARKET_PREFIXES:  # すでに "US.AAPL" 形式
         return t
     return f"US.{t}"
 
@@ -1246,32 +1252,104 @@ def institutional_holding(ticker: str, num: int = 12) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def option_volatility(ticker: str) -> dict | None:
-    """オプションのIV(予想変動率)とHV(実績変動率)の推移および現在の評価。"""
+    """原資産のIV(予想変動率)とHV(実績変動率)を取得する。
+
+    ``get_option_volatility`` はオプション*契約*コード専用であり、AAPL等の
+    原資産コードを渡してはいけない。ここでは原資産専用のoverview/history
+    APIをfeature-detectして使う。古いSDKで両APIが未提供なら、契約を推測せず
+    ``None`` を返す（共有Quote contextは呼び出し側で使い回すためcloseしない）。
+    """
     ctx = _ctx()
     code = to_code(ticker)
     if ctx is None or not code:
         return None
-    try:
-        ret, data = ctx.get_option_volatility(code)
-    except Exception:
+
+    overview_method = getattr(ctx, "get_option_underlying_overview", None)
+    history_method = getattr(ctx, "get_option_underlying_his_volatility", None)
+    if not callable(overview_method) and not callable(history_method):
         return None
-    if not _ok(ret) or not isinstance(data, pd.DataFrame) or data.empty:
+
+    overview = pd.DataFrame()
+    if callable(overview_method):
+        try:
+            ret, data = overview_method([code])
+            if _ok(ret) and isinstance(data, pd.DataFrame) and not data.empty:
+                overview = data.copy()
+        except Exception:
+            # overviewが未許可でも履歴APIだけ使える場合がある。
+            overview = pd.DataFrame()
+
+    history_parts: list[pd.DataFrame] = []
+    if callable(history_method):
+        end = pd.Timestamp.now(tz="America/New_York").normalize()
+        begin = end - pd.Timedelta(days=180)
+        page_req_key = None
+        seen_page_keys = set()
+        # APIの異常な循環paginationでUIを止めないため上限を設ける。
+        for _ in range(20):
+            try:
+                result = history_method(
+                    code,
+                    begin_time=begin.strftime("%Y-%m-%d"),
+                    end_time=end.strftime("%Y-%m-%d"),
+                    page_req_key=page_req_key,
+                )
+            except Exception:
+                break
+            if not isinstance(result, tuple) or len(result) < 2 or not _ok(result[0]):
+                break
+            data = result[1]
+            if isinstance(data, pd.DataFrame) and not data.empty:
+                history_parts.append(data.copy())
+            next_key = result[2] if len(result) >= 3 else None
+            if next_key is None or next_key in seen_page_keys:
+                break
+            seen_page_keys.add(next_key)
+            page_req_key = next_key
+
+    history = (pd.concat(history_parts, ignore_index=True)
+               if history_parts else pd.DataFrame())
+    if history.empty and overview.empty:
         return None
-    series = pd.DataFrame({
-        "日付": data.get("timestamp_str"),
-        "IV": pd.to_numeric(data.get("implied_volatility"), errors="coerce"),
-        "HV": pd.to_numeric(data.get("history_volatility"), errors="coerce"),
-        "IVプレミアム": pd.to_numeric(data.get("volatility_premium"), errors="coerce"),
-    }).dropna(subset=["IV"], how="all")
+
+    if history.empty:
+        latest = overview.iloc[0]
+        series = pd.DataFrame({
+            "日付": [pd.Timestamp.now(tz="America/New_York").date().isoformat()],
+            "IV": [pd.to_numeric(pd.Series([latest.get("iv")]), errors="coerce").iloc[0]],
+            "HV": [pd.to_numeric(pd.Series([latest.get("hv_30d")]), errors="coerce").iloc[0]],
+        })
+    else:
+        date_values = history.get("time")
+        if date_values is None:
+            date_values = pd.to_datetime(history.get("timestamp"), unit="s", errors="coerce")
+        series = pd.DataFrame({
+            "日付": date_values,
+            "IV": pd.to_numeric(history.get("iv"), errors="coerce"),
+            "HV": pd.to_numeric(history.get("hv"), errors="coerce"),
+        })
+    series["IVプレミアム"] = series["IV"] - series["HV"]
+    series = series.dropna(subset=["IV", "HV"], how="all")
     if series.empty:
         return None
-    head = data.iloc[0]
+    sort_dates = pd.to_datetime(series["日付"], utc=True, errors="coerce")
+    if sort_dates.notna().any():
+        series = (series.assign(_sort_date=sort_dates)
+                  .sort_values("_sort_date", kind="stable", na_position="last")
+                  .drop(columns="_sort_date"))
+
+    # overviewのcurrent snapshotが履歴末尾より新しい場合でも、同日重複を
+    # 推測で追加せず、カード用の現在値としてだけ保持する。
+    overview_row = overview.iloc[0] if not overview.empty else None
+    average_iv = pd.to_numeric(series["IV"], errors="coerce").mean()
     return {
         "series": series.reset_index(drop=True),
-        "average_iv": pd.to_numeric(pd.Series([head.get("average_impvol")]),
-                                    errors="coerce").iloc[0],
-        "status": head.get("impvol_status"),
-        "analysis": head.get("analysis") or "",
+        "average_iv": average_iv,
+        "status": "available",
+        "analysis": "",
+        "source": "moomoo 原資産オプション統計",
+        "code": code,
+        "overview": overview_row.to_dict() if overview_row is not None else {},
     }
 
 
