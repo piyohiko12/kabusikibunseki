@@ -48,6 +48,67 @@ class SessionClassificationTests(unittest.TestCase):
         naive = pd.DatetimeIndex(["2026-08-06 10:00"])
         self.assertEqual(sessions.classify(naive).iloc[0], sessions.REGULAR)
 
+
+class DaylightSavingTests(unittest.TestCase):
+    """夏時間の切替日でバーを取りこぼさないこと。
+
+    moomooのtime_keyはtz情報を持たないnaiveな時刻で来る。冬時間の切替日は
+    01:00台が2回あるため、ambiguousの扱いを誤るとtrading_dayがNaTになり、
+    その足がlatest_day_sliceから消えてVWAPも欠損する。
+    """
+
+    # 2026年の米国DST切替: 3/8に02:00→03:00、11/1に02:00→01:00
+    SPRING = "2026-03-08"   # 02:00〜02:59が存在しない
+    AUTUMN = "2026-11-01"   # 01:00〜01:59が2回ある
+
+    def _around(self, day: str) -> pd.DatetimeIndex:
+        return pd.DatetimeIndex([f"{day} {h:02d}:{m:02d}"
+                                 for h in range(0, 6) for m in (0, 30)])
+
+    def test_naive_transitions_never_produce_nat(self):
+        for day in (self.SPRING, self.AUTUMN):
+            with self.subTest(day=day):
+                idx = self._around(day)
+                et = sessions.to_et(idx)
+                self.assertFalse(pd.isna(pd.Series(et)).any(),
+                                 "to_etがNaTを返している")
+                days = sessions.trading_day(idx)
+                self.assertFalse(pd.isna(pd.Series(days.values)).any(),
+                                 "trading_dayがNaTを返している")
+                self.assertEqual(len(sessions.classify(idx)), len(idx))
+
+    def test_aware_transitions_are_stable(self):
+        for day in (self.SPRING, self.AUTUMN):
+            with self.subTest(day=day):
+                idx = pd.date_range(f"{day} 00:00", f"{day} 23:30", freq="30min",
+                                    tz="America/New_York")
+                self.assertFalse(pd.isna(pd.Series(sessions.to_et(idx))).any())
+                self.assertEqual(len(sessions.classify(idx)), len(idx))
+
+    def test_ambiguous_hour_bars_are_not_dropped(self):
+        """重複時間帯の足を含んでも、直近取引日の本数とVWAPが欠けない。"""
+        overnight = [f"{self.AUTUMN} 01:00", f"{self.AUTUMN} 01:30"]
+        regular = [f"2026-11-02 {h:02d}:{m:02d}"
+                   for h in range(9, 16) for m in (0, 30)]
+        idx = pd.DatetimeIndex(overnight + regular)
+        frame = pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0,
+                              "Close": 100.5, "Volume": 1e6}, index=idx)
+
+        days = sessions.trading_day(frame.index)
+        self.assertFalse(pd.isna(pd.Series(days.values)).any())
+        # 11/02の立会14本がそのまま残る
+        self.assertEqual(len(sessions.latest_day_slice(frame)), len(regular))
+        self.assertFalse(intraday.vwap(frame).isna().any())
+
+    def test_spring_forward_gap_is_shifted_not_dropped(self):
+        """存在しない02:30も落とさず、直後の実在時刻へ寄せる。"""
+        idx = pd.DatetimeIndex([f"{self.SPRING} 01:30", f"{self.SPRING} 02:30",
+                                f"{self.SPRING} 03:30"])
+        et = sessions.to_et(idx)
+        self.assertEqual(len(et), 3)
+        self.assertFalse(pd.isna(pd.Series(et)).any())
+        self.assertTrue(et.is_monotonic_increasing)
+
     def test_trading_day_rolls_over_at_20et(self):
         idx = pd.DatetimeIndex([
             pd.Timestamp("2026-08-06 19:30", tz="America/New_York"),
