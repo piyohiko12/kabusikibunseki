@@ -63,12 +63,18 @@ ALL_SESSIONS = (OVERNIGHT, PRE, REGULAR, AFTER)
 def to_et(index) -> pd.DatetimeIndex:
     """任意のDatetimeIndexを東部時間に変換する。
 
-    tz情報が無いものはすでにETとみなす(yfinanceの日足など)。
+    tz情報が無いものはすでにETとみなす(yfinanceの日足、moomooのtime_keyなど)。
+
+    冬時間の切替日は01:00台が2回あるため、naiveな時刻はどちらか決められない。
+    ここで ambiguous="NaT" にすると trading_day がNaTを返し、その足が
+    latest_day_slice から消えてVWAPも欠損する。セッション判定は壁時計時刻で
+    行うのでどちらの回を選んでも同じ区分になり、NaTを出さない方が安全。
+    そのため ambiguous=True(夏時間側=最初の出現)を選ぶ。
     """
     idx = pd.DatetimeIndex(index)
     if idx.tz is None:
         return idx.tz_localize(ET, nonexistent="shift_forward",
-                               ambiguous="NaT")
+                               ambiguous=True)
     return idx.tz_convert(ET)
 
 
